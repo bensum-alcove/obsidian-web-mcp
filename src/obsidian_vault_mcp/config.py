@@ -19,7 +19,7 @@ MAX_LIST_DEPTH = 5            # Max directory recursion depth
 CONTEXT_LINES = 2             # Default lines of context in search results
 
 # Directories to never expose or modify
-EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store"}
+EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index"}
 
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0

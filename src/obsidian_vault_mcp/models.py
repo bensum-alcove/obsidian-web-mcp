@@ -230,3 +230,99 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
             if "fields" not in item or not isinstance(item["fields"], dict):
                 raise ValueError(f"updates[{i}] must contain a 'fields' key with a dict value")
         return v
+
+
+class VaultPatchSectionInput(BaseModel):
+    """Replace the content of a single markdown section without rewriting the entire file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    section: str = Field(
+        ...,
+        description="Exact heading text to target, e.g. '## Live Matters'",
+        min_length=1,
+        max_length=200,
+    )
+    content: str = Field(
+        ...,
+        description="Replacement content for that section (not including the heading line itself)",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultAppendInput(BaseModel):
+    """Append content to a vault file without rewriting the whole file."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    content: str = Field(
+        ...,
+        description="Content to append to the file",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    ensure_newline: bool = Field(
+        default=True,
+        description="If true, ensure a blank line separator before the appended content",
+    )
+
+
+class VaultStrReplaceInput(BaseModel):
+    """Replace a unique string in a vault file with another string."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    old_str: str = Field(
+        ...,
+        description="Exact string to find — must appear exactly once in the file",
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    new_str: str = Field(
+        ...,
+        description="Replacement string (empty string to delete)",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+
+class VaultBatchWriteInput(BaseModel):
+    """Write multiple files in a single call."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    files: list[dict] = Field(
+        ...,
+        description=(
+            "List of files to write. Each item must have 'path' (str) and 'content' (str); "
+            "optionally 'create_dirs' (bool, default true)."
+        ),
+        min_length=1,
+        max_length=20,
+    )
+
+    @field_validator("files")
+    @classmethod
+    def validate_files(cls, v: list[dict]) -> list[dict]:
+        for i, item in enumerate(v):
+            if "path" not in item or not isinstance(item["path"], str):
+                raise ValueError(f"files[{i}] must contain a 'path' key with a string value")
+            if "content" not in item or not isinstance(item["content"], str):
+                raise ValueError(f"files[{i}] must contain a 'content' key with a string value")
+        return v

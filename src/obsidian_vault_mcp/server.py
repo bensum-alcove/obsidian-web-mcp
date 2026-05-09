@@ -4,16 +4,39 @@ Exposes read/write access to an Obsidian vault over Streamable HTTP.
 Designed to run behind Cloudflare Tunnel for secure remote access.
 """
 
+import asyncio
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
 from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
 from .frontmatter_index import FrontmatterIndex
+
+
+class SecretPathMiddleware(BaseHTTPMiddleware):
+    """Block /mcp requests unless they include the MCP_SECRET_PATH segment.
+    If MCP_SECRET_PATH is not set, all requests are allowed (backward compatible).
+    OAuth endpoints are always allowed.
+    """
+    async def dispatch(self, request, call_next):
+        secret = os.environ.get("MCP_SECRET_PATH", "")
+        if secret:
+            path = request.url.path
+            if path.startswith("/mcp") and not path.startswith(f"/mcp/{secret}"):
+                return Response("Forbidden", status_code=403)
+            if path.startswith(f"/mcp/{secret}"):
+                new_path = "/mcp" + path[len(f"/mcp/{secret}"):]
+                request.scope["path"] = new_path
+        return await call_next(request)
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +50,8 @@ async def lifespan(server):
     logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
     frontmatter_index.start()
     logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
+    if SEMANTIC_AVAILABLE:
+        asyncio.create_task(asyncio.to_thread(build_index))
     yield {"frontmatter_index": frontmatter_index}
     frontmatter_index.stop()
     logger.info("Vault MCP server shut down.")
@@ -44,8 +69,9 @@ mcp = FastMCP(
             "127.0.0.1:*",
             "localhost:*",
             "[::1]:*",
-            # Add your tunnel hostname here, e.g.:
-            # "vault-mcp.example.com",
+"vault.bensum.org",
+            "vault-cb.bensum.org",
+            "vault-alcove.bensum.org",
         ],
     ),
 )
@@ -54,9 +80,10 @@ mcp = FastMCP(
 # --- Register all tools ---
 
 from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
-from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update
+from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update, vault_patch_section as _vault_patch_section, vault_append as _vault_append, vault_batch_write as _vault_batch_write, vault_str_replace as _vault_str_replace
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
+from .tools.semantic_search import SEMANTIC_AVAILABLE, build_index, vault_semantic_search as _vault_semantic_search
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -67,6 +94,10 @@ from .models import (
     VaultListInput,
     VaultMoveInput,
     VaultDeleteInput,
+    VaultPatchSectionInput,
+    VaultAppendInput,
+    VaultBatchWriteInput,
+    VaultStrReplaceInput,
 )
 
 
@@ -187,6 +218,71 @@ def vault_delete(path: str, confirm: bool = False) -> str:
     return _vault_delete(inp.path, inp.confirm)
 
 
+
+@mcp.tool(
+    name="vault_patch_section",
+    description="Replace the content of a single markdown section without rewriting the entire file. Targets a heading and replaces everything between it and the next heading of the same or higher level.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_patch_section(path: str, section: str, content: str) -> str:
+    """Patch a single markdown section in a vault file."""
+    inp = VaultPatchSectionInput(path=path, section=section, content=content)
+    return _vault_patch_section(inp.path, inp.section, inp.content)
+
+
+@mcp.tool(
+    name="vault_append",
+    description="Append content to an existing vault file without reading or rewriting the whole file. Creates the file if it does not exist. Optionally inserts a blank-line separator before the new content.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
+    """Append content to a vault file."""
+    inp = VaultAppendInput(path=path, content=content, ensure_newline=ensure_newline)
+    return _vault_append(inp.path, inp.content, inp.ensure_newline)
+
+
+@mcp.tool(
+    name="vault_batch_write",
+    description="Write up to 20 files in a single call. Each file is written atomically. Failures are reported per-file — the batch does not abort on a single error.",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_batch_write(files: list[dict]) -> str:
+    """Write multiple vault files in one call."""
+    inp = VaultBatchWriteInput(files=files)
+    return _vault_batch_write(inp.files)
+
+@mcp.tool(
+    name="vault_str_replace",
+    description="Replace a unique string in a vault file with another string. old_str must appear exactly once in the file. Safer and cheaper than vault_write for inline edits.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_str_replace(path: str, old_str: str, new_str: str) -> str:
+    """Replace a unique string in a vault file."""
+    inp = VaultStrReplaceInput(path=path, old_str=old_str, new_str=new_str)
+    return _vault_str_replace(inp.path, inp.old_str, inp.new_str)
+
+
+if SEMANTIC_AVAILABLE:
+    @mcp.tool(
+        name="vault_semantic_search",
+        description=(
+            "Search vault files by semantic similarity rather than exact keywords. "
+            "Returns ranked results with path, relevance score, snippet, and section heading. "
+            "Best for conceptual or natural-language queries. "
+            "Index reflects vault state at last server startup — for content written in the "
+            "current session, use vault_search instead."
+        ),
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    )
+    async def vault_semantic_search(
+        query: str,
+        max_results: int = 5,
+        path_prefix: str | None = None,
+    ) -> str:
+        """Search vault by semantic similarity."""
+        return await asyncio.to_thread(_vault_semantic_search, query, max_results, path_prefix)
+
+
 def main():
     """Entry point. Run with streamable HTTP transport."""
     logging.basicConfig(
@@ -214,6 +310,7 @@ def main():
             app.routes.insert(0, route)
 
         app.add_middleware(BearerAuthMiddleware)
+        app.add_middleware(SecretPathMiddleware)  # outermost — runs first, blocks wrong paths before auth
         logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
 
         import uvicorn

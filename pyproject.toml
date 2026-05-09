@@ -9,6 +9,8 @@ dependencies = [
     "python-frontmatter>=1.1.0",
     "pydantic>=2.0",
     "watchdog>=4.0.0",
+    "fastembed>=0.8.0",
+    "sqlite-vec>=0.1.9",
 ]
 
 [project.optional-dependencies]

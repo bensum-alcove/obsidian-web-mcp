@@ -10,6 +10,7 @@ import frontmatter
 
 from .. import config
 from ..vault import resolve_vault_path
+from ..utils import sanitize_for_json, SafeJSONEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,93 @@ def _search_python(
     return matches
 
 
+_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "for",
+    "on", "at", "by", "it", "its", "this", "that", "from", "with", "as",
+    "be", "or", "and", "not", "but", "has", "had", "have", "do", "does",
+    "did", "will", "would", "can", "could", "may", "might", "shall",
+    "should", "about", "into", "than", "then", "so", "if", "no", "up",
+    "out", "my", "your", "our", "his", "her", "their", "we", "you", "he",
+    "she", "they", "me", "him", "us", "them",
+})
+
+
+def _search_keyword_fallback(
+    query: str,
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Keyword-based fallback search when ripgrep returns 0 results."""
+    import fnmatch
+
+    words = query.lower().split()
+    keywords = [w for w in words if w not in _STOPWORDS and len(w) > 1]
+    if not keywords:
+        return []
+
+    # Single pass: read each file once and record which keywords it contains
+    file_data = []  # (file_path, rel_path, content, found_keywords)
+
+    for file_path in search_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if any(part in config.EXCLUDED_DIRS for part in file_path.parts):
+            continue
+        if not fnmatch.fnmatch(file_path.name, file_pattern):
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, PermissionError):
+            continue
+        try:
+            rel_path = str(file_path.relative_to(config.VAULT_PATH))
+        except ValueError:
+            continue
+        content_lower = content.lower()
+        found = [kw for kw in keywords if kw in content_lower]
+        if found:
+            file_data.append((file_path, rel_path, content, found))
+
+    if not file_data:
+        return []
+
+    # AND logic: files containing all keywords
+    and_matches = [(fp, rp, c, fk) for fp, rp, c, fk in file_data if len(fk) == len(keywords)]
+    candidates = and_matches if and_matches else file_data
+
+    # Rank by keyword count + filename boost
+    def _score(item):
+        fp, rp, c, fk = item
+        name_lower = fp.stem.lower()
+        filename_boost = sum(3 for kw in keywords if kw in name_lower)
+        return len(fk) + filename_boost
+
+    candidates = sorted(candidates, key=_score, reverse=True)
+
+    # Build result entries (one context block per keyword per file)
+    matches = []
+    for file_path, rel_path, content, found_keywords in candidates:
+        lines = content.splitlines()
+        for kw in found_keywords:
+            for i, line in enumerate(lines):
+                if kw in line.lower():
+                    start = max(0, i - context_lines)
+                    end = min(len(lines), i + context_lines + 1)
+                    matches.append({
+                        "path": rel_path,
+                        "line_number": i + 1,
+                        "match_context": "\n".join(lines[start:end]),
+                        "search_mode": "keyword_fallback",
+                    })
+                    break  # one context block per keyword per file
+            if len(matches) >= max_results:
+                return matches
+
+    return matches
+
+
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
     try:
@@ -160,17 +248,20 @@ def vault_search(
         else:
             matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
 
+        if not matches:
+            matches = _search_keyword_fallback(query, search_path, file_pattern, max_results, context_lines)
+
         for match in matches:
             file_full_path = config.VAULT_PATH / match["path"]
             match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
 
         truncated = len(matches) >= max_results
 
-        return json.dumps({
+        return json.dumps(sanitize_for_json({
             "results": matches,
             "total_matches": len(matches),
             "truncated": truncated,
-        })
+        }), cls=SafeJSONEncoder)
     except ValueError as e:
         return json.dumps({"error": str(e)})
     except Exception as e:
@@ -209,11 +300,11 @@ def vault_search_frontmatter(
 
         truncated = len(results) > max_results
 
-        return json.dumps({
+        return json.dumps(sanitize_for_json({
             "results": formatted,
             "total": len(formatted),
             "truncated": truncated,
-        })
+        }), cls=SafeJSONEncoder)
     except Exception as e:
         logger.error(f"vault_search_frontmatter error: {e}")
         return json.dumps({"error": str(e)})
