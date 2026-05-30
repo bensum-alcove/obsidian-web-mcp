@@ -6,6 +6,7 @@ Index path: {VAULT_PATH}/.semantic-index/index.db
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -221,6 +222,24 @@ def build_index() -> None:
 
         except Exception as e:
             logger.error(f"Semantic index build failed: {e}", exc_info=True)
+
+
+async def periodic_reindex(interval_hours: float = 3.0) -> None:
+    """Re-run incremental index build on a timer."""
+    while True:
+        await asyncio.sleep(interval_hours * 3600)
+        try:
+            logger.info(f"Periodic re-index starting for {config.VAULT_PATH}")
+            await asyncio.to_thread(build_index)
+            logger.info(f"Periodic re-index complete for {config.VAULT_PATH}")
+        except Exception as e:
+            logger.error(f"Periodic re-index failed: {e}")
+
+
+async def startup_then_periodic() -> None:
+    """Run initial index build then schedule periodic re-index."""
+    await asyncio.to_thread(build_index)
+    asyncio.create_task(periodic_reindex())
 
 
 def vault_semantic_search(

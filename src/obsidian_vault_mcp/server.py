@@ -5,6 +5,7 @@ Designed to run behind Cloudflare Tunnel for secure remote access.
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -42,19 +43,20 @@ logger = logging.getLogger(__name__)
 
 # Global frontmatter index instance
 frontmatter_index = FrontmatterIndex()
+_semantic_started = False
+
+atexit.register(frontmatter_index.stop)
 
 
 @asynccontextmanager
 async def lifespan(server):
-    """Start frontmatter index on server startup, stop on shutdown."""
-    logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
+    global _semantic_started
     frontmatter_index.start()
-    logger.info(f"Frontmatter index built: {frontmatter_index.file_count} files indexed")
-    if SEMANTIC_AVAILABLE:
-        asyncio.create_task(asyncio.to_thread(build_index))
+    if SEMANTIC_AVAILABLE and not _semantic_started:
+        _semantic_started = True
+        asyncio.create_task(startup_then_periodic())
     yield {"frontmatter_index": frontmatter_index}
-    frontmatter_index.stop()
-    logger.info("Vault MCP server shut down.")
+    # Observer lives for process lifetime; atexit handles cleanup
 
 
 # Create the MCP server
@@ -83,7 +85,7 @@ from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_ba
 from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update, vault_patch_section as _vault_patch_section, vault_append as _vault_append, vault_batch_write as _vault_batch_write, vault_str_replace as _vault_str_replace
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
-from .tools.semantic_search import SEMANTIC_AVAILABLE, build_index, vault_semantic_search as _vault_semantic_search
+from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -269,8 +271,8 @@ if SEMANTIC_AVAILABLE:
             "Search vault files by semantic similarity rather than exact keywords. "
             "Returns ranked results with path, relevance score, snippet, and section heading. "
             "Best for conceptual or natural-language queries. "
-            "Index reflects vault state at last server startup — for content written in the "
-            "current session, use vault_search instead."
+            "Index refreshes automatically every few hours. "
+            "For content written in the last few minutes, use vault_search instead."
         ),
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
