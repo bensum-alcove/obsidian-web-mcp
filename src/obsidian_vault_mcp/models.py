@@ -25,6 +25,15 @@ class VaultReadInput(BaseModel):
         min_length=1,
         max_length=500,
     )
+    force: bool = Field(
+        default=False,
+        description="If true, bypass read_policy: section-only check and return full content regardless",
+    )
+    max_chars: int | None = Field(
+        default=None,
+        description="Truncate content to this many characters; None returns full content",
+        ge=1,
+    )
 
 
 class VaultWriteInput(BaseModel):
@@ -81,6 +90,10 @@ class VaultListInput(BaseModel):
         default=None,
         description="Optional glob pattern to filter results (e.g. '*.md')",
         max_length=100,
+    )
+    frontmatter_fields: list[str] | None = Field(
+        default=None,
+        description="If set, read these frontmatter field names from each .md file and include them in results",
     )
 
 
@@ -207,6 +220,10 @@ class VaultBatchReadInput(BaseModel):
         default=True,
         description="If false, return metadata only (frontmatter, size) without file body",
     )
+    force: bool = Field(
+        default=False,
+        description="If true, bypass read_policy: section-only check for all files in the batch",
+    )
 
 
 class VaultBatchFrontmatterUpdateInput(BaseModel):
@@ -300,6 +317,10 @@ class VaultStrReplaceInput(BaseModel):
         description="Replacement string (empty string to delete)",
         max_length=MAX_CONTENT_SIZE,
     )
+    regex: bool = Field(
+        default=False,
+        description="If true, treat old_str as a Python regex pattern (must match exactly once)",
+    )
 
 
 class VaultBatchWriteInput(BaseModel):
@@ -326,3 +347,92 @@ class VaultBatchWriteInput(BaseModel):
             if "content" not in item or not isinstance(item["content"], str):
                 raise ValueError(f"files[{i}] must contain a 'content' key with a string value")
         return v
+
+
+class VaultReadSectionInput(BaseModel):
+    """Read a single markdown section by heading name."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Relative path from vault root",
+        min_length=1,
+        max_length=500,
+    )
+    section: str = Field(
+        ...,
+        description="Heading text to match (case-insensitive, without '#' prefix)",
+        min_length=1,
+        max_length=200,
+    )
+
+
+class VaultBatchDeleteInput(BaseModel):
+    """Delete multiple files in one call."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    paths: list[str] = Field(
+        ...,
+        description="File paths to delete (moved to .trash/)",
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+    )
+    confirm: bool = Field(
+        default=False,
+        description="Must be true to execute deletions -- safety gate to prevent accidental deletes",
+    )
+
+
+class VaultBatchStrReplaceInput(BaseModel):
+    """Replace unique strings in multiple files in one call."""
+
+    model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
+
+    replacements: list[dict] = Field(
+        ...,
+        description=(
+            "List of replacements. Each item must have 'path' (str), 'old_str' (str), 'new_str' (str); "
+            "optionally 'regex' (bool, default false)."
+        ),
+        min_length=1,
+        max_length=MAX_BATCH_SIZE,
+    )
+
+    @field_validator("replacements")
+    @classmethod
+    def validate_replacements(cls, v: list[dict]) -> list[dict]:
+        for i, item in enumerate(v):
+            if "path" not in item or not isinstance(item["path"], str):
+                raise ValueError(f"replacements[{i}] must contain a 'path' key with a string value")
+            if "old_str" not in item or not isinstance(item["old_str"], str):
+                raise ValueError(f"replacements[{i}] must contain an 'old_str' key with a string value")
+            if "new_str" not in item or not isinstance(item["new_str"], str):
+                raise ValueError(f"replacements[{i}] must contain a 'new_str' key with a string value")
+        return v
+
+
+class VaultRecentChangesInput(BaseModel):
+    """Return vault .md files modified after a given ISO datetime."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    since: str = Field(
+        ...,
+        description="ISO 8601 datetime (e.g. '2026-05-29T00:00:00Z') — return files modified after this",
+        min_length=1,
+        max_length=50,
+    )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Maximum number of files to return",
+    )
+
+
+class VaultStatsInput(BaseModel):
+    """Return vault-wide aggregate statistics."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")

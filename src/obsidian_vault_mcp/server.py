@@ -81,10 +81,10 @@ mcp = FastMCP(
 
 # --- Register all tools ---
 
-from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read
-from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update, vault_patch_section as _vault_patch_section, vault_append as _vault_append, vault_batch_write as _vault_batch_write, vault_str_replace as _vault_str_replace
+from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read, vault_read_section as _vault_read_section
+from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update, vault_patch_section as _vault_patch_section, vault_append as _vault_append, vault_batch_write as _vault_batch_write, vault_str_replace as _vault_str_replace, vault_batch_str_replace as _vault_batch_str_replace
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
-from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete
+from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete, vault_batch_delete as _vault_batch_delete, vault_recent_changes as _vault_recent_changes, vault_stats as _vault_stats
 from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search
 from .models import (
     VaultReadInput,
@@ -100,29 +100,42 @@ from .models import (
     VaultAppendInput,
     VaultBatchWriteInput,
     VaultStrReplaceInput,
+    VaultReadSectionInput,
+    VaultBatchDeleteInput,
+    VaultBatchStrReplaceInput,
+    VaultRecentChangesInput,
+    VaultStatsInput,
 )
 
 
 @mcp.tool(
     name="vault_read",
-    description="Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter.",
+    description=(
+        "Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter. "
+        "If the file has read_policy: section-only in its frontmatter, returns a preview and warning instead of full content — "
+        "use vault_read_section for targeted reading, or pass force=True to read the full file regardless. "
+        "Use max_chars to truncate large files."
+    ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def vault_read(path: str) -> str:
+def vault_read(path: str, force: bool = False, max_chars: int | None = None) -> str:
     """Read a file from the vault."""
-    inp = VaultReadInput(path=path)
-    return _vault_read(inp.path)
+    inp = VaultReadInput(path=path, force=force, max_chars=max_chars)
+    return _vault_read(inp.path, inp.force, inp.max_chars)
 
 
 @mcp.tool(
     name="vault_batch_read",
-    description="Read multiple files from the vault in one call. Handles missing files gracefully.",
+    description=(
+        "Read multiple files from the vault in one call. Handles missing files gracefully. "
+        "Files with read_policy: section-only return a preview and warning per-file unless force=True is set."
+    ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
+def vault_batch_read(paths: list[str], include_content: bool = True, force: bool = False) -> str:
     """Read multiple files at once."""
-    inp = VaultBatchReadInput(paths=paths, include_content=include_content)
-    return _vault_batch_read(inp.paths, inp.include_content)
+    inp = VaultBatchReadInput(paths=paths, include_content=include_content, force=force)
+    return _vault_batch_read(inp.paths, inp.include_content, inp.force)
 
 
 @mcp.tool(
@@ -183,7 +196,11 @@ def vault_search_frontmatter(
 
 @mcp.tool(
     name="vault_list",
-    description="List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. Excludes .obsidian, .trash, .git directories.",
+    description=(
+        "List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. "
+        "Excludes .obsidian, .trash, .git directories. "
+        "Pass frontmatter_fields to include specific YAML frontmatter values from each .md file in the listing."
+    ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_list(
@@ -192,10 +209,11 @@ def vault_list(
     include_files: bool = True,
     include_dirs: bool = True,
     pattern: str | None = None,
+    frontmatter_fields: list[str] | None = None,
 ) -> str:
     """List vault directory contents."""
-    inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern)
-    return _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern)
+    inp = VaultListInput(path=path, depth=depth, include_files=include_files, include_dirs=include_dirs, pattern=pattern, frontmatter_fields=frontmatter_fields)
+    return _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern, inp.frontmatter_fields)
 
 
 @mcp.tool(
@@ -255,13 +273,94 @@ def vault_batch_write(files: list[dict]) -> str:
 
 @mcp.tool(
     name="vault_str_replace",
-    description="Replace a unique string in a vault file with another string. old_str must appear exactly once in the file. Safer and cheaper than vault_write for inline edits.",
+    description=(
+        "Replace a unique string in a vault file with another string. old_str must appear exactly once in the file. "
+        "Safer and cheaper than vault_write for inline edits. "
+        "Pass regex=True to treat old_str as a Python regex pattern (must match exactly once)."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_str_replace(path: str, old_str: str, new_str: str) -> str:
+def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False) -> str:
     """Replace a unique string in a vault file."""
-    inp = VaultStrReplaceInput(path=path, old_str=old_str, new_str=new_str)
-    return _vault_str_replace(inp.path, inp.old_str, inp.new_str)
+    inp = VaultStrReplaceInput(path=path, old_str=old_str, new_str=new_str, regex=regex)
+    return _vault_str_replace(inp.path, inp.old_str, inp.new_str, inp.regex)
+
+
+@mcp.tool(
+    name="vault_read_section",
+    description=(
+        "Read a single markdown section by heading name. Returns only the content between the specified heading "
+        "and the next heading of equal or higher level. Much cheaper than vault_read for large files — "
+        "use this when you only need one section. "
+        "If the section is not found, returns the list of available sections so you can retry."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_read_section(path: str, section: str) -> str:
+    """Read a single markdown section by heading name."""
+    inp = VaultReadSectionInput(path=path, section=section)
+    return _vault_read_section(inp.path, inp.section)
+
+
+@mcp.tool(
+    name="vault_batch_delete",
+    description=(
+        "Delete multiple files in one call by moving them to .trash/. "
+        "Requires confirm=true as a safety gate. "
+        "Results reported per-file — the batch does not abort on individual failures."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_batch_delete(paths: list[str], confirm: bool = False) -> str:
+    """Delete multiple files (move to .trash/)."""
+    inp = VaultBatchDeleteInput(paths=paths, confirm=confirm)
+    return _vault_batch_delete(inp.paths, inp.confirm)
+
+
+@mcp.tool(
+    name="vault_batch_str_replace",
+    description=(
+        "Replace unique strings in multiple files in one call. "
+        "Each replacement specifies path, old_str, new_str, and an optional regex flag. "
+        "Results reported per-file — the batch does not abort on individual failures. "
+        "Safer and cheaper than multiple individual vault_str_replace calls."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def vault_batch_str_replace(replacements: list[dict]) -> str:
+    """Replace unique strings in multiple vault files."""
+    inp = VaultBatchStrReplaceInput(replacements=replacements)
+    return _vault_batch_str_replace(inp.replacements)
+
+
+@mcp.tool(
+    name="vault_recent_changes",
+    description=(
+        "Return vault .md files modified after a given ISO datetime, sorted by most recent first. "
+        "Useful for session-start: 'what changed since my last session?' "
+        "Walks the full vault respecting excluded directories."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_recent_changes(since: str, limit: int = 20) -> str:
+    """Return vault files modified after a given datetime."""
+    inp = VaultRecentChangesInput(since=since, limit=limit)
+    return _vault_recent_changes(inp.since, inp.limit)
+
+
+@mcp.tool(
+    name="vault_stats",
+    description=(
+        "Return vault-wide aggregate statistics: total .md files, total size in KB, "
+        "10 largest files, 10 most recently modified files. "
+        "Quick health overview without listing everything."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_stats() -> str:
+    """Return vault-wide aggregate statistics."""
+    VaultStatsInput()
+    return _vault_stats()
 
 
 if SEMANTIC_AVAILABLE:

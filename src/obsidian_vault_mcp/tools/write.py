@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 import frontmatter
 
@@ -122,19 +123,30 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
         return json.dumps({"error": str(e), "path": path})
 
 
-def vault_str_replace(path: str, old_str: str, new_str: str) -> str:
-    """Replace a unique string in a vault file with another string."""
+def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False) -> str:
+    """Replace a unique string in a vault file with another string. Supports regex."""
     try:
         content, _ = read_file(path)
-        count = content.count(old_str)
-        if count == 0:
-            return json.dumps({"error": f"String not found in {path}", "path": path})
-        if count > 1:
-            return json.dumps({
-                "error": f"String appears {count} times in {path} — must be unique. Add surrounding context to disambiguate.",
-                "path": path,
-            })
-        new_content = content.replace(old_str, new_str, 1)
+        if regex:
+            matches = re.findall(old_str, content)
+            if len(matches) == 0:
+                return json.dumps({"error": f"Regex pattern not found in {path}", "path": path})
+            if len(matches) > 1:
+                return json.dumps({
+                    "error": f"Regex pattern matches {len(matches)} times in {path} — must be unique. Refine the pattern.",
+                    "path": path,
+                })
+            new_content = re.sub(old_str, new_str, content, count=1)
+        else:
+            count = content.count(old_str)
+            if count == 0:
+                return json.dumps({"error": f"String not found in {path}", "path": path})
+            if count > 1:
+                return json.dumps({
+                    "error": f"String appears {count} times in {path} — must be unique. Add surrounding context to disambiguate.",
+                    "path": path,
+                })
+            new_content = content.replace(old_str, new_str, 1)
         _, size = write_file_atomic(path, new_content)
         return json.dumps(sanitize_for_json({
             "path": path,
@@ -146,9 +158,69 @@ def vault_str_replace(path: str, old_str: str, new_str: str) -> str:
         return json.dumps({"error": str(e), "path": path})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
+    except re.error as e:
+        return json.dumps({"error": f"Invalid regex: {e}", "path": path})
     except Exception as e:
         logger.error(f"vault_str_replace error for {path}: {e}")
         return json.dumps({"error": str(e), "path": path})
+
+
+def vault_batch_str_replace(replacements: list[dict]) -> str:
+    """Replace unique strings in multiple files in one call."""
+    results = []
+    changed = 0
+    failed = 0
+
+    for item in replacements:
+        file_path = item.get("path", "")
+        old_str = item.get("old_str", "")
+        new_str = item.get("new_str", "")
+        use_regex = item.get("regex", False)
+
+        try:
+            content, _ = read_file(file_path)
+            if use_regex:
+                matches = re.findall(old_str, content)
+                if len(matches) == 0:
+                    results.append({"path": file_path, "error": "Regex pattern not found"})
+                    failed += 1
+                    continue
+                if len(matches) > 1:
+                    results.append({"path": file_path, "error": f"Regex matches {len(matches)} times — must be unique"})
+                    failed += 1
+                    continue
+                new_content = re.sub(old_str, new_str, content, count=1)
+            else:
+                count = content.count(old_str)
+                if count == 0:
+                    results.append({"path": file_path, "error": "String not found"})
+                    failed += 1
+                    continue
+                if count > 1:
+                    results.append({"path": file_path, "error": f"String appears {count} times — must be unique"})
+                    failed += 1
+                    continue
+                new_content = content.replace(old_str, new_str, 1)
+            write_file_atomic(file_path, new_content)
+            results.append({
+                "path": file_path,
+                "changed": True,
+                "old_length": len(content),
+                "new_length": len(new_content),
+            })
+            changed += 1
+        except FileNotFoundError:
+            results.append({"path": file_path, "error": f"File not found: {file_path}"})
+            failed += 1
+        except re.error as e:
+            results.append({"path": file_path, "error": f"Invalid regex: {e}"})
+            failed += 1
+        except Exception as e:
+            logger.error(f"vault_batch_str_replace error for {file_path}: {e}")
+            results.append({"path": file_path, "error": str(e)})
+            failed += 1
+
+    return json.dumps(sanitize_for_json({"results": results, "changed": changed, "failed": failed}), cls=SafeJSONEncoder)
 
 
 def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
