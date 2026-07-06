@@ -5,10 +5,12 @@ Designed to run behind Cloudflare Tunnel for secure remote access.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import sys
+import traceback
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
@@ -283,6 +285,57 @@ if SEMANTIC_AVAILABLE:
         return await asyncio.to_thread(_vault_semantic_search, query, max_results, path_prefix)
 
 
+class TeamBotSiblingDispatcher:
+    """Routes /mcp/teambot* to the teambot sub-app; all other requests to main app.
+
+    The main app's middleware stack is completely untouched — a bug in the
+    teambot route cannot affect the main vault-serving path.
+    """
+
+    def __init__(self, main_app, teambot_app):
+        self._main = main_app
+        self._teambot = teambot_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "lifespan":
+            await self._lifespan(scope, receive, send)
+            return
+
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path == "/mcp/teambot" or path.startswith("/mcp/teambot/"):
+                suffix = path[len("/mcp/teambot"):]
+                new_scope = dict(scope)
+                new_scope["path"] = "/mcp" + suffix
+                new_scope["raw_path"] = ("/mcp" + suffix).encode()
+                await self._teambot(new_scope, receive, send)
+                return
+
+        await self._main(scope, receive, send)
+
+    async def _lifespan(self, scope, receive, send):
+        """Drive both apps' lifespans concurrently."""
+        started = False
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                await stack.enter_async_context(
+                    self._main.router.lifespan_context(self._main)
+                )
+                await stack.enter_async_context(
+                    self._teambot.router.lifespan_context(self._teambot)
+                )
+                await send({"type": "lifespan.startup.complete"})
+                started = True
+                await receive()  # wait for lifespan.shutdown
+            await send({"type": "lifespan.shutdown.complete"})
+        except Exception as exc:
+            if not started:
+                msg = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                await send({"type": "lifespan.startup.failed", "message": msg})
+            else:
+                raise
+
+
 def main():
     """Entry point. Run with streamable HTTP transport."""
     logging.basicConfig(
@@ -302,6 +355,7 @@ def main():
     try:
         from .auth import BearerAuthMiddleware
         from .oauth import oauth_routes
+        from .teambot import build_teambot_app
 
         app = mcp.streamable_http_app()
 
@@ -311,11 +365,15 @@ def main():
 
         app.add_middleware(BearerAuthMiddleware)
         app.add_middleware(SecretPathMiddleware)  # outermost — runs first, blocks wrong paths before auth
-        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
+
+        teambot_app = build_teambot_app()
+        combined = TeamBotSiblingDispatcher(app, teambot_app)
+
+        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth + teambot route")
 
         import uvicorn
         uvicorn.run(
-            app,
+            combined,
             host="0.0.0.0",
             port=VAULT_MCP_PORT,
             log_level="info",

@@ -4,6 +4,7 @@ from pathlib import Path
 # Vault configuration
 VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/MyVault")))
 VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
+TEAMBOT_MCP_TOKEN = os.environ.get("TEAMBOT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
 # OAuth 2.0 client credentials (for Claude app integration)
