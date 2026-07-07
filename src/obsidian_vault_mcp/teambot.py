@@ -30,6 +30,7 @@ from .tools.write import (
 )
 from .tools.search import vault_search as _vault_search
 from .tools.manage import vault_list as _vault_list
+from .tools.semantic_search import vault_semantic_search as _vault_semantic_search
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,24 @@ def validate_teambot_path(path: str) -> None:
         f"Path '{path}' is outside teambot scope. "
         f"Allowed prefixes: {TEAMBOT_ALLOWED_PREFIXES}"
     )
+
+
+def resolve_semantic_prefix(path_prefix: str | None) -> list[str]:
+    """Return the effective search prefix(es) for vault_semantic_search.
+
+    Rules:
+    - If path_prefix is within an allowed prefix, use it as-is.
+    - If path_prefix is outside scope or not provided, fall back to all allowed
+      prefixes (caller gets a union search across all in-scope roots).
+    - Never returns any prefix outside TEAMBOT_ALLOWED_PREFIXES.
+    """
+    if path_prefix:
+        normalized = posixpath.normpath(path_prefix)
+        for allowed in TEAMBOT_ALLOWED_PREFIXES:
+            if normalized == allowed or normalized.startswith(allowed + "/"):
+                return [path_prefix]
+    # Fallback: all allowed prefixes
+    return list(TEAMBOT_ALLOWED_PREFIXES)
 
 
 class TeamBotBearerAuthMiddleware(BaseHTTPMiddleware):
@@ -251,6 +270,46 @@ def build_teambot_app():
         except ValueError as e:
             return json.dumps({"error": str(e)})
         return _vault_list(path, depth, include_files, include_dirs, pattern)
+
+    @tb_mcp.tool(
+        name="vault_semantic_search",
+        description=(
+            "Search vault files by semantic similarity (nickname/partial-name matching). "
+            "path_prefix is optional: if within BS 2nd Brain/Alcove/Clients/, "
+            "BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/, "
+            "that prefix is used. Otherwise (or if omitted), all three allowed prefixes "
+            "are searched. Results are always restricted to the allowed prefixes."
+        ),
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    )
+    async def vault_semantic_search(
+        query: str,
+        max_results: int = 5,
+        path_prefix: str | None = None,
+    ) -> str:
+        import asyncio
+        prefixes = resolve_semantic_prefix(path_prefix)
+        if len(prefixes) == 1:
+            return await asyncio.to_thread(_vault_semantic_search, query, max_results, prefixes[0])
+        # Union search across all allowed prefixes — merge and re-rank by score
+        results_per_prefix = await asyncio.gather(
+            *[asyncio.to_thread(_vault_semantic_search, query, max_results, p) for p in prefixes]
+        )
+        merged: list = []
+        seen: set = set()
+        for raw in results_per_prefix:
+            try:
+                parsed = json.loads(raw)
+                items = parsed if isinstance(parsed, list) else parsed.get("results", [])
+            except Exception:
+                continue
+            for item in items:
+                key = item.get("path", "")
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(item)
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return json.dumps(merged[:max_results])
 
     app = tb_mcp.streamable_http_app()
     app.add_middleware(TeamBotBearerAuthMiddleware)
