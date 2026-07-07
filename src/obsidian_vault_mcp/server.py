@@ -6,10 +6,12 @@ Designed to run behind Cloudflare Tunnel for secure remote access.
 
 import asyncio
 import atexit
+import contextlib
 import json
 import logging
 import os
 import sys
+import traceback
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
@@ -84,8 +86,9 @@ mcp = FastMCP(
 from .tools.read import vault_read as _vault_read, vault_batch_read as _vault_batch_read, vault_read_section as _vault_read_section
 from .tools.write import vault_write as _vault_write, vault_batch_frontmatter_update as _vault_batch_frontmatter_update, vault_patch_section as _vault_patch_section, vault_append as _vault_append, vault_batch_write as _vault_batch_write, vault_str_replace as _vault_str_replace, vault_batch_str_replace as _vault_batch_str_replace
 from .tools.search import vault_search as _vault_search, vault_search_frontmatter as _vault_search_frontmatter
-from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete, vault_batch_delete as _vault_batch_delete, vault_recent_changes as _vault_recent_changes, vault_stats as _vault_stats
-from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search
+from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete, vault_batch_delete as _vault_batch_delete, vault_recent_changes as _vault_recent_changes, vault_stats as _vault_stats, vault_session_start as _vault_session_start
+from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search, schedule_reindex as _schedule_reindex, vault_read_smart as _vault_read_smart
+from .tools.context import vault_client_context as _vault_client_context
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -105,6 +108,9 @@ from .models import (
     VaultBatchStrReplaceInput,
     VaultRecentChangesInput,
     VaultStatsInput,
+    VaultSessionStartInput,
+    VaultReadSmartInput,
+    VaultClientContextInput,
 )
 
 
@@ -146,7 +152,12 @@ def vault_batch_read(paths: list[str], include_content: bool = True, force: bool
 def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
     """Write a file to the vault."""
     inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    return _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+    result = _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+    try:
+        _schedule_reindex(inp.path)
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -157,7 +168,13 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     """Batch update frontmatter fields."""
     inp = VaultBatchFrontmatterUpdateInput(updates=updates)
-    return _vault_batch_frontmatter_update(inp.updates)
+    result = _vault_batch_frontmatter_update(inp.updates)
+    try:
+        for item in inp.updates:
+            _schedule_reindex(item.get("path", ""))
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -224,7 +241,13 @@ def vault_list(
 def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
     """Move a file or directory."""
     inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs)
-    return _vault_move(inp.source, inp.destination, inp.create_dirs)
+    result = _vault_move(inp.source, inp.destination, inp.create_dirs)
+    try:
+        _schedule_reindex(inp.source)
+        _schedule_reindex(inp.destination)
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -235,7 +258,12 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
 def vault_delete(path: str, confirm: bool = False) -> str:
     """Delete a file (move to .trash/)."""
     inp = VaultDeleteInput(path=path, confirm=confirm)
-    return _vault_delete(inp.path, inp.confirm)
+    result = _vault_delete(inp.path, inp.confirm)
+    try:
+        _schedule_reindex(inp.path)
+    except Exception:
+        pass
+    return result
 
 
 
@@ -247,7 +275,12 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 def vault_patch_section(path: str, section: str, content: str) -> str:
     """Patch a single markdown section in a vault file."""
     inp = VaultPatchSectionInput(path=path, section=section, content=content)
-    return _vault_patch_section(inp.path, inp.section, inp.content)
+    result = _vault_patch_section(inp.path, inp.section, inp.content)
+    try:
+        _schedule_reindex(inp.path)
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -258,7 +291,12 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
 def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
     """Append content to a vault file."""
     inp = VaultAppendInput(path=path, content=content, ensure_newline=ensure_newline)
-    return _vault_append(inp.path, inp.content, inp.ensure_newline)
+    result = _vault_append(inp.path, inp.content, inp.ensure_newline)
+    try:
+        _schedule_reindex(inp.path)
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -269,7 +307,13 @@ def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
 def vault_batch_write(files: list[dict]) -> str:
     """Write multiple vault files in one call."""
     inp = VaultBatchWriteInput(files=files)
-    return _vault_batch_write(inp.files)
+    result = _vault_batch_write(inp.files)
+    try:
+        for item in inp.files:
+            _schedule_reindex(item.get("path", ""))
+    except Exception:
+        pass
+    return result
 
 @mcp.tool(
     name="vault_str_replace",
@@ -283,7 +327,12 @@ def vault_batch_write(files: list[dict]) -> str:
 def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False) -> str:
     """Replace a unique string in a vault file."""
     inp = VaultStrReplaceInput(path=path, old_str=old_str, new_str=new_str, regex=regex)
-    return _vault_str_replace(inp.path, inp.old_str, inp.new_str, inp.regex)
+    result = _vault_str_replace(inp.path, inp.old_str, inp.new_str, inp.regex)
+    try:
+        _schedule_reindex(inp.path)
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -330,7 +379,13 @@ def vault_batch_delete(paths: list[str], confirm: bool = False) -> str:
 def vault_batch_str_replace(replacements: list[dict]) -> str:
     """Replace unique strings in multiple vault files."""
     inp = VaultBatchStrReplaceInput(replacements=replacements)
-    return _vault_batch_str_replace(inp.replacements)
+    result = _vault_batch_str_replace(inp.replacements)
+    try:
+        for item in inp.replacements:
+            _schedule_reindex(item.get("path", ""))
+    except Exception:
+        pass
+    return result
 
 
 @mcp.tool(
@@ -363,6 +418,43 @@ def vault_stats() -> str:
     return _vault_stats()
 
 
+@mcp.tool(
+    name="vault_session_start",
+    description=(
+        "Bundle tool for session start. Returns vault stats, files modified since `since` (default 7 days), "
+        "manifest summary (if present), and a pointer to _SCHEMA.md with the current write-rule count. "
+        "One call replaces vault_stats + vault_recent_changes at session start."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_session_start(since: str | None = None) -> str:
+    """Return bundled session-start data."""
+    inp = VaultSessionStartInput(since=since)
+    return _vault_session_start(inp.since)
+
+
+@mcp.tool(
+    name="vault_client_context",
+    description=(
+        "Scoped session-start for a single client. One call returns: the matched client note (full content + frontmatter), "
+        "hot.md (Skills/hot.md), sp_folder_id from the client note frontmatter, and related file paths. "
+        "Replaces vault_session_start + hot.md read + client search + client note read (4 calls → 1) for single-client tasks. "
+        "If the client query matches multiple notes, returns candidates for disambiguation without reading content. "
+        "If no match, returns client_note: null + template_path. "
+        "Use vault_session_start for vault-wide or multi-client sessions."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_client_context(
+    client: str,
+    include_hot: bool = True,
+    include_instructions: bool = False,
+) -> str:
+    """Return scoped session context for a single client."""
+    inp = VaultClientContextInput(client=client, include_hot=include_hot, include_instructions=include_instructions)
+    return _vault_client_context(inp.client, inp.include_hot, inp.include_instructions)
+
+
 if SEMANTIC_AVAILABLE:
     @mcp.tool(
         name="vault_semantic_search",
@@ -370,8 +462,8 @@ if SEMANTIC_AVAILABLE:
             "Search vault files by semantic similarity rather than exact keywords. "
             "Returns ranked results with path, relevance score, snippet, and section heading. "
             "Best for conceptual or natural-language queries. "
-            "Index refreshes automatically every few hours. "
-            "For content written in the last few minutes, use vault_search instead."
+            "Index refreshes on every write (debounced ~5s) and on a 30-minute floor. "
+            "Current-session content is searchable within seconds. Use vault_search only for content written in the last few seconds."
         ),
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
@@ -382,6 +474,103 @@ if SEMANTIC_AVAILABLE:
     ) -> str:
         """Search vault by semantic similarity."""
         return await asyncio.to_thread(_vault_semantic_search, query, max_results, path_prefix)
+
+    @mcp.tool(
+        name="vault_read_smart",
+        description=(
+            "Read only the relevant sections of a large file using semantic similarity. "
+            "Chunks the file by headings, embeds each chunk, and returns the top max_sections "
+            "sections most relevant to your query. "
+            "Best for large files (>8KB) like changelogs or master notes where you only need one topic. "
+            "Falls back to full content if the file is small, or a section list if embedding fails."
+        ),
+        annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    )
+    async def vault_read_smart(path: str, query: str, max_sections: int = 3) -> str:
+        """Read the most relevant sections of a file for a given query."""
+        inp = VaultReadSmartInput(path=path, query=query, max_sections=max_sections)
+        return await asyncio.to_thread(_vault_read_smart, inp.path, inp.query, inp.max_sections)
+
+
+class TeamBotSiblingDispatcher:
+    """Routes /mcp/teambot* to the teambot sub-app; all other requests to main app.
+
+    The main app's middleware stack is completely untouched — a bug in the
+    teambot route cannot affect the main vault-serving path.
+    """
+
+    def __init__(self, main_app, teambot_app):
+        self._main = main_app
+        self._teambot = teambot_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "lifespan":
+            await self._lifespan(scope, receive, send)
+            return
+
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path == "/mcp/teambot" or path.startswith("/mcp/teambot/"):
+                suffix = path[len("/mcp/teambot"):]
+                new_scope = dict(scope)
+                new_scope["path"] = "/mcp" + suffix
+                new_scope["raw_path"] = ("/mcp" + suffix).encode()
+                await self._teambot(new_scope, receive, send)
+                return
+
+        await self._main(scope, receive, send)
+
+    async def _lifespan(self, scope, receive, send):
+        """Drive both apps' lifespans by sending proper ASGI lifespan events to each."""
+        import anyio
+
+        asgi_version = scope.get("asgi", {})
+        main_started = anyio.Event()
+        teambot_started = anyio.Event()
+        shutdown_trigger = anyio.Event()
+
+        async def run_app_lifespan(app, started_event):
+            """Simulate the full ASGI lifespan protocol for one app."""
+            received_shutdown = anyio.Event()
+
+            async def app_receive():
+                if not started_event.is_set():
+                    return {"type": "lifespan.startup"}
+                await received_shutdown.wait()
+                return {"type": "lifespan.shutdown"}
+
+            async def app_send(message):
+                if message["type"] == "lifespan.startup.complete":
+                    started_event.set()
+                elif message["type"] == "lifespan.startup.failed":
+                    started_event.set()  # unblock even on failure
+
+            # Drive lifespan in background; shutdown when outer trigger fires
+            async with anyio.create_task_group() as sub_tg:
+                sub_tg.start_soon(
+                    app,
+                    {"type": "lifespan", "asgi": asgi_version},
+                    app_receive,
+                    app_send,
+                )
+                await started_event.wait()
+                await shutdown_trigger.wait()
+                received_shutdown.set()
+
+        try:
+            await receive()  # consume lifespan.startup from uvicorn before proceeding
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(run_app_lifespan, self._main, main_started)
+                tg.start_soon(run_app_lifespan, self._teambot, teambot_started)
+                await main_started.wait()
+                await teambot_started.wait()
+                await send({"type": "lifespan.startup.complete"})
+                await receive()  # wait for uvicorn lifespan.shutdown
+                shutdown_trigger.set()
+            await send({"type": "lifespan.shutdown.complete"})
+        except Exception as exc:
+            msg = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            await send({"type": "lifespan.startup.failed", "message": msg})
 
 
 def main():
@@ -402,21 +591,29 @@ def main():
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
         from .auth import BearerAuthMiddleware
-        from .oauth import oauth_routes
+        import os as _os
 
         app = mcp.streamable_http_app()
 
-        # Mount OAuth routes (these are excluded from bearer auth via the middleware)
-        for route in oauth_routes:
-            app.routes.insert(0, route)
+        # Mount OAuth 2.1 routes only when password gate is configured
+        if _os.environ.get("VAULT_AUTH_PASSWORD"):
+            from .oauth import oauth_routes
+            for route in oauth_routes:
+                app.routes.insert(0, route)
+            logger.info("OAuth 2.1 password gate active")
 
         app.add_middleware(BearerAuthMiddleware)
         app.add_middleware(SecretPathMiddleware)  # outermost — runs first, blocks wrong paths before auth
-        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth")
+
+        from .teambot import build_teambot_app
+        teambot_app = build_teambot_app()
+        combined = TeamBotSiblingDispatcher(app, teambot_app)
+
+        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth + teambot route")
 
         import uvicorn
         uvicorn.run(
-            app,
+            combined,
             host="0.0.0.0",
             port=VAULT_MCP_PORT,
             log_level="info",
