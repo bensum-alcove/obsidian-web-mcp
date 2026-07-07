@@ -1,8 +1,9 @@
 """Teambot-scoped MCP sub-application for BS Team Bot.
 
 Exposes a path-filtered subset of vault tools restricted to:
-  - Alcove/Clients/
-  - Alcove/Operations/Todo/
+  - BS 2nd Brain/Alcove/Clients/
+  - BS 2nd Brain/Alcove/Operations/Todo/
+  - BS 2nd Brain/Alcove/Triage/
 
 NOTE: This module must NOT import from .server (circular import risk).
 """
@@ -33,8 +34,9 @@ from .tools.manage import vault_list as _vault_list
 logger = logging.getLogger(__name__)
 
 TEAMBOT_ALLOWED_PREFIXES = [
-    "Alcove/Clients",
-    "Alcove/Operations/Todo",
+    "BS 2nd Brain/Alcove/Clients",
+    "BS 2nd Brain/Alcove/Operations/Todo",
+    "BS 2nd Brain/Alcove/Triage",
 ]
 
 
@@ -109,7 +111,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_read",
-        description="Read a file from the vault (scoped: Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Read a file from the vault (scoped: BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
     def vault_read(path: str) -> str:
@@ -121,7 +123,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_batch_read",
-        description="Read multiple files (all paths must be in Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Read multiple files (all paths must be in BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
     def vault_batch_read(paths: list[str], include_content: bool = True) -> str:
@@ -134,7 +136,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_write",
-        description="Write a file (scoped: Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Write a file (scoped: BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     )
     def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
@@ -146,7 +148,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_append",
-        description="Append content to a vault file (scoped: Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Append content to a vault file (scoped: BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     )
     def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
@@ -158,7 +160,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_patch_section",
-        description="Patch a markdown section (scoped: Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Patch a markdown section (scoped: BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     )
     def vault_patch_section(path: str, section: str, content: str) -> str:
@@ -170,7 +172,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_str_replace",
-        description="Replace a unique string in a vault file (scoped: Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Replace a unique string in a vault file (scoped: BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
     )
     def vault_str_replace(path: str, old_str: str, new_str: str) -> str:
@@ -182,7 +184,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_batch_write",
-        description="Write multiple files (all paths must be in Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Write multiple files (all paths must be in BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     )
     def vault_batch_write(files: list[dict]) -> str:
@@ -196,7 +198,7 @@ def build_teambot_app():
 
     @tb_mcp.tool(
         name="vault_batch_frontmatter_update",
-        description="Update frontmatter on multiple files (all paths must be in Alcove/Clients/ or Alcove/Operations/Todo/).",
+        description="Update frontmatter on multiple files (all paths must be in BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/).",
         annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
     def vault_batch_frontmatter_update(updates: list[dict]) -> str:
@@ -212,7 +214,7 @@ def build_teambot_app():
         name="vault_search",
         description=(
             "Search vault files by keyword. path_prefix is required and must be "
-            "within Alcove/Clients/ or Alcove/Operations/Todo/."
+            "within BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/."
         ),
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
@@ -233,7 +235,7 @@ def build_teambot_app():
         name="vault_list",
         description=(
             "List directory contents. path is required and must be "
-            "within Alcove/Clients/ or Alcove/Operations/Todo/."
+            "within BS 2nd Brain/Alcove/Clients/, BS 2nd Brain/Alcove/Operations/Todo/, or BS 2nd Brain/Alcove/Triage/."
         ),
         annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     )
