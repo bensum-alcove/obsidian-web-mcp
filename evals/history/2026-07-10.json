@@ -1,0 +1,83 @@
+{
+  "vault_search": {
+    "clients": {
+      "r_at_5": 0.9,
+      "mrr": 0.9111,
+      "n": 10
+    },
+    "infrastructure": {
+      "r_at_5": 0.0,
+      "mrr": 0.0,
+      "n": 10
+    },
+    "skills": {
+      "r_at_5": 0.4,
+      "mrr": 0.4,
+      "n": 10
+    },
+    "operations": {
+      "r_at_5": 0.5,
+      "mrr": 0.5143,
+      "n": 10
+    },
+    "overall": {
+      "r_at_5": 0.45,
+      "mrr": 0.4563,
+      "n": 40
+    }
+  },
+  "vault_semantic_search": {
+    "clients": {
+      "r_at_5": 0.9,
+      "mrr": 0.825,
+      "n": 10
+    },
+    "infrastructure": {
+      "r_at_5": 0.3,
+      "mrr": 0.3361,
+      "n": 10
+    },
+    "skills": {
+      "r_at_5": 0.6,
+      "mrr": 0.4283,
+      "n": 10
+    },
+    "operations": {
+      "r_at_5": 0.8,
+      "mrr": 0.8,
+      "n": 10
+    },
+    "overall": {
+      "r_at_5": 0.65,
+      "mrr": 0.5974,
+      "n": 40
+    }
+  },
+  "vault_query": {
+    "clients": {
+      "r_at_5": 1.0,
+      "mrr": 1.0,
+      "n": 10
+    },
+    "infrastructure": {
+      "r_at_5": 0.3,
+      "mrr": 0.1433,
+      "n": 10
+    },
+    "skills": {
+      "r_at_5": 0.7,
+      "mrr": 0.5311,
+      "n": 10
+    },
+    "operations": {
+      "r_at_5": 0.8,
+      "mrr": 0.5861,
+      "n": 10
+    },
+    "overall": {
+      "r_at_5": 0.7,
+      "mrr": 0.5651,
+      "n": 40
+    }
+  }
+}

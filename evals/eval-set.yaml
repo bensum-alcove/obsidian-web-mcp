@@ -1,0 +1,207 @@
+# vault-retrieval-eval — 40-question R@5/MRR eval set for BS Brain vault retrieval.
+#
+# Each entry: {question, expected_paths, category}. expected_paths are relative to
+# VAULT_PATH (BS Brain root) — one or more acceptable files that correctly answer
+# the question. All paths verified to exist in the vault as of 2026-07-10.
+#
+# Categories: clients (10), infrastructure (10), skills (10), operations (10).
+
+- question: "Which lender is Carlos Cacho refinancing to for the equity release on his Dulwich Hill property?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cacho, Carlos.md"
+  category: clients
+
+- question: "What property did Andrew and Camilla Griffin sign a contract to purchase in Seaforth, and for how much?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Griffin, Andrew & Camilla.md"
+  category: clients
+
+- question: "What was the one-off cash make-whole payment KKR paid Daniel Kearns in his June 2026 payslip?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Kearns, Daniel.md"
+  category: clients
+
+- question: "Who is Peter Dickson's employer, and which lender currently holds the Dicksons' existing $2.461m portfolio debt?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Dickson, Peter & Dickson, Virginia.md"
+  category: clients
+
+- question: "What commercial property are Scott and Tracey Duff purchasing in Fyshwick ACT, and who is the tenant?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Duff, Scott & Tracey.md"
+  category: clients
+
+- question: "What is the purchase price target and suburb for Alex Ghamraoui and Shannon Pearce's new owner-occupied home?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Ghamraoui, Alex & Pearce, Shannon.md"
+  category: clients
+
+- question: "What is the total facility size and LVR being sought against Sean Huang and Xinying Wang's Bellevue Hill property?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Huang, Xuan Yuan & Wang, Xinying.md"
+  category: clients
+
+- question: "What is Nathan Taylor's base salary at Jarden, and what is the family's Mosman home valued at?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Taylor, Nathan & Tess.md"
+  category: clients
+
+- question: "What off-the-plan property are Laura and Dylan Goodall purchasing, and why do they need two servicing calculations?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Goodall, Laura & Dylan.md"
+  category: clients
+
+- question: "What is blocking Simon Holt's $12.685m Westpac refinance and equity release deal from proceeding?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Holt, Simon.md"
+  category: clients
+
+- question: "What is the correct environment variable name for the vault MCP bearer token, and what incorrect name was never actually deployed?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "What port does the BS Brain vault MCP server run on, and what is its filesystem root path?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "Where is the live obsidian-web-mcp checkout that actually powers the running vault MCP servers, and which git branch is it on?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "Does a BS_BRAIN_API_KEY environment variable exist anywhere in the infrastructure?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "Where is supervisord's config directory located on BSMiniPC, and where is it commonly but wrongly assumed to be?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "What IBKR client ID does the live SPI trading system actually use, and what ID was previously wrongly assumed?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "What ports do the Alcove Brain and CB Brain vault MCP servers run on?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "Where do Build Orchestrator specs and schedule YAML files live in the vault?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "What does an HTTP 502 error from a vault MCP tunnel URL actually indicate?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "What tool call reliably indicates whether the Home Assistant MCP process is down, as opposed to just the tunnel?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure
+
+- question: "When should Claude use vault_search versus vault_semantic_search?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/vault-search-rules.md"
+  category: skills
+
+- question: "What four files must be batch-read at the very start of a daily email triage session?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/Triage-SOP.md"
+  category: skills
+
+- question: "What is Codex's role relative to Claude in Ben's AI architecture?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/Codex-Project-Instructions.md"
+  category: skills
+
+- question: "Who is the broker of record and what is the Introducer ID used on Westpac Private application packs?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/WBC-Private-Application-Pack-SOP.md"
+  category: skills
+
+- question: "What voice and sign-off convention should an FHB lending strategy email follow?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/FHB-Lending-Strategy-Email.md"
+  category: skills
+
+- question: "What is the mandatory checkpoint in the filing-client-documents skill workflow?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/filing-client-documents-SKILL.md"
+  category: skills
+
+- question: "What are the two deliverables produced by the client-docs-required skill?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/client-docs-required-SKILL.md"
+  category: skills
+
+- question: "What tech stack powers the Alcovestats analytics dashboard, and where does its data come from?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/Alcovestats-Project-Instructions.md"
+  category: skills
+
+- question: "What two manual steps can Claude Code never perform itself during an infrastructure build?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/Infrastructure-Build-Pattern.md"
+  category: skills
+
+- question: "According to the vault schema, what is the file naming convention for client files?"
+  expected_paths:
+    - "BS 2nd Brain/_SCHEMA.md"
+  category: skills
+
+- question: "What was decided about the Responsible Lending Manager role transition, and from whom to whom?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-04-23 Broker Codes & RLM Transition - Tisha & Jon.md"
+  category: operations
+
+- question: "Why is Ben moving from lodging deals under Chris's broker code to individual broker codes for himself and Jon?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-04-23 Broker Codes & RLM Transition - Tisha & Jon.md"
+  category: operations
+
+- question: "What is the actual cyber-security-specific monthly cost in the Efex Q-24025 quote, versus its headline total?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-07-02 Efex Cyber Security Quote Review - Tisha.md"
+  category: operations
+
+- question: "What was decided about browser automation for the AFG credit report skill, and why?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Browser-Automation-Decision.md"
+  category: operations
+
+- question: "What ClawBot gateway topology was decided on, and which alternative option was rejected?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/ClawBot Topology Decision.md"
+  category: operations
+
+- question: "Which clients settled in July 2026 according to the loan book tracker, and with which lenders?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Triage/loan-book.md"
+  category: operations
+
+- question: "What Outlook folders should be created to reduce inbox noise, and what should be filed into each?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Triage/outlook-noise-filing-rules.md"
+  category: operations
+
+- question: "What was the actual root cause of the 2026-05-16 HTTP 524 incident on vault.bensum.org, and what was the initial wrong suspicion?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/vault-mcp-524-incident-2026-05-16.md"
+  category: operations
+
+- question: "What three scheduled tasks make up ClawBot's gateway watchdog on Windows, and how often does the main watchdog run?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/ClawBot Gateway Stability Fix.md"
+  category: operations
+
+- question: "How is client work split between Chris Bates deals and Matt Mohl deals in the WIP pipeline tracker?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Triage/wip.md"
+  category: operations
