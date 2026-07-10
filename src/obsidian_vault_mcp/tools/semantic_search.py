@@ -25,6 +25,7 @@ except ImportError:
     logging.warning("fastembed or sqlite-vec not available — vault_semantic_search disabled")
 
 from .. import config
+from ..vault import resolve_vault_path
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,12 @@ _index_ready = False
 
 # Max words per chunk before splitting at paragraph boundaries
 _MAX_CHUNK_WORDS = 500
+
+# Debounce state for event-triggered reindex after writes
+_DEBOUNCE_SECONDS = 5.0
+_pending_paths: set[str] = set()
+_pending_lock = threading.Lock()
+_debounce_timer: Optional[threading.Timer] = None
 
 
 def _get_model() -> "TextEmbedding":
@@ -224,7 +231,102 @@ def build_index() -> None:
             logger.error(f"Semantic index build failed: {e}", exc_info=True)
 
 
-async def periodic_reindex(interval_hours: float = 3.0) -> None:
+def reindex_paths(paths: list[str]) -> None:
+    """Incrementally re-embed specific files by path. Blocking — uses _build_lock."""
+    if not SEMANTIC_AVAILABLE or not paths:
+        return
+    with _build_lock:
+        db = None
+        try:
+            db = _open_db()
+            _ensure_schema(db)
+            model = _get_model()
+            vault_path = config.VAULT_PATH
+            updated = 0
+            for rel in paths:
+                md_file = vault_path / rel
+                try:
+                    if not md_file.exists():
+                        db.execute(
+                            "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path = ?)",
+                            (rel,),
+                        )
+                        db.execute("DELETE FROM chunks WHERE file_path = ?", (rel,))
+                        db.commit()
+                        continue
+                    mtime = md_file.stat().st_mtime
+                    content = md_file.read_text(encoding="utf-8", errors="replace")
+                    fhash = _file_hash(content)
+                    row = db.execute(
+                        "SELECT mtime, file_hash FROM chunks WHERE file_path = ? LIMIT 1", (rel,)
+                    ).fetchone()
+                    if row and row[0] == mtime and row[1] == fhash:
+                        continue
+                    db.execute(
+                        "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path = ?)",
+                        (rel,),
+                    )
+                    db.execute("DELETE FROM chunks WHERE file_path = ?", (rel,))
+                    file_chunks = _chunk_text(content)
+                    if not file_chunks:
+                        db.commit()
+                        continue
+                    embeddings = list(model.embed([c["content"] for c in file_chunks]))
+                    for i, (chunk, emb) in enumerate(zip(file_chunks, embeddings)):
+                        cur = db.execute(
+                            "INSERT INTO chunks (file_path, mtime, file_hash, chunk_index, section_heading, content)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (rel, mtime, fhash, i, chunk["heading"], chunk["content"]),
+                        )
+                        db.execute(
+                            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                            (cur.lastrowid, _serialize(emb)),
+                        )
+                    db.commit()
+                    updated += 1
+                except Exception as e:
+                    db.rollback()
+                    logger.warning(f"Event reindex failed for {rel}: {e}")
+            if updated:
+                logger.info(f"Event reindex complete: {updated} file(s) updated")
+        except Exception as e:
+            logger.error(f"Event reindex batch failed: {e}", exc_info=True)
+        finally:
+            if db is not None:
+                db.close()
+
+
+def _debounce_fire() -> None:
+    """Timer callback — drain pending paths and reindex them."""
+    global _debounce_timer
+    with _pending_lock:
+        paths = list(_pending_paths)
+        _pending_paths.clear()
+        _debounce_timer = None
+    if paths:
+        try:
+            reindex_paths(paths)
+        except Exception as e:
+            logger.error(f"Debounced reindex failed: {e}")
+
+
+def schedule_reindex(path: str) -> None:
+    """Schedule a debounced incremental reindex for a written file.
+    Safe to call from any thread. No-op if SEMANTIC_AVAILABLE is False."""
+    global _debounce_timer
+    if not SEMANTIC_AVAILABLE or not path:
+        return
+    with _pending_lock:
+        _pending_paths.add(path)
+        if _debounce_timer is not None:
+            _debounce_timer.cancel()
+        t = threading.Timer(_DEBOUNCE_SECONDS, _debounce_fire)
+        t.daemon = True
+        t.start()
+        _debounce_timer = t
+
+
+async def periodic_reindex(interval_hours: float = 0.5) -> None:
     """Re-run incremental index build on a timer."""
     while True:
         await asyncio.sleep(interval_hours * 3600)
@@ -300,3 +402,90 @@ def vault_semantic_search(
     except Exception as e:
         logger.error(f"Semantic search failed: {e}", exc_info=True)
         return json.dumps({"error": str(e)})
+
+
+def vault_read_smart(
+    path: str,
+    query: str,
+    max_sections: int = 3,
+) -> str:
+    """Section-level RAG over a single file. Returns top max_sections chunks by semantic similarity.
+    Blocking — call via asyncio.to_thread().
+    Note: read_policy: section-only is intentionally not enforced — this tool IS the section
+    selector, returning only relevant sections rather than the full content."""
+    try:
+        try:
+            md_file = resolve_vault_path(path)
+        except ValueError as e:
+            return json.dumps({"error": str(e), "path": path})
+        if not md_file.exists():
+            return json.dumps({"error": f"File not found: {path}"})
+
+        content = md_file.read_text(encoding="utf-8", errors="replace")
+
+        # Small file: return whole thing
+        if len(content) < 8192:
+            return json.dumps({"path": path, "mode": "full", "content": content})
+
+        chunks = _chunk_text(content)
+        if not chunks:
+            return json.dumps({"path": path, "mode": "full", "content": content})
+
+        try:
+            model = _get_model()
+            all_texts = [query] + [c["content"] for c in chunks]
+            all_embs = list(model.embed(all_texts))
+            query_emb = all_embs[0]
+            chunk_embs = all_embs[1:]
+
+            try:
+                import numpy as np
+                q = np.array(query_emb, dtype=float)
+                C = np.array(chunk_embs, dtype=float)
+                q_norm = float(np.linalg.norm(q))
+                c_norms = np.linalg.norm(C, axis=1)
+                scores = ((C @ q) / (c_norms * q_norm + 1e-10)).tolist()
+            except Exception:
+                def _dot(a, b) -> float:
+                    return sum(float(x) * float(y) for x, y in zip(a, b))
+                def _norm(v) -> float:
+                    return sum(float(x) * float(x) for x in v) ** 0.5
+                q_norm = _norm(query_emb)
+                scores = [
+                    _dot(ce, query_emb) / (_norm(ce) * q_norm + 1e-10)
+                    for ce in chunk_embs
+                ]
+
+            ranked = sorted(
+                zip(scores, chunks),
+                key=lambda x: x[0],
+                reverse=True,
+            )[:max_sections]
+
+            return json.dumps({
+                "path": path,
+                "mode": "smart",
+                "query": query,
+                "sections": [
+                    {
+                        "heading": c["heading"] or "",
+                        "score": round(float(s), 4),
+                        "content": c["content"],
+                    }
+                    for s, c in ranked
+                ],
+            })
+
+        except Exception as e:
+            logger.warning(f"vault_read_smart embedding failed for {path}: {e}")
+            headings = [c["heading"] for c in chunks if c["heading"]]
+            return json.dumps({
+                "path": path,
+                "mode": "fallback",
+                "note": "Embedding failed — available sections listed. Use vault_read_section to read one.",
+                "sections": headings,
+            })
+
+    except Exception as e:
+        logger.error(f"vault_read_smart error for {path}: {e}", exc_info=True)
+        return json.dumps({"error": str(e), "path": path})

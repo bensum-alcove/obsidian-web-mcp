@@ -168,6 +168,48 @@ def vault_recent_changes(since: str, limit: int = 20) -> str:
     return json.dumps({"files": files, "total": total, "since": since})
 
 
+def vault_session_start(since: str | None = None) -> str:
+    """Bundle session-start data in one call: stats + recent changes + manifest summary + schema pointer."""
+    from datetime import timedelta
+    result: dict = {}
+
+    # Stats
+    try:
+        result["stats"] = json.loads(vault_stats())
+    except Exception as e:
+        result["stats"] = {"error": str(e)}
+
+    # Recent changes — default 7 days ago
+    try:
+        if since is None:
+            since_dt = datetime.now(tz=timezone.utc) - timedelta(days=7)
+            since = since_dt.isoformat()
+        result["recent_changes"] = json.loads(vault_recent_changes(since, limit=50))
+    except Exception as e:
+        result["recent_changes"] = {"error": str(e)}
+
+    # Manifest summary (optional Build B artefact — absent gracefully)
+    try:
+        manifest_path = VAULT_PATH / "_manifest.json"
+        if manifest_path.exists():
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            result["manifest_summary"] = {
+                "generated_at": manifest_data.get("generated_at"),
+                "file_count": manifest_data.get("file_count"),
+                "stale_files": manifest_data.get("stale_files", []),
+            }
+    except Exception:
+        pass
+
+    # Schema pointer — tells Claude where vault rules live (path relative to vault root)
+    result["schema_pointer"] = {
+        "schema_path": "_SCHEMA.md",
+        "note": "Read _SCHEMA.md for all write rules and vault conventions.",
+    }
+
+    return json.dumps(result)
+
+
 def vault_stats() -> str:
     """Return vault-wide aggregate statistics."""
     vault_root = VAULT_PATH.resolve()

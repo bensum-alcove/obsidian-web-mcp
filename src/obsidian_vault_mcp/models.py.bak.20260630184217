@@ -450,27 +450,6 @@ class VaultSessionStartInput(BaseModel):
     )
 
 
-class VaultClientContextInput(BaseModel):
-    """Return scoped session context for a single client."""
-
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    client: str = Field(
-        ...,
-        description="Client surname or partial name — matched against Clients/ filenames (case-insensitive substring; fuzzy fallback)",
-        min_length=1,
-        max_length=200,
-    )
-    include_hot: bool = Field(
-        default=True,
-        description="If true, include the full content of Skills/hot.md in the response",
-    )
-    include_instructions: bool = Field(
-        default=False,
-        description="If true, also return Lending-Analyst-Project-Instructions.md",
-    )
-
-
 class VaultReadSmartInput(BaseModel):
     """Read only the relevant sections of a large file by semantic similarity."""
 
