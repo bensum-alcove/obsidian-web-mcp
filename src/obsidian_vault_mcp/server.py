@@ -91,6 +91,7 @@ from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, 
 from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search, schedule_reindex as _schedule_reindex, vault_read_smart as _vault_read_smart
 from .tools.context import vault_client_context as _vault_client_context
 from .tools.entity import vault_entity as _vault_entity
+from .tools.query import vault_query as _vault_query, vault_answer_context as _vault_answer_context
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -114,6 +115,8 @@ from .models import (
     VaultReadSmartInput,
     VaultClientContextInput,
     VaultEntityInput,
+    VaultQueryInput,
+    VaultAnswerContextInput,
 )
 
 
@@ -473,6 +476,47 @@ def vault_entity(name: str, max_backlinks: int = 15) -> str:
     """Look up a vault entity by name or alias."""
     inp = VaultEntityInput(name=name, max_backlinks=max_backlinks)
     return _vault_entity(inp.name, inp.max_backlinks)
+
+
+@mcp.tool(
+    name="vault_query",
+    description=(
+        "Fused hybrid search across the vault: merges the ripgrep keyword leg and the semantic "
+        "embedding leg with Reciprocal Rank Fusion, then applies temporal decay (recent files rank "
+        "higher; half-life varies by folder — Claude-Code-Prompts/ decays fastest, Clients/ slowest). "
+        "Excludes _Archive/ and .trash/ by default. Each result includes the fused score, nearest "
+        "heading, a chunk snippet, the file's updated date, a stale flag (unmodified >45 days), and "
+        "an expand handle usable with vault_read_section. Use this instead of choosing between "
+        "vault_search and vault_semantic_search."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_query(
+    query: str,
+    top_k: int = 8,
+    path_prefix: str | None = None,
+    include_archive: bool = False,
+    decay: bool = True,
+) -> str:
+    """Fused hybrid search (RRF + temporal decay) across the vault."""
+    inp = VaultQueryInput(query=query, top_k=top_k, path_prefix=path_prefix, include_archive=include_archive, decay=decay)
+    return _vault_query(inp.query, inp.top_k, inp.path_prefix, inp.include_archive, inp.decay)
+
+
+@mcp.tool(
+    name="vault_answer_context",
+    description=(
+        "One-call brain-first pre-flight bundle: runs vault_query(question) and adds up to 3 relevant "
+        "hot.md files (preferring ones sharing a top-level folder with the top results) plus a warnings "
+        "list flagging stale or superseded results. Replaces a manual vault_query + hot.md read + "
+        "staleness check sequence with a single call."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_answer_context(question: str, top_k: int = 6) -> str:
+    """Brain-first pre-flight bundle: vault_query + hot.md + warnings."""
+    inp = VaultAnswerContextInput(question=question, top_k=top_k)
+    return _vault_answer_context(inp.question, inp.top_k)
 
 
 if SEMANTIC_AVAILABLE:

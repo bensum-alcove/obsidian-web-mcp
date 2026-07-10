@@ -490,6 +490,57 @@ class VaultEntityInput(BaseModel):
     )
 
 
+class VaultQueryInput(BaseModel):
+    """Fused hybrid search: ripgrep leg + semantic leg, merged with RRF + temporal decay."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(
+        ...,
+        description="Search query — natural language or keywords",
+        min_length=1,
+        max_length=500,
+    )
+    top_k: int = Field(
+        default=8,
+        ge=1,
+        le=MAX_SEARCH_RESULTS,
+        description="Maximum number of fused results to return",
+    )
+    path_prefix: str | None = Field(
+        default=None,
+        description="Limit results to files under this directory prefix",
+        max_length=500,
+    )
+    include_archive: bool = Field(
+        default=False,
+        description="If true, include files under _Archive/ and .trash/ (excluded by default)",
+    )
+    decay: bool = Field(
+        default=True,
+        description="If true, apply temporal decay to the fused score based on file age",
+    )
+
+
+class VaultAnswerContextInput(BaseModel):
+    """One-call pre-flight bundle: vault_query + hot.md files + staleness warnings."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    question: str = Field(
+        ...,
+        description="The question to answer from the vault",
+        min_length=1,
+        max_length=500,
+    )
+    top_k: int = Field(
+        default=6,
+        ge=1,
+        le=MAX_SEARCH_RESULTS,
+        description="Maximum number of fused vault_query results to include",
+    )
+
+
 class VaultReadSmartInput(BaseModel):
     """Read only the relevant sections of a large file by semantic similarity."""
 

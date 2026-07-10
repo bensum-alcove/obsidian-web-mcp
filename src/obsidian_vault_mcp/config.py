@@ -32,3 +32,12 @@ FRONTMATTER_INDEX_DEBOUNCE = 5.0
 # Rate limiting (requests per minute) -- track in-memory, enforce per-token
 RATE_LIMIT_READ = 100
 RATE_LIMIT_WRITE = 30
+
+# vault_query temporal decay: half-life in days, env-overridable.
+# Longest matching path substring wins; unmatched paths use the default.
+VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))
+VAULT_QUERY_HALF_LIFE_OVERRIDES = {
+    "Claude-Code-Prompts/": float(os.environ.get("VAULT_QUERY_HALF_LIFE_CLAUDE_CODE_PROMPTS", "30")),
+    "Skills/": float(os.environ.get("VAULT_QUERY_HALF_LIFE_SKILLS", "180")),
+    "Clients/": float(os.environ.get("VAULT_QUERY_HALF_LIFE_CLIENTS", "365")),
+}
