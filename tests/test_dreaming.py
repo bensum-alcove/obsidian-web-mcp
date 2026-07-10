@@ -1,6 +1,7 @@
 """Tests for scripts/dreaming.py -- the nightly report-only vault maintenance cycle."""
 
 import importlib.util
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,7 +158,7 @@ def test_build_report_has_what_this_means_and_proposed_actions(dreaming):
     assert "Nothing to action tonight" in report
 
 
-def test_run_writes_exactly_one_new_report_file(dreaming, vault, monkeypatch):
+def test_run_writes_report_and_entities_json_leaves_content_untouched(dreaming, vault, monkeypatch):
     monkeypatch.setattr(dreaming, "VAULT_PATH", vault)
     monkeypatch.setattr(dreaming, "VAULT_NAME", "cb-brain")
     monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
@@ -169,6 +170,101 @@ def test_run_writes_exactly_one_new_report_file(dreaming, vault, monkeypatch):
     assert out_path.exists()
     assert out_path.parent == vault / "_Reports" / "dreaming"
 
+    entities_path = vault / "_entities.json"
+    assert entities_path.exists()
+
     after_md_files = set(vault.rglob("*.md")) - {out_path}
     for p in after_md_files:
         assert p.stat().st_mtime == before[p]
+
+
+# --- Entity index -----------------------------------------------------------
+
+def test_generate_aliases_single_person(dreaming):
+    assert dreaming.generate_aliases("Asimus, Angie") == ["Angie Asimus"]
+
+
+def test_generate_aliases_couple_both_surnames(dreaming):
+    assert dreaming.generate_aliases("Baader, Benjamin & Jacquet, Aurelie") == [
+        "Benjamin Baader",
+        "Aurelie Jacquet",
+    ]
+
+
+def test_generate_aliases_couple_shared_surname(dreaming):
+    assert dreaming.generate_aliases("Duff, Scott & Tracey") == ["Scott Duff", "Tracey Duff"]
+
+
+def test_generate_aliases_no_comma_returns_empty(dreaming):
+    assert dreaming.generate_aliases("Sajju Shrestha") == []
+
+
+@pytest.fixture
+def entity_vault(tmp_path):
+    """BS-Brain-shaped vault: Clients/ folder entities, a couple file, an
+    aliased entity, a frontmatter-type-only entity outside any entity folder,
+    and mentions to backlink against."""
+    clients = tmp_path / "BS 2nd Brain" / "Alcove" / "Clients"
+    clients.mkdir(parents=True)
+    (clients / "McGrath, Danny.md").write_text(
+        "---\ntype: client\n---\n\n# McGrath, Danny\n\nRefinance in progress.\n"
+    )
+    (clients / "McGrath, Michael & McGrath, Kim.md").write_text(
+        "---\ntype: client\n---\n\n# McGrath, Michael & McGrath, Kim\n\nSettled.\n"
+    )
+    (clients / "Robson, Lloyd & McGrath, Rebecca.md").write_text(
+        "---\ntype: client\naliases: [\"The Robsons\"]\n---\n\n# Robson, Lloyd & McGrath, Rebecca\n"
+    )
+
+    other = tmp_path / "Notes"
+    other.mkdir()
+    (other / "meeting-note.md").write_text(
+        "# Meeting\n\nCalled [[McGrath, Danny]] about the refinance.\n"
+        "Also spoke with Michael McGrath by phone.\n"
+    )
+    (other / "reference-note.md").write_text(
+        "---\ntype: reference\n---\n\n# Alcove Partners\n\nGeneral reference note.\n"
+    )
+
+    return tmp_path
+
+
+def test_entity_candidates_includes_folder_and_frontmatter_type(dreaming, entity_vault):
+    md_files = dreaming.list_md_files(entity_vault)
+    candidates = dreaming._entity_candidates(entity_vault, "bs-brain", md_files)
+    assert "BS 2nd Brain/Alcove/Clients/McGrath, Danny.md" in candidates
+    assert "Notes/reference-note.md" in candidates
+    assert "Notes/meeting-note.md" not in candidates
+
+
+def test_pass_entity_index_mcgrath_disambiguation_and_backlinks(dreaming, entity_vault):
+    md_files = dreaming.list_md_files(entity_vault)
+    entities = dreaming.pass_entity_index(entity_vault, "bs-brain", md_files)
+
+    mcgrath_matches = [e for e in entities if "mcgrath" in e["name"].lower()]
+    assert len(mcgrath_matches) == 3
+
+    danny = next(e for e in entities if e["name"] == "McGrath, Danny")
+    assert danny["aliases"] == ["Danny McGrath"]
+    backlink_paths = {b["path"] for b in danny["backlinks"]}
+    assert "Notes/meeting-note.md" in backlink_paths
+
+    couple = next(e for e in entities if e["name"] == "McGrath, Michael & McGrath, Kim")
+    assert couple["aliases"] == ["Michael McGrath", "Kim McGrath"]
+    couple_backlink_paths = {b["path"] for b in couple["backlinks"]}
+    assert "Notes/meeting-note.md" in couple_backlink_paths
+
+    robson = next(e for e in entities if e["name"] == "Robson, Lloyd & McGrath, Rebecca")
+    assert "The Robsons" in robson["aliases"]
+
+
+def test_write_entities_json_schema(dreaming, entity_vault):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    entities = dreaming.pass_entity_index(entity_vault, "bs-brain", dreaming.list_md_files(entity_vault))
+    out_path = dreaming.write_entities_json(entity_vault, "bs-brain", now, entities)
+
+    assert out_path == entity_vault / "_entities.json"
+    payload = json.loads(out_path.read_text())
+    assert payload["vault"] == "bs-brain"
+    assert payload["entity_count"] == len(entities)
+    assert payload["entity_count"] >= 4

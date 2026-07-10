@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""dreaming.py — Nightly report-only maintenance cycle for a vault.
+"""dreaming.py — Nightly report-only maintenance cycle for a vault, plus a
+zero-LLM entity index pass.
 
 Cron: 30 15 * * * (01:30 AEST), one invocation per vault via VAULT_PATH env var.
-Six passes: index reconcile, broken wikilink scan, archive candidates,
+Six report passes: index reconcile, broken wikilink scan, archive candidates,
 hot.md budget check, near-duplicate detection, and (Sundays, BS Brain only)
 a contradiction-lint pass over infrastructure.md vs. infrastructure-changelog.md.
+Plus an entity-index pass that (re)writes `_entities.json` at the vault root.
 
-v1 is strictly REPORT-ONLY: it writes exactly one new file (the report) and
-touches nothing else in the vault content tree. The semantic index db under
-.semantic-index/ is refreshed as part of the index-reconcile pass, but that
-directory is excluded from vault "content" and from the report-only guarantee.
+The report passes remain REPORT-ONLY with respect to vault *content*: existing
+.md files are never modified, and the report itself is the only new content
+file written per run. `_entities.json` is a second, machine-generated artifact
+(not curated vault content) rebuilt from scratch every run — deterministic and
+idempotent, so an unchanged vault produces byte-identical output. It, the
+semantic index db under .semantic-index/, and the report output are all
+excluded from "content" scans.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -46,6 +52,28 @@ ARCHIVE_NAME_HINTS = ("-output.md", "-log.md", "-prompt.md")
 ARCHIVE_PATH_HINTS = ("pending-logs", "synced-logs", "build-logs", "build-log")
 
 WIKILINK_RE = re.compile(r"\[\[([^\]\|#]+)")
+
+# Entity index (zero-LLM): folders whose .md files are always entities, per vault.
+# Layout differs per vault (BS: flat Clients/; Alcove: Clients/A-Z/ subfolders;
+# CB: no Clients/-style folder — relies entirely on the frontmatter-type fallback
+# below). Override per-deployment via ENTITY_FOLDERS_JSON env var
+# (e.g. '{"bs-brain": ["BS 2nd Brain/Alcove/Clients"]}').
+ENTITY_FOLDERS: dict[str, list[str]] = {
+    "bs-brain": [
+        "BS 2nd Brain/Alcove/Clients",
+        "BS 2nd Brain/Alcove/Team",
+        "BS 2nd Brain/Alcove/Referral Partners",
+    ],
+    "alcove-brain": [
+        "Alcove Brain/Clients",
+        "Alcove Brain/Team",
+        "Alcove Brain/Referral Partners",
+    ],
+    "cb-brain": [],
+}
+ENTITY_TYPE_HINTS = {"client", "person", "reference"}
+COUPLE_SEP = " & "
+MAX_STORED_BACKLINKS = 50
 
 
 def _is_report_dir(parts: tuple[str, ...]) -> bool:
@@ -147,6 +175,175 @@ def pass_broken_wikilinks(vault_path: Path, md_files: list[str]) -> list[dict]:
             if target_stem not in stems:
                 broken.append({"file": rel, "link": target})
     return broken
+
+
+def _split_person(segment: str) -> tuple[str | None, str]:
+    """'Surname, Given' -> (surname, given); 'Given' alone -> (None, given)."""
+    if ", " in segment:
+        surname, given = segment.split(", ", 1)
+        return surname.strip(), given.strip()
+    return None, segment.strip()
+
+
+def generate_aliases(canonical_name: str) -> list[str]:
+    """Given-name+surname aliases for a 'Surname, Given[ & Surname2, Given2]' name.
+
+    Couple files where the second person shares the first person's surname omit
+    it (e.g. "Duff, Scott & Tracey.md") -- the shared surname is inferred from
+    the first segment.
+    """
+    parts = [p.strip() for p in canonical_name.split(COUPLE_SEP)]
+    aliases: list[str] = []
+
+    surname1, given1 = _split_person(parts[0])
+    if surname1:
+        aliases.append(f"{given1} {surname1}")
+
+    if len(parts) > 1:
+        surname2, given2 = _split_person(parts[1])
+        surname_for_2 = surname2 or surname1
+        if surname_for_2:
+            aliases.append(f"{given2} {surname_for_2}")
+
+    return aliases
+
+
+def _rel_under(rel: str, folder: str) -> bool:
+    rel_parts = Path(rel).parts
+    folder_parts = Path(folder).parts
+    return rel_parts[: len(folder_parts)] == folder_parts
+
+
+def _entity_folders_for(vault_name: str) -> list[str]:
+    override = os.environ.get("ENTITY_FOLDERS_JSON")
+    if override:
+        try:
+            data = json.loads(override)
+            folders = data.get(vault_name)
+            if folders is not None:
+                return list(folders)
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return ENTITY_FOLDERS.get(vault_name, [])
+
+
+def _entity_candidates(vault_path: Path, vault_name: str, md_files: list[str]) -> list[str]:
+    """Entity folder members, plus any file with frontmatter type in ENTITY_TYPE_HINTS."""
+    folders = _entity_folders_for(vault_name)
+    candidates: set[str] = set()
+    for rel in md_files:
+        if any(_rel_under(rel, folder) for folder in folders):
+            candidates.add(rel)
+            continue
+        try:
+            post = frontmatter.loads(_read(vault_path, rel))
+        except Exception:
+            continue
+        if str(post.metadata.get("type", "")).lower() in ENTITY_TYPE_HINTS:
+            candidates.add(rel)
+    return sorted(candidates)
+
+
+def _whole_word_positions(content: str, needle: str) -> list[int]:
+    """Case-insensitive offsets where `needle` occurs with non-alnum (or
+    string-edge) boundaries on both sides -- a "whole word" match for
+    multi-token names that plain \\b regex boundaries can't handle cleanly
+    (names contain commas, apostrophes, etc.)."""
+    if not needle:
+        return []
+    lowered, needle_l = content.lower(), needle.lower()
+    hits, start = [], 0
+    while True:
+        idx = lowered.find(needle_l, start)
+        if idx == -1:
+            break
+        before_ok = idx == 0 or not lowered[idx - 1].isalnum()
+        end = idx + len(needle_l)
+        after_ok = end >= len(lowered) or not lowered[end].isalnum()
+        if before_ok and after_ok:
+            hits.append(idx)
+        start = idx + 1
+    return hits
+
+
+def _line_for_offset(content: str, offset: int) -> tuple[int, str]:
+    line_no = content.count("\n", 0, offset) + 1
+    line_start = content.rfind("\n", 0, offset) + 1
+    line_end = content.find("\n", offset)
+    if line_end == -1:
+        line_end = len(content)
+    return line_no, content[line_start:line_end].strip()
+
+
+def _find_backlinks(vault_path: Path, md_files: list[str], entity_rel: str, names: list[str]) -> list[dict]:
+    """Every file containing `[[name]]` (any alias) or an exact whole-word
+    plain-text match of `name`, with the matching line captured."""
+    names_lower = {n.lower() for n in names if n}
+    backlinks = []
+    for rel in md_files:
+        if rel == entity_rel:
+            continue
+        content = _read(vault_path, rel)
+        seen_lines: set[int] = set()
+
+        for m in WIKILINK_RE.finditer(content):
+            if m.group(1).strip().lower() in names_lower:
+                line_no, line_text = _line_for_offset(content, m.start())
+                if line_no not in seen_lines:
+                    backlinks.append({"path": rel, "line": line_no, "text": line_text})
+                    seen_lines.add(line_no)
+
+        for name in names:
+            for offset in _whole_word_positions(content, name):
+                line_no, line_text = _line_for_offset(content, offset)
+                if line_no not in seen_lines:
+                    backlinks.append({"path": rel, "line": line_no, "text": line_text})
+                    seen_lines.add(line_no)
+
+    return backlinks
+
+
+def pass_entity_index(vault_path: Path, vault_name: str, md_files: list[str]) -> list[dict]:
+    """Zero-LLM entity index: canonical name (filename sans .md), aliases,
+    path, type, and backlinks for every entity-folder member or frontmatter
+    type={client,person,reference} file."""
+    entities = []
+    for rel in _entity_candidates(vault_path, vault_name, md_files):
+        canonical = Path(rel).stem
+
+        try:
+            post = frontmatter.loads(_read(vault_path, rel))
+            fm_aliases = post.metadata.get("aliases") or []
+            if isinstance(fm_aliases, str):
+                fm_aliases = [fm_aliases]
+            ftype = str(post.metadata.get("type", "")).lower() or None
+        except Exception:
+            fm_aliases, ftype = [], None
+
+        aliases = list(dict.fromkeys([*fm_aliases, *generate_aliases(canonical)]))
+        backlinks = _find_backlinks(vault_path, md_files, rel, [canonical, *aliases])
+
+        entities.append({
+            "name": canonical,
+            "path": rel,
+            "type": ftype,
+            "aliases": aliases,
+            "backlinks": backlinks[:MAX_STORED_BACKLINKS],
+            "backlinks_truncated": len(backlinks) > MAX_STORED_BACKLINKS,
+        })
+    return entities
+
+
+def write_entities_json(vault_path: Path, vault_name: str, now: datetime, entities: list[dict]) -> Path:
+    out_path = vault_path / "_entities.json"
+    payload = {
+        "vault": vault_name,
+        "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "entity_count": len(entities),
+        "entities": entities,
+    }
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path
 
 
 def pass_archive_candidates(vault_path: Path, md_files: list[str], now: datetime) -> list[dict]:
@@ -430,6 +627,7 @@ def run() -> Path:
     hot_md_flags = pass_hot_md_budget(VAULT_PATH, md_files)
     near_dups = pass_near_duplicates(VAULT_PATH, md_files)
     contradiction = pass_contradiction_lint_sunday(VAULT_PATH, VAULT_NAME, now)
+    entities = pass_entity_index(VAULT_PATH, VAULT_NAME, md_files)
 
     report = build_report(
         VAULT_NAME, now, reconcile, broken_links, archive_candidates, hot_md_flags, near_dups, contradiction
@@ -439,10 +637,13 @@ def run() -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(report, encoding="utf-8")
 
+    entities_path = write_entities_json(VAULT_PATH, VAULT_NAME, now, entities)
+
     print(
         f"[dreaming] {VAULT_NAME} {now.strftime('%Y-%m-%d %H:%M')} UTC — "
         f"{len(md_files)} files scanned, {len(broken_links)} broken links, "
-        f"{len(archive_candidates)} archive candidates → {out_path}",
+        f"{len(archive_candidates)} archive candidates, "
+        f"{len(entities)} entities → {out_path}, {entities_path}",
         flush=True,
     )
     return out_path
