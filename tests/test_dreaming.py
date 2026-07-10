@@ -1,0 +1,174 @@
+"""Tests for scripts/dreaming.py -- the nightly report-only vault maintenance cycle."""
+
+import importlib.util
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "dreaming.py"
+
+
+@pytest.fixture(scope="module")
+def dreaming():
+    spec = importlib.util.spec_from_file_location("dreaming", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def vault(tmp_path):
+    """A vault with a broken link, a hot.md over budget, an archive candidate,
+    and two same-titled notes."""
+    (tmp_path / "good-note.md").write_text(
+        "---\ntype: note\n---\n\n# Good Note\n\nLinks to [[good-note-2]].\n"
+    )
+    (tmp_path / "good-note-2.md").write_text("# Good Note 2\n\nSome content.\n")
+    (tmp_path / "broken-link.md").write_text(
+        "# Broken Link Note\n\nSee [[does-not-exist]] for details.\n"
+    )
+
+    hot = tmp_path / "hot.md"
+    hot.write_text("x" * 3000)
+
+    old_prompt = tmp_path / "old-prompt.md"
+    old_prompt.write_text("---\ntype: cc-prompt\nstatus: done\n---\n\n# Old Prompt\n\nDone.\n")
+    import os
+    old_time = datetime.now(timezone.utc).timestamp() - (40 * 86400)
+    os.utime(old_prompt, (old_time, old_time))
+
+    (tmp_path / "dup-a.md").write_text("# Same Title\n\nFirst copy.\n")
+    (tmp_path / "dup-b.md").write_text("# Same Title\n\nSecond copy.\n")
+
+    excluded = tmp_path / ".trash"
+    excluded.mkdir()
+    (excluded / "ignored.md").write_text("# Should be ignored\n")
+
+    return tmp_path
+
+
+def test_list_md_files_excludes_dirs(dreaming, vault):
+    files = dreaming.list_md_files(vault)
+    assert ".trash/ignored.md" not in files
+    assert "good-note.md" in files
+    assert all(f.endswith(".md") for f in files)
+
+
+def test_list_md_files_excludes_prior_reports(dreaming, tmp_path):
+    (tmp_path / "note.md").write_text("# Note\n")
+    reports = tmp_path / "_Reports" / "dreaming"
+    reports.mkdir(parents=True)
+    (reports / "2026-07-09.md").write_text("- [ ] Fix broken link: `[[does-not-exist]]`\n")
+
+    other_reports = tmp_path / "_Reports" / "other"
+    other_reports.mkdir(parents=True)
+    (other_reports / "keep.md").write_text("# Keep\n")
+
+    bs_reports = tmp_path / "BS 2nd Brain" / "Alcove" / "Infrastructure" / "dreaming-reports"
+    bs_reports.mkdir(parents=True)
+    (bs_reports / "2026-07-09.md").write_text("- [ ] Fix broken link: `[[does-not-exist]]`\n")
+
+    files = dreaming.list_md_files(tmp_path)
+    assert "note.md" in files
+    assert "_Reports/other/keep.md" in files
+    assert not any("dreaming" in f for f in files)
+
+
+def test_broken_wikilinks_detects_missing_target(dreaming, vault):
+    md_files = dreaming.list_md_files(vault)
+    broken = dreaming.pass_broken_wikilinks(vault, md_files)
+    assert {"file": "broken-link.md", "link": "does-not-exist"} in broken
+    assert not any(b["file"] == "good-note.md" for b in broken)
+
+
+def test_archive_candidates_flags_stale_completed_prompt(dreaming, vault):
+    md_files = dreaming.list_md_files(vault)
+    now = datetime.now(timezone.utc)
+    candidates = dreaming.pass_archive_candidates(vault, md_files, now)
+    paths = [c["path"] for c in candidates]
+    assert "old-prompt.md" in paths
+    assert "good-note.md" not in paths
+
+
+def test_hot_md_budget_flags_oversized_file(dreaming, vault):
+    md_files = dreaming.list_md_files(vault)
+    flagged = dreaming.pass_hot_md_budget(vault, md_files)
+    assert len(flagged) == 1
+    assert flagged[0]["path"] == "hot.md"
+    assert flagged[0]["chars"] == 3000
+
+
+def test_hot_md_budget_ignores_small_file(dreaming, tmp_path):
+    (tmp_path / "hot.md").write_text("short")
+    flagged = dreaming.pass_hot_md_budget(tmp_path, dreaming.list_md_files(tmp_path))
+    assert flagged == []
+
+
+def test_near_duplicates_title_match(dreaming, vault):
+    md_files = dreaming.list_md_files(vault)
+    result = dreaming.pass_near_duplicates(vault, md_files)
+    title_matches = result["title_matches"]
+    assert any(
+        set(tm["files"]) == {"dup-a.md", "dup-b.md"} for tm in title_matches
+    )
+
+
+def test_report_path_bs_brain_vs_other(dreaming, tmp_path):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    bs_path = dreaming.report_path_for(tmp_path, "bs-brain", now)
+    assert str(bs_path).endswith("BS 2nd Brain/Alcove/Infrastructure/dreaming-reports/2026-07-10.md")
+
+    cb_path = dreaming.report_path_for(tmp_path, "cb-brain", now)
+    assert str(cb_path).endswith("_Reports/dreaming/2026-07-10.md")
+
+
+def test_contradiction_lint_skips_non_sunday(dreaming, tmp_path):
+    monday = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    assert dreaming.pass_contradiction_lint_sunday(tmp_path, "bs-brain", monday) is None
+
+
+def test_contradiction_lint_skips_non_bs_brain_on_sunday(dreaming, tmp_path):
+    sunday = datetime(2026, 7, 12, tzinfo=timezone.utc)
+    assert dreaming.pass_contradiction_lint_sunday(tmp_path, "cb-brain", sunday) is None
+
+
+def test_contradiction_lint_missing_files_reports_skip(dreaming, tmp_path):
+    sunday = datetime(2026, 7, 12, tzinfo=timezone.utc)
+    result = dreaming.pass_contradiction_lint_sunday(tmp_path, "bs-brain", sunday)
+    assert result["status"] == "skipped"
+
+
+def test_build_report_has_what_this_means_and_proposed_actions(dreaming):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    report = dreaming.build_report(
+        "bs-brain",
+        now,
+        {"status": "skipped", "reason": "not available in test"},
+        [],
+        [],
+        [],
+        {"title_matches": [], "embedding_matches": []},
+        None,
+    )
+    assert "## What this means" in report
+    assert "## Proposed actions" in report
+    assert "Nothing to action tonight" in report
+
+
+def test_run_writes_exactly_one_new_report_file(dreaming, vault, monkeypatch):
+    monkeypatch.setattr(dreaming, "VAULT_PATH", vault)
+    monkeypatch.setattr(dreaming, "VAULT_NAME", "cb-brain")
+    monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+
+    before = {p: p.stat().st_mtime for p in vault.rglob("*.md")}
+
+    out_path = dreaming.run()
+
+    assert out_path.exists()
+    assert out_path.parent == vault / "_Reports" / "dreaming"
+
+    after_md_files = set(vault.rglob("*.md")) - {out_path}
+    for p in after_md_files:
+        assert p.stat().st_mtime == before[p]
