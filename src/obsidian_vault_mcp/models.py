@@ -471,6 +471,25 @@ class VaultClientContextInput(BaseModel):
     )
 
 
+class VaultEntityInput(BaseModel):
+    """Look up a vault entity (client/team/partner) by name or alias."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Entity name, alias, or partial name to look up (case-insensitive, fuzzy)",
+        min_length=1,
+        max_length=200,
+    )
+    max_backlinks: int = Field(
+        default=15,
+        ge=1,
+        le=50,
+        description="Maximum number of backlink mentions to return for a matched entity",
+    )
+
+
 class VaultReadSmartInput(BaseModel):
     """Read only the relevant sections of a large file by semantic similarity."""
 

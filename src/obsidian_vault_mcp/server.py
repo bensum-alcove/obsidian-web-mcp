@@ -18,7 +18,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
 from .frontmatter_index import FrontmatterIndex
@@ -89,6 +90,7 @@ from .tools.search import vault_search as _vault_search, vault_search_frontmatte
 from .tools.manage import vault_list as _vault_list, vault_move as _vault_move, vault_delete as _vault_delete, vault_batch_delete as _vault_batch_delete, vault_recent_changes as _vault_recent_changes, vault_stats as _vault_stats, vault_session_start as _vault_session_start
 from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, vault_semantic_search as _vault_semantic_search, schedule_reindex as _schedule_reindex, vault_read_smart as _vault_read_smart
 from .tools.context import vault_client_context as _vault_client_context
+from .tools.entity import vault_entity as _vault_entity
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -111,6 +113,7 @@ from .models import (
     VaultSessionStartInput,
     VaultReadSmartInput,
     VaultClientContextInput,
+    VaultEntityInput,
 )
 
 
@@ -455,6 +458,23 @@ def vault_client_context(
     return _vault_client_context(inp.client, inp.include_hot, inp.include_instructions)
 
 
+@mcp.tool(
+    name="vault_entity",
+    description=(
+        "Look up a vault entity (client, team member, referral partner) by name or alias. "
+        "Zero-LLM: reads the nightly-built _entities.json index. Single match returns the "
+        "entity's file content plus its backlinks (path + line, capped at max_backlinks). "
+        "Multiple matches return candidates for disambiguation, e.g. vault_entity(\"McGrath\") "
+        "with several McGrath client files. No match returns the nearest names found."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_entity(name: str, max_backlinks: int = 15) -> str:
+    """Look up a vault entity by name or alias."""
+    inp = VaultEntityInput(name=name, max_backlinks=max_backlinks)
+    return _vault_entity(inp.name, inp.max_backlinks)
+
+
 if SEMANTIC_AVAILABLE:
     @mcp.tool(
         name="vault_semantic_search",
@@ -594,6 +614,13 @@ def main():
         import os as _os
 
         app = mcp.streamable_http_app()
+
+        # /health is auth-exempt (see auth.py _AUTH_EXEMPT) but had no handler --
+        # canary-restart verification needs a real 200 here.
+        async def _health(request):
+            return JSONResponse({"status": "ok"})
+
+        app.routes.insert(0, Route("/health", _health, methods=["GET"]))
 
         # Mount OAuth 2.1 routes only when password gate is configured
         if _os.environ.get("VAULT_AUTH_PASSWORD"):
