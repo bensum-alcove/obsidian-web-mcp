@@ -15,6 +15,14 @@ VAULT_BASE_URL = os.environ.get("VAULT_BASE_URL", "")  # e.g. https://vault.bens
 VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "")
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 
+# OAuth token persistence (opt-in — leave unset for in-memory tokens, byte-identical
+# to pre-persistence behaviour: 24h access TTL, no refresh_token grant)
+VAULT_TOKEN_DB = os.environ.get("VAULT_TOKEN_DB", "")
+VAULT_TOKEN_TTL_SECONDS = int(
+    os.environ.get("VAULT_TOKEN_TTL_SECONDS", "2592000" if VAULT_TOKEN_DB else "86400")
+)  # 30 days when persisted, 24h in-memory default (unchanged)
+VAULT_REFRESH_TTL_SECONDS = int(os.environ.get("VAULT_REFRESH_TTL_SECONDS", "7776000"))  # 90 days
+
 # Safety limits
 MAX_CONTENT_SIZE = 1_000_000  # 1MB max write size
 MAX_BATCH_SIZE = 20           # Max files per batch operation

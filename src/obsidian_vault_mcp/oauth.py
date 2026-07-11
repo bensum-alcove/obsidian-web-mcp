@@ -13,7 +13,10 @@ import hmac
 import html
 import logging
 import secrets
+import sqlite3
+import threading
 import time
+from pathlib import Path
 from urllib.parse import urlencode
 
 from starlette.requests import Request
@@ -24,13 +27,82 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-# --- In-memory stores ---
+# --- In-memory stores (auth codes always live here; short 10-min TTL makes
+# restart loss harmless) ---
 
 # code -> {client_id, redirect_uri, code_challenge, code_challenge_method, expires_at}
 _auth_codes: dict[str, dict] = {}
 
-# token -> expires_at (unix timestamp)
+# token -> expires_at (unix timestamp) — used only when VAULT_TOKEN_DB is unset.
+# This is the original pre-persistence store, kept byte-identical for that path.
 _tokens: dict[str, float] = {}
+
+# --- SQLite-backed token store (used when VAULT_TOKEN_DB is set) ---
+#
+# Tokens are stored as SHA-256 hashes only — never plaintext — so a leaked DB
+# file grants nothing. Lazy cleanup runs on each write.
+
+_db_lock = threading.Lock()
+_db_conn: sqlite3.Connection | None = None
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _get_db() -> sqlite3.Connection:
+    global _db_conn
+    if _db_conn is None:
+        db_path = Path(config.VAULT_TOKEN_DB).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tokens ("
+            "token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+            "scope TEXT, expires_at REAL NOT NULL, created_at REAL NOT NULL)"
+        )
+        conn.commit()
+        try:
+            db_path.chmod(0o600)
+        except OSError:
+            pass
+        _db_conn = conn
+    return _db_conn
+
+
+def _store_token(token: str, kind: str, ttl_seconds: float, scope: str = "vault") -> None:
+    now = time.time()
+    if config.VAULT_TOKEN_DB:
+        conn = _get_db()
+        with _db_lock:
+            conn.execute("DELETE FROM tokens WHERE expires_at < ?", (now,))
+            conn.execute(
+                "INSERT OR REPLACE INTO tokens (token_hash, kind, scope, expires_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (_hash_token(token), kind, scope, now + ttl_seconds, now),
+            )
+            conn.commit()
+    else:
+        _tokens[token] = now + ttl_seconds
+
+
+def _consume_refresh_token(token: str) -> bool:
+    """Validate and single-use-delete a refresh token (rotation). SQLite-mode only."""
+    if not config.VAULT_TOKEN_DB:
+        return False
+    conn = _get_db()
+    token_hash = _hash_token(token)
+    with _db_lock:
+        row = conn.execute(
+            "SELECT expires_at FROM tokens WHERE token_hash = ? AND kind = 'refresh'",
+            (token_hash,),
+        ).fetchone()
+        if row is None or row[0] < time.time():
+            return False
+        conn.execute("DELETE FROM tokens WHERE token_hash = ?", (token_hash,))
+        conn.commit()
+    return True
 
 
 def _cleanup() -> None:
@@ -42,7 +114,15 @@ def _cleanup() -> None:
 
 
 def is_valid_oauth_token(token: str) -> bool:
-    """Check whether a token is a valid, unexpired OAuth-issued token."""
+    """Check whether a token is a valid, unexpired OAuth-issued access token."""
+    if config.VAULT_TOKEN_DB:
+        conn = _get_db()
+        with _db_lock:
+            row = conn.execute(
+                "SELECT expires_at FROM tokens WHERE token_hash = ? AND kind = 'access'",
+                (_hash_token(token),),
+            ).fetchone()
+        return row is not None and row[0] > time.time()
     _cleanup()
     exp = _tokens.get(token)
     return exp is not None and exp > time.time()
@@ -71,12 +151,15 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
 async def authorization_server_metadata(request: Request) -> JSONResponse:
     """RFC 8414 — authorization server metadata."""
     base = _base_url(request)
+    grant_types = ["authorization_code"]
+    if config.VAULT_TOKEN_DB:
+        grant_types.append("refresh_token")
     return JSONResponse({
         "issuer": base,
         "authorization_endpoint": f"{base}/authorize",
         "token_endpoint": f"{base}/token",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": grant_types,
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["vault"],
     })
@@ -275,20 +358,8 @@ async def _authorize_post(request: Request) -> Response:
 # Token endpoint
 # ---------------------------------------------------------------------------
 
-async def token_endpoint(request: Request) -> JSONResponse:
-    try:
-        form = await request.form()
-    except Exception:
-        return JSONResponse({"error": "invalid_request"}, status_code=400)
-
-    grant_type = form.get("grant_type", "")
-    if grant_type != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-
-    code = form.get("code", "")
-    redirect_uri = form.get("redirect_uri", "")
-    client_id = form.get("client_id", "")
-    code_verifier = form.get("code_verifier", "")
+def _validate_client_secret(request: Request, form, client_id: str) -> JSONResponse | None:
+    """Returns an error JSONResponse if client auth fails, else None."""
     client_secret = form.get("client_secret", "")
 
     # Also accept Basic auth for client_secret
@@ -301,7 +372,6 @@ async def token_endpoint(request: Request) -> JSONResponse:
             except Exception:
                 pass
 
-    # Validate client secret
     if config.VAULT_OAUTH_CLIENT_SECRET:
         if not client_secret or not hmac.compare_digest(client_secret, config.VAULT_OAUTH_CLIENT_SECRET):
             logger.warning(f"Token request: invalid client_secret for client_id={client_id!r}")
@@ -309,6 +379,56 @@ async def token_endpoint(request: Request) -> JSONResponse:
                 {"error": "invalid_client", "error_description": "Client authentication failed"},
                 status_code=401,
             )
+    return None
+
+
+def _issue_token_response() -> JSONResponse:
+    access_token = secrets.token_hex(32)
+    _store_token(access_token, "access", config.VAULT_TOKEN_TTL_SECONDS)
+
+    body = {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": config.VAULT_TOKEN_TTL_SECONDS,
+        "scope": "vault",
+    }
+    if config.VAULT_TOKEN_DB:
+        refresh_token = secrets.token_hex(32)
+        _store_token(refresh_token, "refresh", config.VAULT_REFRESH_TTL_SECONDS)
+        body["refresh_token"] = refresh_token
+
+    return JSONResponse(body)
+
+
+async def token_endpoint(request: Request) -> JSONResponse:
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    grant_type = form.get("grant_type", "")
+    client_id = form.get("client_id", "")
+
+    client_error = _validate_client_secret(request, form, client_id)
+    if client_error is not None:
+        return client_error
+
+    if grant_type == "refresh_token":
+        refresh_token = form.get("refresh_token", "")
+        if not refresh_token or not _consume_refresh_token(refresh_token):
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "Invalid or expired refresh token"},
+                status_code=400,
+            )
+        logger.info(f"OAuth token refreshed for client_id={client_id!r}")
+        return _issue_token_response()
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    code = form.get("code", "")
+    redirect_uri = form.get("redirect_uri", "")
+    code_verifier = form.get("code_verifier", "")
 
     _cleanup()
 
@@ -358,16 +478,8 @@ async def token_endpoint(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-    token = secrets.token_hex(32)
-    _tokens[token] = time.time() + 86400  # 24 hours
-
     logger.info(f"OAuth token issued for client_id={client_id!r}")
-    return JSONResponse({
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": 86400,
-        "scope": "vault",
-    })
+    return _issue_token_response()
 
 
 # ---------------------------------------------------------------------------
