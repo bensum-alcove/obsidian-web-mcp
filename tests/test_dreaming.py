@@ -2,7 +2,6 @@
 
 import importlib.util
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,7 +78,8 @@ def test_list_md_files_excludes_prior_reports(dreaming, tmp_path):
 
 def test_broken_wikilinks_detects_missing_target(dreaming, vault):
     md_files = dreaming.list_md_files(vault)
-    broken = dreaming.pass_broken_wikilinks(vault, md_files)
+    result = dreaming.pass_broken_wikilinks(vault, md_files)
+    broken = result["broken"]
     assert {"file": "broken-link.md", "link": "does-not-exist"} in broken
     assert not any(b["file"] == "good-note.md" for b in broken)
 
@@ -147,10 +147,10 @@ def test_build_report_has_what_this_means_and_proposed_actions(dreaming):
         "bs-brain",
         now,
         {"status": "skipped", "reason": "not available in test"},
+        {"broken": [], "suppressed_count": 0},
         [],
         [],
-        [],
-        {"title_matches": [], "embedding_matches": []},
+        {"title_matches": [], "embedding_matches": [], "suspect_lines": []},
         None,
     )
     assert "## What this means" in report
@@ -268,3 +268,137 @@ def test_write_entities_json_schema(dreaming, entity_vault):
     assert payload["vault"] == "bs-brain"
     assert payload["entity_count"] == len(entities)
     assert payload["entity_count"] >= 4
+
+
+# --- Denoise: code-fence-aware extraction + placeholder allowlist -----------
+
+def test_broken_wikilinks_ignores_bash_test_syntax_in_fence(dreaming, tmp_path):
+    (tmp_path / "ha-diagnose.md").write_text(
+        "# HA Diagnose\n\n```bash\nif [[ \"$HA_CODE\" == \"000\" ]]; then\n  echo ok\nfi\n```\n"
+    )
+    md_files = dreaming.list_md_files(tmp_path)
+    result = dreaming.pass_broken_wikilinks(tmp_path, md_files)
+    assert result["broken"] == []
+    assert result["suppressed_count"] == 0  # stripped before extraction, not suppressed
+
+
+def test_broken_wikilinks_ignores_tilde_fence_and_inline_code(dreaming, tmp_path):
+    (tmp_path / "note.md").write_text(
+        "# Note\n\n~~~\n[[ \"$X\" == \"1\" ]]\n~~~\n\nSee `[[inline-code-link]]` here.\n"
+    )
+    md_files = dreaming.list_md_files(tmp_path)
+    result = dreaming.pass_broken_wikilinks(tmp_path, md_files)
+    assert result["broken"] == []
+
+
+def test_broken_wikilinks_suppresses_placeholders_and_identifiers(dreaming, tmp_path):
+    (tmp_path / "schema.md").write_text(
+        "# Schema\n\n"
+        "Example: [[wikilink]] or [[wikilinks]] or [[target]] or [[entity]] or [[note name]].\n"
+        "Full example: [[BS 2nd Brain/path/to/file]].\n"
+        "Internal id: [[project_shadow_execution_gap]].\n"
+        "Elided: [[Alcove/...]].\n"
+        "Bare dir: [[Alcove/Systems/]].\n"
+    )
+    md_files = dreaming.list_md_files(tmp_path)
+    result = dreaming.pass_broken_wikilinks(tmp_path, md_files)
+    assert result["broken"] == []
+    assert result["suppressed_count"] == 9
+
+
+def test_broken_wikilinks_still_reports_genuine_broken_link(dreaming, tmp_path):
+    (tmp_path / "note.md").write_text("# Note\n\n[[definitely-not-a-real-file]]\n")
+    md_files = dreaming.list_md_files(tmp_path)
+    result = dreaming.pass_broken_wikilinks(tmp_path, md_files)
+    assert {"file": "note.md", "link": "definitely-not-a-real-file"} in result["broken"]
+
+
+# --- Denoise: structural same-title suppression ------------------------------
+
+def test_near_duplicates_suppresses_bo_spec_build_log_pair(dreaming, tmp_path):
+    specs = tmp_path / "Personal" / "Build Orchestrator" / "specs"
+    logs = tmp_path / "Personal" / "Build Orchestrator" / "build-logs"
+    specs.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    (specs / "auto-2026-07-07-HSI-stop-too-tight-scores.md").write_text("# Same Build Title\n")
+    (logs / "auto-20260707-stop-too-tight-scores-output.md").write_text("# Same Build Title\n")
+
+    md_files = dreaming.list_md_files(tmp_path)
+    result = dreaming.pass_near_duplicates(tmp_path, md_files)
+    assert result["title_matches"] == []
+
+
+def test_near_duplicates_keeps_non_bo_same_title_pair(dreaming, vault):
+    md_files = dreaming.list_md_files(vault)
+    result = dreaming.pass_near_duplicates(vault, md_files)
+    assert any(set(tm["files"]) == {"dup-a.md", "dup-b.md"} for tm in result["title_matches"])
+
+
+# --- Autofix -------------------------------------------------------------
+
+@pytest.fixture
+def autofix_vault(tmp_path):
+    """A file with a punctuation-drifted link to 'Real File.md', plus an
+    unfixable genuinely-dead link and an _Archive/ file that must stay untouched."""
+    (tmp_path / "Real File.md").write_text("---\nupdated: 2026-01-01\n---\n\n# Real File\n")
+    (tmp_path / "citing-note.md").write_text(
+        "---\nupdated: 2026-01-01\n---\n\n# Citing Note\n\nSee [[real-file]] for details.\n"
+    )
+    (tmp_path / "dead-link-note.md").write_text("# Dead Link Note\n\n[[nonexistent-thing]]\n")
+    archive = tmp_path / "_Archive"
+    archive.mkdir()
+    (archive / "old.md").write_text("# Old\n\n[[real-file]]\n")
+    return tmp_path
+
+
+def test_find_autofix_candidates_matches_punctuation_drift_only(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["file"] == "citing-note.md"
+    assert c["old_target"] == "real-file"
+    assert c["new_target"] == "Real File"
+
+
+def test_apply_autofix_backs_up_fixes_and_bumps_updated(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    fixed_lines, backup_dir = dreaming.apply_autofix(autofix_vault, candidates, now)
+
+    assert len(fixed_lines) == 1
+    assert "citing-note.md:7" in fixed_lines[0]
+    assert backup_dir.exists()
+    assert (backup_dir / "citing-note.md").read_text() == (
+        "---\nupdated: 2026-01-01\n---\n\n# Citing Note\n\nSee [[real-file]] for details.\n"
+    )
+
+    fixed_content = (autofix_vault / "citing-note.md").read_text()
+    assert "[[Real File]]" in fixed_content
+    assert "updated: 2026-08-01\n---\n" in fixed_content  # newline before closing fence must survive
+
+
+def test_apply_autofix_is_idempotent(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    dreaming.apply_autofix(autofix_vault, dreaming.find_autofix_candidates(autofix_vault, md_files), now)
+
+    md_files_2 = dreaming.list_md_files(autofix_vault)
+    second_candidates = dreaming.find_autofix_candidates(autofix_vault, md_files_2)
+    fixed_lines_2, _ = dreaming.apply_autofix(autofix_vault, second_candidates, now)
+    assert second_candidates == []
+    assert fixed_lines_2 == []
+
+
+def test_find_autofix_candidates_ignores_archive_files(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    assert not any(c["file"].startswith("_Archive/") for c in candidates)
+
+
+def test_find_autofix_candidates_leaves_genuinely_dead_link(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    assert not any(c["old_target"] == "nonexistent-thing" for c in candidates)

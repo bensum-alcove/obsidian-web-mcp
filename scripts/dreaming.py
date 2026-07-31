@@ -53,6 +53,59 @@ ARCHIVE_PATH_HINTS = ("pending-logs", "synced-logs", "build-logs", "build-log")
 
 WIKILINK_RE = re.compile(r"\[\[([^\]\|#]+)")
 
+FENCE_OPEN_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})")
+INDENT_CODE_RE = re.compile(r"^(\t| {4,})\S")
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+# Placeholder/identifier link targets that are never real vault paths — template
+# examples in _SCHEMA.md/prompt files, or internal snake_case build-log ids.
+PLACEHOLDER_TARGETS = {"wikilink", "wikilinks", "target", "entity", "note name", "path/to/file"}
+SNAKE_CASE_IDENTIFIER_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)+$")
+
+
+def _strip_non_prose(content: str) -> str:
+    """Blank out fenced/indented code blocks and inline code spans so wikilink
+    extraction never fires on code syntax (e.g. bash `[[ "$X" == "0" ]]` tests).
+    Blanks regions in place (never deletes lines) so line numbers stay accurate."""
+    lines = content.split("\n")
+    has_fence = any(FENCE_OPEN_RE.match(line) for line in lines)
+    out = []
+    fence_char = None
+    for line in lines:
+        if fence_char is not None:
+            if re.match(rf"^[ \t]*{re.escape(fence_char)}{{3,}}\s*$", line):
+                fence_char = None
+            out.append("")
+            continue
+        m = FENCE_OPEN_RE.match(line)
+        if m:
+            fence_char = m.group(2)[0]
+            out.append("")
+            continue
+        if not has_fence and INDENT_CODE_RE.match(line):
+            out.append("")
+            continue
+        out.append(INLINE_CODE_RE.sub(lambda mm: " " * len(mm.group(0)), line))
+    return "\n".join(out)
+
+
+def _is_suppressed_link_target(target: str) -> bool:
+    """True if `target` is a documentation placeholder or internal identifier,
+    never a real vault path, per the dreaming-autofix-and-denoise spec allowlist."""
+    t = target.strip()
+    tl = t.lower()
+    if tl in PLACEHOLDER_TARGETS:
+        return True
+    if tl.endswith("/path/to/file"):
+        return True
+    if SNAKE_CASE_IDENTIFIER_RE.match(t):
+        return True
+    if "..." in t:
+        return True
+    if t.endswith("/"):
+        return True
+    return False
+
 # Entity index (zero-LLM): folders whose .md files are always entities, per vault.
 # Layout differs per vault (BS: flat Clients/; Alcove: Clients/A-Z/ subfolders;
 # CB: no Clients/-style folder — relies entirely on the frontmatter-type fallback
@@ -159,22 +212,24 @@ def pass_index_reconcile() -> dict:
     }
 
 
-def pass_broken_wikilinks(vault_path: Path, md_files: list[str]) -> list[dict]:
-    stems: dict[str, list[str]] = {}
-    for rel in md_files:
-        stems.setdefault(Path(rel).stem.lower(), []).append(rel)
+def pass_broken_wikilinks(vault_path: Path, md_files: list[str]) -> dict:
+    stems = _build_stem_index(md_files)
 
     broken = []
+    suppressed_count = 0
     for rel in md_files:
-        content = _read(vault_path, rel)
+        content = _strip_non_prose(_read(vault_path, rel))
         for m in WIKILINK_RE.finditer(content):
             target = m.group(1).strip()
-            if not target or target.endswith("..."):
+            if not target:
+                continue
+            if _is_suppressed_link_target(target):
+                suppressed_count += 1
                 continue
             target_stem = Path(target).stem.lower()
             if target_stem not in stems:
                 broken.append({"file": rel, "link": target})
-    return broken
+    return {"broken": broken, "suppressed_count": suppressed_count}
 
 
 def _split_person(segment: str) -> tuple[str | None, str]:
@@ -394,6 +449,43 @@ def pass_hot_md_budget(vault_path: Path, md_files: list[str]) -> list[dict]:
     return flagged
 
 
+BO_SPECS_DIR = "Personal/Build Orchestrator/specs"
+BO_BUILD_LOGS_DIR = "Personal/Build Orchestrator/build-logs"
+BO_AUTO_DATE_PREFIX_RE = re.compile(r"^auto-\d{8}-")
+BO_AUTO_DATE_INSTRUMENT_PREFIX_RE = re.compile(r"^auto-\d{4}-\d{2}-\d{2}-[A-Za-z]+-")
+RETRIEVAL_EVAL_REPORT_RE = re.compile(r"retrieval-eval[/\\][^/\\]*-report\.md$", re.IGNORECASE)
+SUSPECT_NEAR_DUP_SIMILARITY = 0.999
+
+
+def _normalize_bo_stem(stem: str) -> str:
+    """Strip the BO trailing '-output' and either date-prefix convention
+    ('auto-YYYYMMDD-' or 'auto-YYYY-MM-DD-{INSTRUMENT}-') so a spec's stem and
+    its build-log's stem compare equal for the same build id."""
+    s = stem
+    if s.endswith("-output"):
+        s = s[: -len("-output")]
+    s = BO_AUTO_DATE_INSTRUMENT_PREFIX_RE.sub("", s)
+    s = BO_AUTO_DATE_PREFIX_RE.sub("", s)
+    return s
+
+
+def _is_structural_bo_pair(paths: list[str]) -> bool:
+    """True if `paths` is exactly one Build Orchestrator spec + its build-log,
+    for the same build id — the designed BO spec/build-log convention, not a
+    real duplicate."""
+    if len(paths) != 2:
+        return False
+    specs = [p for p in paths if _rel_under(p, BO_SPECS_DIR)]
+    logs = [p for p in paths if _rel_under(p, BO_BUILD_LOGS_DIR)]
+    if len(specs) != 1 or len(logs) != 1:
+        return False
+    return _normalize_bo_stem(Path(specs[0]).stem) == _normalize_bo_stem(Path(logs[0]).stem)
+
+
+def _is_retrieval_eval_report(path: str) -> bool:
+    return bool(RETRIEVAL_EVAL_REPORT_RE.search(path))
+
+
 def pass_near_duplicates(vault_path: Path, md_files: list[str]) -> dict:
     titles: dict[str, list[str]] = {}
     for rel in md_files:
@@ -401,10 +493,13 @@ def pass_near_duplicates(vault_path: Path, md_files: list[str]) -> dict:
         title = (first_h1(content) or Path(rel).stem).strip().lower()
         titles.setdefault(title, []).append(rel)
     title_matches = [
-        {"title": t, "files": paths} for t, paths in sorted(titles.items()) if len(paths) > 1
+        {"title": t, "files": paths}
+        for t, paths in sorted(titles.items())
+        if len(paths) > 1 and not _is_structural_bo_pair(paths)
     ]
 
     embedding_matches: list[dict] = []
+    suspect_lines: list[str] = []
     if ss.SEMANTIC_AVAILABLE and len(md_files) > 1:
         import numpy as np
 
@@ -423,14 +518,26 @@ def pass_near_duplicates(vault_path: Path, md_files: list[str]) -> dict:
         for i in range(n):
             for j in range(i + 1, n):
                 score = float(sim[i, j])
-                if score > NEAR_DUP_SIMILARITY:
-                    embedding_matches.append({
-                        "a": md_files[i],
-                        "b": md_files[j],
-                        "similarity": round(score, 4),
-                    })
+                if score <= NEAR_DUP_SIMILARITY:
+                    continue
+                a, b = md_files[i], md_files[j]
+                if _is_retrieval_eval_report(a) and _is_retrieval_eval_report(b):
+                    # successive eval reports are expected to be near-identical
+                    # by construction; suppress, but flag suspiciously exact ones
+                    if score >= SUSPECT_NEAR_DUP_SIMILARITY:
+                        suspect_lines.append(f"`{a}` ↔ `{b}` (similarity {round(score, 4)})")
+                    continue
+                embedding_matches.append({
+                    "a": a,
+                    "b": b,
+                    "similarity": round(score, 4),
+                })
 
-    return {"title_matches": title_matches, "embedding_matches": embedding_matches}
+    return {
+        "title_matches": title_matches,
+        "embedding_matches": embedding_matches,
+        "suspect_lines": suspect_lines,
+    }
 
 
 def _split_changelog_entries(text: str) -> list[tuple[str | None, str]]:
@@ -490,12 +597,14 @@ def build_report(
     vault_name: str,
     now: datetime,
     reconcile: dict,
-    broken_links: list[dict],
+    broken_links_result: dict,
     archive_candidates: list[dict],
     hot_md_flags: list[dict],
     near_dups: dict,
     contradiction: dict | None,
 ) -> str:
+    broken_links = broken_links_result["broken"]
+    suppressed_count = broken_links_result["suppressed_count"]
     date_str = now.strftime("%Y-%m-%d")
     lines = [
         "---",
@@ -532,6 +641,10 @@ def build_report(
             lines.append(f"- `{b['file']}` → `[[{b['link']}]]`")
     else:
         lines.append("None found.")
+    lines.append(
+        f"Suppressed {suppressed_count} link(s) as code-fence/inline-code content, "
+        "documentation placeholders, or snake_case internal identifiers."
+    )
 
     lines += ["", "## 3. Archive candidates"]
     if archive_candidates:
@@ -564,6 +677,11 @@ def build_report(
             lines.append(f"- `{em['a']}` ↔ `{em['b']}` (similarity {em['similarity']})")
     elif ss.SEMANTIC_AVAILABLE:
         lines.append(f"No embedding near-duplicates above {NEAR_DUP_SIMILARITY}.")
+
+    suspect_lines = near_dups.get("suspect_lines", [])
+    if suspect_lines:
+        lines.append("")
+        lines.append(f"SUSPECT: eval harness may not be re-running — {'; '.join(suspect_lines)}")
 
     if contradiction is not None:
         lines += ["", "## 6. Contradiction lint (Sundays only, BS Brain)"]
@@ -608,6 +726,125 @@ def build_report(
     return "\n".join(lines) + "\n"
 
 
+ARCHIVE_EXCLUDED_DIRS = {"_Archive", ".trash"}
+
+
+def _build_stem_index(md_files: list[str]) -> dict[str, list[str]]:
+    stems: dict[str, list[str]] = {}
+    for rel in md_files:
+        stems.setdefault(Path(rel).stem.lower(), []).append(rel)
+    return stems
+
+
+def _normalize_basename(s: str) -> str:
+    """Fold a filename stem down to bare alphanumerics so 'Old Page', 'old-page'
+    and 'Old_Page' all compare equal -- the 'mechanical' repair class this
+    build's autofix targets (punctuation/case drift), not semantic renames."""
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def find_autofix_candidates(vault_path: Path, md_files: list[str]) -> list[dict]:
+    """Broken wikilinks (per pass_broken_wikilinks' resolution rule) whose target
+    basename, once punctuation/case-folded, matches exactly one vault file --
+    an unambiguous mechanical fix. Placeholder/identifier targets (Step 3) are
+    never candidates. Links inside _Archive/ or .trash/ files are never touched."""
+    stems = _build_stem_index(md_files)
+    norm_index: dict[str, list[str]] = {}
+    for stem_key, rels in stems.items():
+        norm_index.setdefault(_normalize_basename(stem_key), []).extend(rels)
+
+    candidates = []
+    for rel in md_files:
+        if any(part in ARCHIVE_EXCLUDED_DIRS for part in Path(rel).parts):
+            continue
+        stripped = _strip_non_prose(_read(vault_path, rel))
+        for m in WIKILINK_RE.finditer(stripped):
+            target = m.group(1).strip()
+            if not target or _is_suppressed_link_target(target):
+                continue
+            target_stem = Path(target).stem.lower()
+            if target_stem in stems:
+                continue  # already resolves -- not broken
+
+            matches = sorted(set(norm_index.get(_normalize_basename(Path(target).stem), [])))
+            if len(matches) != 1:
+                continue
+            match_rel = matches[0]
+            new_target = match_rel[:-3] if match_rel.lower().endswith(".md") else match_rel
+
+            line_start = stripped.rfind("\n", 0, m.start(1)) + 1
+            candidates.append({
+                "file": rel,
+                "line": stripped.count("\n", 0, m.start(1)) + 1,
+                "col": m.start(1) - line_start,
+                "old_target": m.group(1),
+                "new_target": new_target,
+            })
+    return candidates
+
+
+def _bump_frontmatter_updated(content: str, today: str) -> str:
+    """Same conservative pattern as vault-audit.py's autofix_stale_frontmatter:
+    only touch an existing `updated:` line, never add one."""
+    if not content.startswith("---"):
+        return content
+    end = content.find("---", 3)
+    if end == -1:
+        return content
+    fm_block = content[3:end]
+    # [ \t]*$, not \s*$: \s matches literal newlines too, so when `updated:` is
+    # the last frontmatter line, a greedy \s*$ under MULTILINE swallows the
+    # block's trailing newline and glues the next line onto the closing `---`.
+    m = re.search(r'^(updated:\s*)([\'"]?)\d{4}-\d{2}-\d{2}([\'"]?)[ \t]*$', fm_block, re.MULTILINE)
+    if not m:
+        return content
+    prefix, q_open, q_close = m.group(1), m.group(2), m.group(3)
+    quote = q_open if q_open == q_close else q_open
+    new_line = f"{prefix}{quote}{today}{quote}"
+    new_fm_block = fm_block[: m.start()] + new_line + fm_block[m.end() :]
+    return content[:3] + new_fm_block + content[end:]
+
+
+def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tuple[list[str], Path | None]:
+    """Backs up and repairs every candidate. Idempotent: once fixed, a target
+    resolves via _build_stem_index and will never be a candidate again."""
+    if not candidates:
+        return [], None
+
+    backup_dir = Path.home() / "backups" / "dreaming-autofix" / now.strftime("%Y%m%dT%H%M%SZ")
+    today = now.strftime("%Y-%m-%d")
+
+    by_file: dict[str, list[dict]] = {}
+    for c in candidates:
+        by_file.setdefault(c["file"], []).append(c)
+
+    fixed_lines = []
+    for rel, cands in by_file.items():
+        path = vault_path / rel
+        original_content = path.read_text(encoding="utf-8", errors="replace")
+        lines = original_content.split("\n")
+        file_fixed = []
+        for c in sorted(cands, key=lambda c: (c["line"], -c["col"])):
+            ln, col, old = c["line"] - 1, c["col"], c["old_target"]
+            line_text = lines[ln]
+            if line_text[col : col + len(old)] != old:
+                continue  # content shifted since scan -- skip rather than corrupt
+            lines[ln] = line_text[:col] + c["new_target"] + line_text[col + len(old) :]
+            file_fixed.append(f"FIXED: {rel}:{c['line']} [[{old}]] → [[{c['new_target']}]]")
+
+        if not file_fixed:
+            continue
+        new_content = _bump_frontmatter_updated("\n".join(lines), today)
+
+        backup_path = backup_dir / rel
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        backup_path.write_text(original_content, encoding="utf-8")
+        path.write_text(new_content, encoding="utf-8")
+        fixed_lines.extend(file_fixed)
+
+    return fixed_lines, (backup_dir if fixed_lines else None)
+
+
 def report_path_for(vault_path: Path, vault_name: str, now: datetime) -> Path:
     date_str = now.strftime("%Y-%m-%d")
     if vault_name == "bs-brain":
@@ -617,7 +854,7 @@ def report_path_for(vault_path: Path, vault_name: str, now: datetime) -> Path:
     return report_dir / f"{date_str}.md"
 
 
-def run() -> Path:
+def run(autofix: bool = False) -> Path:
     now = datetime.now(timezone.utc)
     md_files = list_md_files(VAULT_PATH)
 
@@ -641,13 +878,33 @@ def run() -> Path:
 
     print(
         f"[dreaming] {VAULT_NAME} {now.strftime('%Y-%m-%d %H:%M')} UTC — "
-        f"{len(md_files)} files scanned, {len(broken_links)} broken links, "
+        f"{len(md_files)} files scanned, {len(broken_links['broken'])} broken links, "
         f"{len(archive_candidates)} archive candidates, "
         f"{len(entities)} entities → {out_path}, {entities_path}",
         flush=True,
     )
+
+    if autofix:
+        candidates = find_autofix_candidates(VAULT_PATH, md_files)
+        fixed_lines, backup_dir = apply_autofix(VAULT_PATH, candidates, now)
+        if fixed_lines:
+            print(f"[dreaming] --autofix: backed up originals to {backup_dir}", flush=True)
+            for line in fixed_lines:
+                print(line, flush=True)
+        else:
+            print("[dreaming] --autofix: no unambiguous mechanical repairs found", flush=True)
+
     return out_path
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--autofix",
+        action="store_true",
+        help="Repair broken wikilinks with exactly one unambiguous basename match",
+    )
+    cli_args = parser.parse_args()
+    run(autofix=cli_args.autofix)
