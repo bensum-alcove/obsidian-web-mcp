@@ -72,6 +72,27 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     return json.dumps({"results": results})
 
 
+def _split_leading_heading(text: str) -> tuple[str | None, str]:
+    """If `text` begins with a markdown heading line, return (heading, remainder).
+
+    `heading` has surrounding whitespace and any line ending stripped. `remainder`
+    is everything after that heading line's line ending (or "" if the heading was
+    the only content). Returns (None, text) if `text` does not start with a heading.
+    """
+    if not text:
+        return None, text
+    newline_pos = text.find('\n')
+    first_line = text if newline_pos == -1 else text[:newline_pos]
+    remainder = '' if newline_pos == -1 else text[newline_pos + 1:]
+    candidate = first_line.rstrip('\r').strip()
+    if not candidate.startswith('#'):
+        return None, text
+    level = len(candidate) - len(candidate.lstrip('#'))
+    if level > 6 or not (len(candidate) > level and candidate[level] == ' '):
+        return None, text
+    return candidate, remainder
+
+
 def vault_patch_section(path: str, section: str, content: str) -> str:
     """Replace the content of a single markdown section without rewriting the entire file."""
     try:
@@ -105,8 +126,26 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
                     end_line = i
                     break
 
+        # The file's own heading line (lines[target_line]) is always kept as-is.
+        # If the caller's content redundantly repeats that heading, drop the
+        # caller's copy so the result has exactly one heading. If it leads with
+        # a *different* heading, that's ambiguous — refuse rather than guess.
+        leading_heading, body_after_heading = _split_leading_heading(content)
+        if leading_heading is not None:
+            if leading_heading != section_stripped:
+                return json.dumps({
+                    "error": (
+                        f"content starts with heading {leading_heading!r}, which does not match "
+                        f"target section {section_stripped!r}. Pass content without a leading "
+                        "heading, or with the exact matching heading."
+                    ),
+                    "path": path,
+                })
+            replacement = body_after_heading
+        else:
+            replacement = content
+
         # Normalise replacement: ensure it ends with a newline if non-empty
-        replacement = content
         if replacement and not replacement.endswith('\n'):
             replacement += '\n'
 
