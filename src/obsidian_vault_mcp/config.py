@@ -41,6 +41,14 @@ FRONTMATTER_INDEX_DEBOUNCE = 5.0
 RATE_LIMIT_READ = 100
 RATE_LIMIT_WRITE = 30
 
+# vault_query keyword-leg tokenization (opt-out — defaults enabled). When disabled,
+# the keyword leg passes the raw question straight to ripgrep as it always has, byte-
+# identical to pre-tokenization behaviour. This is the fastest revert path: a
+# supervisord environment edit + restart, no git operation needed.
+VAULT_QUERY_KEYWORD_TOKENIZE = os.environ.get("VAULT_QUERY_KEYWORD_TOKENIZE", "1") not in (
+    "0", "false", "False", "",
+)
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))

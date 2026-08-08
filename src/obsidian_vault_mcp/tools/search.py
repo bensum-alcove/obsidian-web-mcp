@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -137,18 +138,75 @@ _STOPWORDS = frozenset({
 })
 
 
-def _search_keyword_fallback(
-    query: str,
+_INTERROGATIVES = frozenset({
+    "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+})
+
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_QUERY_TOKEN_EDGE_CHARS = "?!,;:()[]{}<>\"'`"
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """Extract content tokens from a natural-language query for vault_query's
+    keyword leg: quoted phrases kept intact as single tokens, stopwords and
+    interrogatives (what/how/where/...) dropped -- vault_query is fed full
+    questions rather than the 2-4 bare nouns vault_search expects, so
+    interrogatives need stripping here on top of the existing stopword list.
+
+    Only whitespace is ever a delimiter (same principle as the fallback
+    tokenizer below), so identifiers, paths, env var names, ports, and error
+    codes (BS_BRAIN_API_KEY, ~/.config/supervisor/, 502, feature/vault-tools-v2)
+    survive as single atomic tokens -- underscores, slashes, dots, and hyphens
+    are never split points. Edge punctuation (trailing '?', ',', etc. left over
+    from sentence structure) is stripped so a token searches as the literal
+    word it names.
+    """
+    phrases = [p.strip() for p in _QUOTED_PHRASE_RE.findall(query) if p.strip()]
+    remainder = _QUOTED_PHRASE_RE.sub(" ", query)
+
+    tokens: list[str] = list(phrases)
+    for word in remainder.split():
+        stripped = word.strip(_QUERY_TOKEN_EDGE_CHARS)
+        if not stripped or len(stripped) <= 1:
+            continue
+        if stripped.lower() in _STOPWORDS or stripped.lower() in _INTERROGATIVES:
+            continue
+        tokens.append(stripped)
+
+    return tokens
+
+
+def _search_by_tokens(
+    keywords: list[str],
     search_path: Path,
     file_pattern: str,
     max_results: int,
     context_lines: int,
+    require_all: bool = True,
 ) -> list[dict]:
-    """Keyword-based fallback search when ripgrep returns 0 results."""
+    """Single-pass, per-token ranked search: reads each file once, ranks by how
+    many distinct tokens it contains, plus a filename boost. Shared by
+    _search_keyword_fallback (which supplies its own lowercased, split-on-
+    whitespace keyword list, require_all=True, its long-standing behaviour) and
+    vault_query's tokenized keyword leg (which supplies richer tokens from
+    _tokenize_query with require_all=False).
+
+    require_all=True prefers an AND match (every keyword present) over any
+    partial match, falling back to OR ranking only when no file satisfies all
+    keywords. This is fine for short queries with 2-4 nouns, but for long,
+    natural-language questions (many tokens) it becomes an all-or-nothing
+    cliff: a single large, topically broad file that happens to contain every
+    token *somewhere* in its body (an append-only changelog, say) wins
+    outright and excludes every partial-but-more-relevant match entirely --
+    this crowded out the correct answer for several 2026-08-08 diagnosis
+    questions once tokenization started producing clean-enough keyword lists
+    for an accidental full AND match to actually succeed. require_all=False
+    skips that gate and ranks every candidate purely by keyword-match count
+    (+ filename boost), so a partial match doesn't get discarded just because
+    some unrelated file happened to match everything.
+    """
     import fnmatch
 
-    words = query.lower().split()
-    keywords = [w for w in words if w not in _STOPWORDS and len(w) > 1]
     if not keywords:
         return []
 
@@ -178,9 +236,12 @@ def _search_keyword_fallback(
     if not file_data:
         return []
 
-    # AND logic: files containing all keywords
-    and_matches = [(fp, rp, c, fk) for fp, rp, c, fk in file_data if len(fk) == len(keywords)]
-    candidates = and_matches if and_matches else file_data
+    if require_all:
+        # AND logic: files containing all keywords
+        and_matches = [(fp, rp, c, fk) for fp, rp, c, fk in file_data if len(fk) == len(keywords)]
+        candidates = and_matches if and_matches else file_data
+    else:
+        candidates = file_data
 
     # Rank by keyword count + filename boost
     def _score(item):
@@ -211,6 +272,19 @@ def _search_keyword_fallback(
                 return matches
 
     return matches
+
+
+def _search_keyword_fallback(
+    query: str,
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Keyword-based fallback search when ripgrep returns 0 results."""
+    words = query.lower().split()
+    keywords = [w for w in words if w not in _STOPWORDS and len(w) > 1]
+    return _search_by_tokens(keywords, search_path, file_pattern, max_results, context_lines)
 
 
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:

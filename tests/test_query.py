@@ -75,6 +75,121 @@ def test_is_archived_false_for_normal_path():
     assert query_tool._is_archived("Alcove/Infrastructure/note.md") is False
 
 
+# --- _keyword_leg tokenization tests -------------------------------------------
+
+_LONG_SENTENCE = "Does a BS_BRAIN_API_KEY environment variable exist anywhere in the infrastructure?"
+
+
+def test_keyword_leg_short_query_passes_raw_query_unchanged(vault_dir, monkeypatch):
+    """<=4 content tokens: identical ripgrep call to pre-tokenization behaviour."""
+    calls = []
+
+    def fake_ripgrep(query, search_path, file_pattern, max_results, context_lines):
+        calls.append(query)
+        return []
+
+    monkeypatch.setattr(query_tool.shutil, "which", lambda name: "/usr/bin/rg")
+    monkeypatch.setattr(query_tool, "_search_ripgrep", fake_ripgrep)
+
+    query_tool._keyword_leg("supervisord config path", "*.md", 50)
+
+    assert calls == ["supervisord config path"]
+
+
+def test_keyword_leg_fallback_triggers_on_weak_nonempty_result(vault_dir, monkeypatch):
+    """A non-empty but too-small primary result (< _WEAK_MATCH_MIN_COUNT) must still
+    trigger the per-token merge -- not only a zero-match result."""
+    (vault_dir / "correct.md").write_text(
+        "The BS_BRAIN_API_KEY environment variable lives in supervisord config.\n"
+    )
+    (vault_dir / "adjacent.md").write_text(
+        "This document discusses infrastructure history broadly.\n"
+    )
+
+    def fake_ripgrep(query, search_path, file_pattern, max_results, context_lines):
+        # Simulates an incidental regex hit on an unrelated file: one match, low signal.
+        return [{
+            "path": "adjacent.md",
+            "line_number": 1,
+            "match_context": "This document discusses infrastructure history broadly.",
+        }]
+
+    monkeypatch.setattr(query_tool.shutil, "which", lambda name: "/usr/bin/rg")
+    monkeypatch.setattr(query_tool, "_search_ripgrep", fake_ripgrep)
+
+    result = query_tool._keyword_leg(_LONG_SENTENCE, "*.md", 50)
+    paths = [p for p, _ in result]
+    assert "correct.md" in paths
+
+
+def test_keyword_leg_fallback_triggers_when_no_match_has_multi_token_overlap(vault_dir, monkeypatch):
+    """>= _WEAK_MATCH_MIN_COUNT matches, but none overlaps more than one query token,
+    must still be treated as weak and trigger the per-token merge."""
+    (vault_dir / "correct.md").write_text(
+        "The BS_BRAIN_API_KEY environment variable lives in supervisord config.\n"
+    )
+    (vault_dir / "n1.md").write_text("infrastructure notes one\n")
+    (vault_dir / "n2.md").write_text("infrastructure notes two\n")
+    (vault_dir / "n3.md").write_text("infrastructure notes three\n")
+
+    def fake_ripgrep(query, search_path, file_pattern, max_results, context_lines):
+        return [
+            {"path": "n1.md", "line_number": 1, "match_context": "infrastructure notes one"},
+            {"path": "n2.md", "line_number": 1, "match_context": "infrastructure notes two"},
+            {"path": "n3.md", "line_number": 1, "match_context": "infrastructure notes three"},
+        ]
+
+    monkeypatch.setattr(query_tool.shutil, "which", lambda name: "/usr/bin/rg")
+    monkeypatch.setattr(query_tool, "_search_ripgrep", fake_ripgrep)
+
+    result = query_tool._keyword_leg(_LONG_SENTENCE, "*.md", 50)
+    paths = [p for p, _ in result]
+    assert "correct.md" in paths
+
+
+def test_keyword_leg_keeps_strong_primary_result(vault_dir, monkeypatch):
+    """A primary result with enough matches and real multi-token overlap is trusted
+    as-is -- the per-token merge must not override a genuinely strong result."""
+    fixed_matches = [
+        {"path": "a.md", "line_number": 1, "match_context": "BS_BRAIN_API_KEY environment variable"},
+        {"path": "b.md", "line_number": 1, "match_context": "environment variable infrastructure"},
+        {"path": "c.md", "line_number": 1, "match_context": "infrastructure environment exist"},
+    ]
+
+    def fake_ripgrep(query, search_path, file_pattern, max_results, context_lines):
+        return fixed_matches
+
+    monkeypatch.setattr(query_tool.shutil, "which", lambda name: "/usr/bin/rg")
+    monkeypatch.setattr(query_tool, "_search_ripgrep", fake_ripgrep)
+
+    result = query_tool._keyword_leg(_LONG_SENTENCE, "*.md", 50)
+    assert result == [("a.md", 1), ("b.md", 1), ("c.md", 1)]
+
+
+def test_keyword_leg_kill_switch_off_ignores_token_count_and_weakness(vault_dir, monkeypatch):
+    """Kill switch disabled: raw sentence passed straight through, unchanged from
+    pre-tokenization behaviour, even for a long query with an empty primary result."""
+    monkeypatch.setattr(config, "VAULT_QUERY_KEYWORD_TOKENIZE", False)
+    calls = []
+
+    def fake_ripgrep(query, search_path, file_pattern, max_results, context_lines):
+        calls.append(query)
+        return []
+
+    monkeypatch.setattr(query_tool.shutil, "which", lambda name: "/usr/bin/rg")
+    monkeypatch.setattr(query_tool, "_search_ripgrep", fake_ripgrep)
+
+    query_tool._keyword_leg(_LONG_SENTENCE, "*.md", 50)
+
+    assert calls == [_LONG_SENTENCE]
+
+
+def test_tokenize_query_and_search_by_tokens_importable_from_query_module():
+    """query.py imports these directly from search.py -- guards against a stale import."""
+    assert query_tool._tokenize_query is not None
+    assert query_tool._search_by_tokens is not None
+
+
 # --- vault_query integration tests --------------------------------------------
 
 def _touch_with_age(path, days_old: float):

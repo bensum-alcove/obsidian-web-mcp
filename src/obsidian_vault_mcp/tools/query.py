@@ -21,7 +21,7 @@ import frontmatter as fm_lib
 
 from .. import config
 from ..utils import sanitize_for_json, SafeJSONEncoder
-from .search import _search_ripgrep, _search_python, _search_keyword_fallback
+from .search import _search_ripgrep, _search_python, _search_keyword_fallback, _search_by_tokens, _tokenize_query
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,53 @@ RRF_K = 60
 _HOT_MD_MAX_BYTES = 3072
 _ANSWER_CONTEXT_MAX_HOT = 3
 _SUPERSEDED_STATUSES = {"superseded", "deprecated", "archived"}
+
+# vault_query keyword leg tuning. A query at or under this many extracted content
+# tokens is short enough that a raw-sentence ripgrep pattern is effectively already
+# an exact-phrase search (the vault_search-style "2-4 nouns" case) -- leave that path
+# untouched. Above the threshold, the raw sentence stops being a reliable literal/regex
+# pattern, so the per-token merge below takes over when the raw-sentence leg is weak.
+_SHORT_QUERY_TOKEN_THRESHOLD = 4
+
+# A raw-sentence keyword-leg result counts as "weak" -- and triggers the per-token
+# merge -- if it has fewer than this many distinct-file matches, or if every match it
+# does have only overlaps one query token. Fewer than 3 files is too thin a candidate
+# set to trust over a full per-token search; a match containing only one query token
+# is exactly the "incidental regex hit on a full sentence" failure mode from the
+# 2026-08-08 diagnosis (BS_BRAIN_API_KEY / 502 questions matched zero or one token's
+# worth of the sentence and got crowded out by topically-adjacent files instead).
+_WEAK_MATCH_MIN_COUNT = 3
+
+
+def _dedupe_first_occurrence(matches: list[dict]) -> list[tuple[str, int]]:
+    """First occurrence per file, path order preserved from the input match order."""
+    seen: dict[str, int] = {}
+    order: list[str] = []
+    for m in matches:
+        p = m["path"]
+        if p not in seen:
+            seen[p] = m["line_number"]
+            order.append(p)
+    return [(p, seen[p]) for p in order]
+
+
+def _run_primary_keyword_search(query: str, search_path: Path, file_pattern: str, fetch_n: int) -> list[dict]:
+    """The raw-sentence keyword search: ripgrep if available, else the Python fallback."""
+    if shutil.which("rg"):
+        return _search_ripgrep(query, search_path, file_pattern, fetch_n, 1)
+    return _search_python(query, search_path, file_pattern, fetch_n, 1)
+
+
+def _count_matched_tokens(text: str, tokens: list[str]) -> int:
+    text_lower = text.lower()
+    return sum(1 for t in tokens if t.lower() in text_lower)
+
+
+def _is_weak_keyword_result(matches: list[dict], tokens: list[str]) -> bool:
+    """See _WEAK_MATCH_MIN_COUNT for the threshold rationale."""
+    if len(matches) < _WEAK_MATCH_MIN_COUNT:
+        return True
+    return not any(_count_matched_tokens(m.get("match_context", ""), tokens) > 1 for m in matches)
 
 
 def _is_archived(path: str) -> bool:
@@ -66,24 +113,39 @@ def _rrf_fuse(keyword_paths: list[str], semantic_paths: list[str], k: int = RRF_
 def _keyword_leg(query: str, file_pattern: str, fetch_n: int) -> list[tuple[str, int]]:
     """Ranked list of (path, line_number) — first occurrence per file, in match order."""
     search_path = config.VAULT_PATH
+    matches = _run_primary_keyword_search(query, search_path, file_pattern, fetch_n)
 
-    if shutil.which("rg"):
-        matches = _search_ripgrep(query, search_path, file_pattern, fetch_n, 1)
-    else:
-        matches = _search_python(query, search_path, file_pattern, fetch_n, 1)
+    if not config.VAULT_QUERY_KEYWORD_TOKENIZE:
+        # Kill switch off: byte-identical to pre-tokenization behaviour.
+        if not matches:
+            matches = _search_keyword_fallback(query, search_path, file_pattern, fetch_n, 1)
+        return _dedupe_first_occurrence(matches)
 
-    if not matches:
-        matches = _search_keyword_fallback(query, search_path, file_pattern, fetch_n, 1)
+    tokens = _tokenize_query(query)
 
-    seen: dict[str, int] = {}
-    order: list[str] = []
-    for m in matches:
-        p = m["path"]
-        if p not in seen:
-            seen[p] = m["line_number"]
-            order.append(p)
+    if len(tokens) <= _SHORT_QUERY_TOKEN_THRESHOLD:
+        # Short queries: identical behaviour to today (and to the kill-switch-off path).
+        if not matches:
+            matches = _search_keyword_fallback(query, search_path, file_pattern, fetch_n, 1)
+        return _dedupe_first_occurrence(matches)
 
-    return [(p, seen[p]) for p in order]
+    # Long queries: a raw full-sentence match is trusted only if it's strong.
+    # Otherwise, search per-token and merge, ranking by distinct-token overlap.
+    # require_all=True: matches _search_keyword_fallback's long-standing AND-
+    # preferred/OR-fallback behaviour. require_all=False (pure count ranking,
+    # no AND gate) was tried and measured against the eval: it fixed some
+    # partial-match cases but let large, topically broad files accumulate a
+    # high raw token count just from size and crowd out narrower, more
+    # relevant files even more often than the AND gate does -- net worse on
+    # the eval. require_all=True is the better-measured tradeoff of the two,
+    # though neither eliminates the underlying single-file-flooding dynamic
+    # (see BASELINE_SCORES comparison in this build's output doc).
+    if _is_weak_keyword_result(matches, tokens):
+        matches = _search_by_tokens(
+            [t.lower() for t in tokens], search_path, file_pattern, fetch_n, 1, require_all=True
+        )
+
+    return _dedupe_first_occurrence(matches)
 
 
 def _semantic_leg(query: str, fetch_n: int) -> list[tuple[str, str | None, str, float]]:
