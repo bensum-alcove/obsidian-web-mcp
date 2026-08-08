@@ -287,6 +287,61 @@ def _search_keyword_fallback(
     return _search_by_tokens(keywords, search_path, file_pattern, max_results, context_lines)
 
 
+# vault_search tokenized-augmentation tuning. A query at or under this many extracted
+# content tokens is short enough that it's effectively the "2-4 nouns" case vault_search
+# already expects -- and, critically, the case a caller doing exact-string verification
+# before vault_str_replace is relying on. Leave it byte-identical to pre-change
+# behaviour. Same threshold as vault_query's keyword leg (query.py's
+# _SHORT_QUERY_TOKEN_THRESHOLD), kept as a separate constant per-module rather than a
+# shared import so the two kill switches (VAULT_SEARCH_TOKENIZE and
+# VAULT_QUERY_KEYWORD_TOKENIZE) stay fully decoupled.
+_VAULT_SEARCH_TOKEN_THRESHOLD = 4
+
+
+def _tag_match_type(matches: list[dict], match_type: str) -> list[dict]:
+    for match in matches:
+        match["match_type"] = match_type
+    return matches
+
+
+def _augment_with_tokenized_matches(
+    query: str,
+    literal_matches: list[dict],
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Augments vault_search's literal (ripgrep/Python) results with tokenized
+    matches for long queries, without ever reordering, demoting, or dropping a
+    literal match.
+
+    `literal_matches` -- whatever the exact-string search phase found, including
+    empty -- always comes first, tagged match_type="literal". For queries with
+    more than _VAULT_SEARCH_TOKEN_THRESHOLD content tokens, tokenized matches
+    (reusing vault_query's _tokenize_query, not a second tokenizer) are appended
+    below them, tagged match_type="tokenized", with paths already present in the
+    literal set skipped so no file appears twice.
+
+    This tagging is the exact-string-verification contract: a caller checking
+    whether a string exists before vault_str_replace must filter to
+    match_type == "literal" and treat zero such matches as "does not exist",
+    even if tokenized matches are also present.
+    """
+    tagged_literal = _tag_match_type(literal_matches, "literal")
+    seen_paths = {m["path"] for m in tagged_literal}
+
+    tokens = [t.lower() for t in _tokenize_query(query)]
+    tokenized = _search_by_tokens(
+        tokens, search_path, file_pattern, max_results, context_lines, require_all=True
+    )
+    appended = _tag_match_type(
+        [m for m in tokenized if m["path"] not in seen_paths], "tokenized"
+    )
+
+    return (tagged_literal + appended)[:max_results]
+
+
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
     try:
@@ -322,7 +377,11 @@ def vault_search(
         else:
             matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
 
-        if not matches:
+        if config.VAULT_SEARCH_TOKENIZE and len(_tokenize_query(query)) > _VAULT_SEARCH_TOKEN_THRESHOLD:
+            matches = _augment_with_tokenized_matches(
+                query, matches, search_path, file_pattern, max_results, context_lines
+            )
+        elif not matches:
             matches = _search_keyword_fallback(query, search_path, file_pattern, max_results, context_lines)
 
         for match in matches:

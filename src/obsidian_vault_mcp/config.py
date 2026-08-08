@@ -49,6 +49,15 @@ VAULT_QUERY_KEYWORD_TOKENIZE = os.environ.get("VAULT_QUERY_KEYWORD_TOKENIZE", "1
     "0", "false", "False", "",
 )
 
+# vault_search tokenized-augmentation (opt-out — defaults enabled). Separate from
+# VAULT_QUERY_KEYWORD_TOKENIZE so the two deploys can be reverted independently. When
+# disabled, vault_search is byte-identical to pre-tokenization behaviour. See
+# tools/search.py's _augment_with_tokenized_matches for the exact-string-verification
+# contract this guards.
+VAULT_SEARCH_TOKENIZE = os.environ.get("VAULT_SEARCH_TOKENIZE", "1") not in (
+    "0", "false", "False", "",
+)
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))
