@@ -1,10 +1,19 @@
-# vault-retrieval-eval — 40-question R@5/MRR eval set for BS Brain vault retrieval.
+# vault-retrieval-eval — 50-question R@5/MRR eval set for BS Brain vault retrieval.
 #
 # Each entry: {question, expected_paths, category}. expected_paths are relative to
 # VAULT_PATH (BS Brain root) — one or more acceptable files that correctly answer
-# the question. All paths verified to exist in the vault as of 2026-07-10.
+# the question. All paths verified to exist in the vault as of 2026-07-10, except
+# the infrastructure (v2) and infrastructure_v1 categories, verified 2026-08-08.
 #
-# Categories: clients (10), infrastructure (10), skills (10), operations (10).
+# Categories: clients (10), infrastructure (10), skills (10), operations (10),
+# infrastructure_v1 (10).
+#
+# infrastructure_v1 is a DEPRECATED snapshot of the original (malformed, all-10-
+# questions-expect-one-file) infrastructure category, kept only for time-series
+# continuity with weekly reports predating 2026-08-08 (vault-eval-set-infra-repair).
+# Scheduled for removal on or after 2026-09-05 — see that build's output doc for
+# rationale. The "infrastructure" category above it is the v2 replacement: 10
+# questions across >=6 distinct expected files, <=3 of which expect SYSTEM-FACTS.md.
 
 - question: "Which lender is Carlos Cacho refinancing to for the equity release on his Dulwich Hill property?"
   expected_paths:
@@ -56,54 +65,55 @@
     - "BS 2nd Brain/Alcove/Clients/Holt, Simon.md"
   category: clients
 
-- question: "What is the correct environment variable name for the vault MCP bearer token, and what incorrect name was never actually deployed?"
+- question: "Of the two diverged obsidian-web-mcp checkouts, which one actually serves live vault MCP traffic, and which one runs the cron jobs including dreaming.py?"
   expected_paths:
     - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
   category: infrastructure
 
-- question: "What port does the BS Brain vault MCP server run on, and what is its filesystem root path?"
+- question: "How much RAM is usable inside WSL on BSMiniPC, and what Windows-side config file enforces that cap?"
   expected_paths:
     - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
   category: infrastructure
 
-- question: "Where is the live obsidian-web-mcp checkout that actually powers the running vault MCP servers, and which git branch is it on?"
-  expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
-  category: infrastructure
-
-- question: "Does a BS_BRAIN_API_KEY environment variable exist anywhere in the infrastructure?"
-  expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
-  category: infrastructure
-
-- question: "Where is supervisord's config directory located on BSMiniPC, and where is it commonly but wrongly assumed to be?"
-  expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
-  category: infrastructure
-
-- question: "What IBKR client ID does the live SPI trading system actually use, and what ID was previously wrongly assumed?"
-  expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
-  category: infrastructure
-
-- question: "What ports do the Alcove Brain and CB Brain vault MCP servers run on?"
+- question: "According to the Correction Log, what was wrong with the belief that supervisord does NOT auto-start on WSL boot, and what actually happens now?"
   expected_paths:
     - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
   category: infrastructure
 
 - question: "Where do Build Orchestrator specs and schedule YAML files live in the vault?"
   expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+    - "Personal/Build Orchestrator/instructions/00-orchestrator-schema.md"
+    - "Personal/Build Orchestrator/instructions/03-schedule-template.md"
   category: infrastructure
 
-- question: "What does an HTTP 502 error from a vault MCP tunnel URL actually indicate?"
+- question: "What port does the m365-mcp server run on, and what port is reserved for Tisha's future vault-mcp instance?"
   expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
   category: infrastructure
 
-- question: "What tool call reliably indicates whether the Home Assistant MCP process is down, as opposed to just the tunnel?"
+- question: "Why did the service-separation plan recommend against buying a traditional NAS, and what did it recommend instead?"
   expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/service-separation-nas-plan.md"
+  category: infrastructure
+
+- question: "What decision is due on 2026-08-15 about merging vault-audit.py and dreaming.py, and why was it deferred instead of done immediately?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/scheduled-reviews.md"
+  category: infrastructure
+
+- question: "What did the vault-infra-retrieval-diagnosis build identify as the more fundamental root cause of infrastructure retrieval misses, beyond the single-file-flooding hypothesis?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-infra-retrieval-diagnosis-output.md"
+  category: infrastructure
+
+- question: "What was the actual root cause of the 2026-07-29 WSL restart-loop incident, and what nonexistent PowerShell method broke the trading-hours safety gate?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+  category: infrastructure
+
+- question: "What is Claude instructed to read first at the very start of an infrastructure session, before any other vault reads?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/hot.md"
   category: infrastructure
 
 - question: "When should Claude use vault_search versus vault_semantic_search?"
@@ -205,3 +215,61 @@
   expected_paths:
     - "BS 2nd Brain/Alcove/Triage/wip.md"
   category: operations
+
+# --- infrastructure_v1 (DEPRECATED 2026-08-08, vault-eval-set-infra-repair) ---
+# Unchanged snapshot of the original infrastructure category, kept ONLY for
+# time-series continuity with weekly reports predating this build. All 10
+# questions here expect the same single file (SYSTEM-FACTS.md), which is exactly
+# the malformation this build fixed for the "infrastructure" category above.
+# Do NOT edit these questions and do NOT use this category for any new retrieval
+# comparison. Scheduled for removal on or after 2026-09-05.
+
+- question: "What is the correct environment variable name for the vault MCP bearer token, and what incorrect name was never actually deployed?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "What port does the BS Brain vault MCP server run on, and what is its filesystem root path?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "Where is the live obsidian-web-mcp checkout that actually powers the running vault MCP servers, and which git branch is it on?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "Does a BS_BRAIN_API_KEY environment variable exist anywhere in the infrastructure?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "Where is supervisord's config directory located on BSMiniPC, and where is it commonly but wrongly assumed to be?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "What IBKR client ID does the live SPI trading system actually use, and what ID was previously wrongly assumed?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "What ports do the Alcove Brain and CB Brain vault MCP servers run on?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "Where do Build Orchestrator specs and schedule YAML files live in the vault?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "What does an HTTP 502 error from a vault MCP tunnel URL actually indicate?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1
+
+- question: "What tool call reliably indicates whether the Home Assistant MCP process is down, as opposed to just the tunnel?"
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category: infrastructure_v1

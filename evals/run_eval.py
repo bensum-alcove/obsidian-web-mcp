@@ -231,7 +231,7 @@ def render_report(date_str: str, results: dict, previous: dict | None) -> str:
         "## What this means",
         "",
         "Weekly R@5 (is the right file in the top 5 results?) and MRR (mean reciprocal rank) "
-        "scores for every deployed vault retrieval tool, run against the 40-question answer key "
+        "scores for every deployed vault retrieval tool, run against the 50-question answer key "
         "in `evals/eval-set.yaml`. Deltas are vs. the immediately preceding run. Use this to tell "
         "whether a retrieval change actually helped instead of guessing.",
         "",
@@ -281,7 +281,7 @@ def main() -> None:
     print(f"VAULT_PATH: {config.VAULT_PATH}", file=sys.stderr)
 
     eval_set = load_eval_set()
-    assert len(eval_set) == 40, f"expected 40 eval questions, found {len(eval_set)}"
+    assert len(eval_set) == 50, f"expected 50 eval questions, found {len(eval_set)}"
 
     runners = build_tool_runners(config, src_root)
     if not runners:
