@@ -22,13 +22,22 @@ Because this is a heuristic, not a human judgment, findings are candidates for
 manual review, not confirmed contradictions.
 
 Read-only against infrastructure.md, infrastructure-changelog.md, and
-SYSTEM-FACTS.md — those three files are never modified. The prior manual
-infrastructure.md analysis in contradiction-lint-report.md is carried forward
-verbatim (this script cannot redo that reasoning-based pass without an LLM);
-only the SYSTEM-FACTS sections below it are regenerated fresh each run. On
-findings, a single Write Rule 13 summary entry is prepended to
-infrastructure-changelog.md (newest-first ordering, confirmed from the live
-file) and its frontmatter `updated` date is bumped as a separate edit.
+SYSTEM-FACTS.md — those three files are never modified, by any code path, on
+any run, findings or not. The only file this script writes is
+contradiction-lint-report.md: the prior manual infrastructure.md analysis
+there is carried forward verbatim (this script cannot redo that
+reasoning-based pass without an LLM) under its own always-2026-06-30-dated
+heading, and only the automated SYSTEM-FACTS section below it regenerates
+each run, under its own separately-dated heading.
+
+Matching is evidence-based, not co-occurrence-based (see contradiction-lint-
+precision-fix, 2026-08-09): a fact only gets flagged if a changelog entry, in
+a bounded window around a shared token, states what actually changed (an
+explicit change signal, or a differing value for the same key) — a bare
+shared token is not evidence. High-frequency infra nouns (`.wslconfig`,
+`vault_search`, ...) need a second independent corroborating signal beyond
+the noun itself, since they're mentioned in nearly every entry regardless of
+topic. If a match can't state a concrete current truth, it isn't flagged.
 """
 from __future__ import annotations
 
@@ -86,6 +95,82 @@ MIN_TOKEN_LEN = 6
 # separator. Phrases with whitespace ("status: ready") are config-keyword noise
 # too generic to mean "same claim", not "same topic".
 _DELIM_RE = re.compile(r"[/._-]")
+
+# These tokens clear the stoplist (long enough, have a path/file separator) but
+# still show up in nearly every infra changelog entry regardless of topic —
+# ".wslconfig", "vault_search" etc. are mentioned constantly without the
+# underlying fact they'd contradict actually changing. Co-occurrence with one
+# of these alone is not evidence; require a second, independent corroborating
+# signal (a distinct token from the same fact, or a matching value/quantity)
+# before letting a match through. See Phase 1 of the precision-fix spec.
+_HIGH_FREQ_NOUNS = {
+    ".wslconfig", "supervisord.conf", "conf.d", "build-orchestrator",
+    "vault_search", "vault_query", "check-supervisord.sh",
+}
+# Every `vault_*` MCP tool name (not just vault_search/vault_query above) is
+# equally over-mentioned in this vault's own engineering changelog — any
+# retrieval/tooling entry discusses several of them together as a matter of
+# course, regardless of whether "MCP tools available" itself changed.
+_HIGH_FREQ_PREFIXES = ("vault_",)
+
+# Bounded window (chars) searched around a token occurrence for a change
+# signal or differing value — deliberately small. Matching anywhere in a
+# multi-thousand-word changelog entry is exactly the co-occurrence bug this
+# fix exists to remove; the entry must say what changed *near* the token. Even
+# a single "|"-delimited table row can span 150+ chars across unrelated
+# columns (e.g. a "before" cell listing an untouched env var next to an
+# "after" cell describing a *different* var being added) — 100 keeps the
+# window inside roughly one clause/cell without crossing into the next.
+_WINDOW_RADIUS = 100
+
+# Phrases indicating the changelog entry states something actually changed,
+# not just that the token was mentioned. "at least" per the spec — deliberately
+# excludes weaker/ambiguous words like "instead of" or bare "never" ("X was
+# never modified" reads as confirmation, not change, and must NOT count).
+# "→" (also spec-listed) is deliberately excluded: this vault's changelog uses
+# it constantly for unrelated things (HTTP status asides, boot-chain arrows,
+# before/after table cells) that have nothing to do with the token being
+# checked, so at any usable window size it reads as noise, not signal.
+_CHANGE_SIGNAL_RE = re.compile(
+    r"\b(moved|renamed|removed|replaced|superseded|deprecat\w*|added|now|no longer)\b",
+    re.IGNORECASE,
+)
+
+# A value's own "shape" — used to check whether a changelog entry restates the
+# *same* value (confirmation, no contradiction) or a *different* one (real
+# evidence) for the same fact. Deliberately tied to a key word (memory/cap/
+# ram) within a short span of the number — a bare "~20GB" floating in an
+# unrelated sentence ("ruling out the obvious ~20GB hypothesis") is not a
+# value for the fact's key, it just happens to share a unit.
+_KEY_QUANTITY_RE = re.compile(
+    r"(?:\b(?:memory|cap|ram)\b.{0,20}?(\d+(?:\.\d+)?)\s?(GB|GiB|MB|KB))"
+    r"|(?:(\d+(?:\.\d+)?)\s?(GB|GiB|MB|KB).{0,20}?\b(?:memory|cap|ram)\b)",
+    re.IGNORECASE,
+)
+
+# Characters that continue a path/identifier — used to tell a "maximal" token
+# occurrence (its own free-standing identifier) from one merely embedded inside
+# a longer one (e.g. the token `conf.d` inside a path ending in
+# `conf.d/playwright-mcp.conf` describes a *different, more specific* thing
+# than the fact's own value and must not count as evidence for it).
+_IDENT_CONTINUATION = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~/")
+
+
+def _is_isolated_occurrence(entry_lower: str, start: int, end: int) -> bool:
+    if start > 0 and entry_lower[start - 1] in _IDENT_CONTINUATION:
+        return False
+    if end < len(entry_lower) and entry_lower[end] in _IDENT_CONTINUATION:
+        return False
+    return True
+
+
+def _quantities(text: str) -> set[tuple[str, str]]:
+    out = set()
+    for m in _KEY_QUANTITY_RE.finditer(text):
+        val = m.group(1) or m.group(3)
+        unit = m.group(2) or m.group(4)
+        out.add((val, unit.lower().rstrip("s")))
+    return out
 
 
 def _split_changelog_entries(text: str) -> list[tuple[str | None, str]]:
@@ -154,15 +239,49 @@ def parse_md_tables(text: str) -> list[dict]:
     return tables
 
 
+def _self_referential(entry_text: str) -> bool:
+    """Entries this lint itself generated (weekly SYSTEM-FACTS findings summaries)
+    describe lint output, not an infrastructure change — they must not feed back
+    in as evidence for the next run's matching, or the lint corroborates itself."""
+    title = entry_text.strip().splitlines()[0] if entry_text.strip() else ""
+    return "vault-fact-lint-recurring:" in title and "SYSTEM-FACTS contradiction/staleness findings" in title
+
+
 def _find_contradiction(
-    search_text: str, last_verified: str | None, changelog_entries: list[tuple[str | None, str]], now: datetime
+    search_text: str,
+    last_verified: str | None,
+    changelog_entries: list[tuple[str | None, str]],
+    now: datetime,
+    is_correction: bool = False,
 ) -> dict | None:
-    """First changelog entry dated after `last_verified` (or, if no verification
-    date at all, within the last STALE_DAYS) that shares a distinctive token
-    with `search_text` — a candidate contradiction/supersession for review."""
+    """First changelog entry, dated after `last_verified` (or within STALE_DAYS if
+    there's no verification date at all), that gives *evidence* of a changed
+    value for `search_text` — not merely a shared token. A bare token match is
+    not evidence: the entry must state what changed, near the token, either via
+    an explicit change signal (moved/renamed/removed/.../added/now/no longer) or
+    a differing value/quantity for the same key. High-frequency infra nouns
+    (`.wslconfig`, `vault_search`, ...) are mentioned in nearly every entry
+    regardless of topic, so a plain fact needs a *second* independent
+    corroborating signal (another distinct fact token in the same window, or a
+    genuinely differing same-key value) beyond the noun itself — and an entry
+    that explicitly restates the fact's own value unchanged vetoes the match
+    outright, overriding any signal word elsewhere in the window.
+
+    Correction Log rows get one deliberate exception to that veto: they record
+    a fact Ben has already gotten wrong once, so any entry with a real change
+    signal that touches the exact same config/file is worth flagging for a
+    second look even if the specific value it restates is unchanged (e.g. a new
+    section was added to the same file). Plain facts don't get this exception —
+    that would be exactly the co-occurrence-as-evidence bug this rewrite exists
+    to remove. See Phase 1/2 of the precision-fix spec.
+
+    If no window can state a concrete current truth, no hit is returned: "if
+    the tool cannot state what the truth now is, it must not flag."."""
     tokens = _extract_tokens(search_text)
     if not tokens:
         return None
+    fact_quantities = _quantities(search_text)
+    fact_units = {u for _, u in fact_quantities}
     for date_str, entry_text in changelog_entries:
         if not date_str:
             continue
@@ -171,15 +290,72 @@ def _find_contradiction(
                 continue
         elif _days_since(date_str, now) > STALE_DAYS:
             continue
+        if _self_referential(entry_text):
+            continue
         entry_lower = entry_text.lower()
         for tok in tokens:
-            if tok.lower() in entry_lower:
+            tok_lower = tok.lower()
+            is_high_freq = any(noun in tok_lower for noun in _HIGH_FREQ_NOUNS) or tok_lower.startswith(
+                _HIGH_FREQ_PREFIXES
+            )
+            search_from = 0
+            while True:
+                idx = entry_lower.find(tok_lower, search_from)
+                if idx == -1:
+                    break
+                end = idx + len(tok_lower)
+                search_from = end
+                if not _is_isolated_occurrence(entry_lower, idx, end):
+                    continue
+                win_start, win_end = max(0, idx - _WINDOW_RADIUS), min(len(entry_text), end + _WINDOW_RADIUS)
+                window = entry_text[win_start:win_end]
+
+                # Only compare quantities that share a unit with something in
+                # the fact — a "~5 min" restart cadence near the token is not
+                # evidence about a fact whose own quantities are all GB/GiB.
+                window_quantities = {(v, u) for v, u in _quantities(window) if u in fact_units}
+                differing_quantities = window_quantities - fact_quantities
+                same_quantity_only = bool(window_quantities) and not differing_quantities
+
+                if same_quantity_only and not is_correction:
+                    # Entry restates the same value near this token — that's
+                    # confirmation, not contradiction. Corrections get the
+                    # exception described above; plain facts don't.
+                    continue
+
+                has_signal = bool(_CHANGE_SIGNAL_RE.search(window))
+
+                if is_high_freq and not is_correction:
+                    # The noun alone (even with a differing quantity) isn't
+                    # enough for a high-frequency noun on a plain fact — it
+                    # needs an explicit change signal *and* a second
+                    # independent corroborating signal (a differing value, or
+                    # another distinct fact token, in the same window). A
+                    # sibling from the same "family" (e.g. `vault_search` /
+                    # `vault_semantic_search` — a fact enumerating many
+                    # `vault_*` tools) doesn't count: those co-occur constantly
+                    # in ordinary engineering prose about the vault codebase
+                    # and aren't independent evidence of each other.
+                    tok_prefix = re.split(r"[_.\-]", tok_lower, maxsplit=1)[0]
+                    other_tokens_present = any(
+                        t.lower() in window.lower()
+                        for t in tokens
+                        if t.lower() != tok_lower
+                        and re.split(r"[_.\-]", t.lower(), maxsplit=1)[0] != tok_prefix
+                    )
+                    if not (has_signal and (differing_quantities or other_tokens_present)):
+                        continue
+                elif not (differing_quantities or has_signal):
+                    continue
+
                 title = entry_text.strip().splitlines()[0].lstrip("#").strip()
                 title = re.sub(rf"^{re.escape(date_str)}\s*—\s*", "", title)
+                snippet = " ".join(window.split())[:220]
                 return {
                     "date": date_str,
                     "excerpt": title[:200],
                     "token": tok,
+                    "current_truth": snippet,
                 }
     return None
 
@@ -225,7 +401,7 @@ def lint_system_facts(system_facts_text: str, changelog_entries: list[tuple[str 
                         "section": table["heading"] or "SYSTEM-FACTS.md",
                         "changelog": hit["excerpt"],
                         "date": hit["date"],
-                        "current_truth": f"See changelog {hit['date']} (matched on `{hit['token']}`)",
+                        "current_truth": f"{hit['current_truth']} (changelog {hit['date']})",
                     }
                 )
             elif last_verified is None or _days_since(last_verified, now) > STALE_DAYS:
@@ -253,7 +429,7 @@ def lint_system_facts(system_facts_text: str, changelog_entries: list[tuple[str 
             correct_fact = row.get(correct_key, "")
             date_learned = row.get(date_key, "") if date_key else ""
             last_verified = _last_date(date_learned)
-            hit = _find_contradiction(correct_fact, last_verified, changelog_entries, now)
+            hit = _find_contradiction(correct_fact, last_verified, changelog_entries, now, is_correction=True)
             if hit:
                 correction_superseded.append(
                     {
@@ -261,7 +437,7 @@ def lint_system_facts(system_facts_text: str, changelog_entries: list[tuple[str 
                         "section": "Correction Log",
                         "changelog": hit["excerpt"],
                         "date": hit["date"],
-                        "current_truth": f"Correction itself superseded — see changelog {hit['date']}",
+                        "current_truth": f"Correction itself may be stale — {hit['current_truth']} (changelog {hit['date']})",
                     }
                 )
 
@@ -281,12 +457,15 @@ def _md_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def render_system_facts_section(result: dict, now: datetime) -> str:
     lines = [
-        f"{SYSTEM_FACTS_MARKER} {now.strftime('%Y-%m-%d')} by "
-        "`scripts/contradiction_lint.py` (automated, weekly). Sections above this point are "
-        "carried forward verbatim from the original 2026-06-30 manual infrastructure.md analysis "
-        "— not re-run by this script.*",
+        SYSTEM_FACTS_MARKER,
         "",
-        "## SYSTEM-FACTS contradictions",
+        f"## Automated SYSTEM-FACTS analysis (generated {now.strftime('%Y-%m-%d')})",
+        "",
+        "Automated, weekly, by `scripts/contradiction_lint.py`. Independent of the manual "
+        "infrastructure.md analysis above — that pass is one-time (2026-06-30) and not "
+        "re-run by this script; only this section regenerates each run.",
+        "",
+        "### SYSTEM-FACTS contradictions",
         "",
     ]
     if result["contradicted"]:
@@ -302,7 +481,7 @@ def render_system_facts_section(result: dict, now: datetime) -> str:
     else:
         lines.append("| Fact | Table/section | Changelog entry | Date | Current truth |")
         lines.append("|---|---|---|---|---|")
-    lines += ["", "## SYSTEM-FACTS stale (no confirmation >90d)", ""]
+    lines += ["", "### SYSTEM-FACTS stale (no confirmation >90d)", ""]
     if result["stale"]:
         lines.append(
             _md_table(
@@ -313,17 +492,54 @@ def render_system_facts_section(result: dict, now: datetime) -> str:
     else:
         lines.append("| Fact | Table/section | Last verified |")
         lines.append("|---|---|---|")
-    lines += ["", "## SYSTEM-FACTS current", "", f"Count: {len(result['current'])}"]
+    lines += ["", "### SYSTEM-FACTS current", "", f"Count: {len(result['current'])}"]
     return "\n".join(lines) + "\n"
 
 
-SYSTEM_FACTS_MARKER = "*SYSTEM-FACTS sections below regenerated"
+# Invisible cut-point for splitting "manual analysis" from "automated section" on
+# rerun — an HTML comment so it doesn't clutter the rendered report the way the
+# old inline italic note did, while still giving build_report() an exact,
+# stable string to find. The old inline-italic marker is recognized too, purely
+# so the one run that transitions a report from the old format to this one
+# doesn't duplicate the carried-forward manual section.
+SYSTEM_FACTS_MARKER = "<!-- SYSTEM_FACTS_AUTOMATED_SECTION -->"
+_LEGACY_SYSTEM_FACTS_MARKER = "*SYSTEM-FACTS sections below regenerated"
+
+# The manual 2026-06-30 infrastructure.md analysis is carried forward verbatim
+# (this script cannot redo that reasoning-based pass) but it goes stale exactly
+# because it's never re-run — e.g. it still lists Playwright MCP's headless
+# setting, which stopped applying once playwright-mcp was decommissioned
+# entirely on 2026-08-09. Flagging it costs nothing and keeps a fresh
+# `generated:` frontmatter date from implying the whole report was re-verified.
+_MANUAL_ANALYSIS_LABEL_MARKER = "one-time pass, not re-run by automation"
+_MANUAL_ANALYSIS_LABEL = (
+    "\n\n**Manual infrastructure.md analysis — one-time pass, not re-run by automation.** "
+    "The frontmatter `generated:` date above tracks only the automated section at the bottom "
+    "of this report; this section keeps its own 2026-06-30 date and goes stale independently."
+)
+
+_KNOWN_OBSOLETE_NOTE_MARKER = "## Known-obsolete manual-analysis rows (flagged, not corrected)"
+_KNOWN_OBSOLETE_NOTE = f"""
+{_KNOWN_OBSOLETE_NOTE_MARKER}
+
+The manual analysis above is carried forward verbatim and never re-run, so it can go stale on
+its own timeline. Known cases (flagged here, not edited into the row above — see Hard
+Constraints):
+
+- **Playwright MCP: "Browser: Headless Chromium..." row** — `playwright-mcp` (the program this
+  row describes) was decommissioned entirely on 2026-08-09; see
+  `infrastructure-changelog.md` entry `playwright-mcp-decommission-cleanup`. The row's headless/
+  display-flag claim no longer applies to anything running.
+"""
 
 
 def build_report(existing_text: str, system_facts_section: str, now: datetime) -> str:
     """Carry forward everything up to (and not including) a prior SYSTEM_FACTS_MARKER
     verbatim, bump the `generated:` frontmatter date, and append the freshly
-    regenerated SYSTEM-FACTS section — idempotent across reruns."""
+    regenerated SYSTEM-FACTS section — idempotent across reruns. `generated:`
+    describes only the automated section; the manual analysis keeps its own
+    2026-06-30 date inline so a fresh `generated:` value never implies the
+    carried-forward content was re-verified."""
     today = now.strftime("%Y-%m-%d")
     if existing_text.startswith("---"):
         end = existing_text.find("\n---", 3)
@@ -334,64 +550,18 @@ def build_report(existing_text: str, system_facts_section: str, now: datetime) -
     fm_block = re.sub(r"^generated:\s*.*$", f"generated: '{today}'", fm_block, flags=re.MULTILINE)
 
     cut = body.find("\n" + SYSTEM_FACTS_MARKER)
+    if cut == -1:
+        cut = body.find("\n" + _LEGACY_SYSTEM_FACTS_MARKER)
     if cut != -1:
         body = body[:cut]
 
+    if _MANUAL_ANALYSIS_LABEL_MARKER not in body:
+        body = re.sub(r"(^Generated: *\d{4}-\d{2}-\d{2})$", r"\1" + _MANUAL_ANALYSIS_LABEL, body, count=1, flags=re.MULTILINE)
+
+    if _KNOWN_OBSOLETE_NOTE_MARKER not in body:
+        body = body.rstrip() + "\n" + _KNOWN_OBSOLETE_NOTE
+
     return fm_block + body.rstrip() + "\n\n" + system_facts_section
-
-
-CHANGELOG_ENTRY_TEMPLATE = """## {date} — vault-fact-lint-recurring: SYSTEM-FACTS contradiction/staleness findings
-**Status:** executed
-
-### What this means
-Automated weekly lint found {n_contra} candidate contradiction(s) and {n_stale} stale fact(s) \
-between SYSTEM-FACTS.md and this changelog. See `contradiction-lint-report.md` for the full \
-table. Report-only — no source files were modified by this run; findings are candidates for \
-manual review, not confirmed corrections.
-
-### Files changed
-| File | Original before | Change after | Revert command |
-|------|-------------------|----------------|----------------|
-| BS 2nd Brain/Alcove/Infrastructure/contradiction-lint-report.md | previous lint snapshot | \
-regenerated with fresh SYSTEM-FACTS section | restore prior version from git history / vault backup |
-
-### Verification
-- [x] Report regenerated: contradiction-lint-report.md
-- [ ] Findings reviewed by Ben and SYSTEM-FACTS.md corrected if needed
-
-### Rationale
-Recurring automated lint (vault-fact-lint-recurring build) — SYSTEM-FACTS.md accuracy is \
-load-bearing for every infrastructure session, so drift must surface automatically rather than \
-never (the original 2026-06-30 lint was run once manually and never scheduled).
-
-### Revert procedure
-1. This entry is informational only; no infrastructure change was made.
-2. If findings are false positives, no action needed beyond noting so in the report.
-
-"""
-
-
-def _bump_changelog(changelog_text: str, n_contra: int, n_stale: int, now: datetime) -> str:
-    today = now.strftime("%Y-%m-%d")
-    entry = CHANGELOG_ENTRY_TEMPLATE.format(date=today, n_contra=n_contra, n_stale=n_stale)
-
-    if changelog_text.startswith("---"):
-        end = changelog_text.find("\n---", 3)
-        fm_block, body = changelog_text[: end + 4], changelog_text[end + 4 :]
-    else:
-        fm_block, body = "", changelog_text
-
-    fm_block = re.sub(r"^updated:\s*.*$", f"updated: '{today}'", fm_block, flags=re.MULTILINE)
-    fm_block = re.sub(
-        r"^last_edit_note:.*$",
-        "last_edit_note: Added vault-fact-lint-recurring SYSTEM-FACTS findings entry "
-        f"({today})",
-        fm_block,
-        flags=re.MULTILINE,
-    )
-    fm_block = re.sub(r"^last_edited_by:.*$", "last_edited_by: Claude Code (vault-fact-lint-recurring cron)", fm_block, flags=re.MULTILINE)
-
-    return fm_block + "\n\n" + entry + body.lstrip("\n")
 
 
 def run(dry_run: bool = False) -> dict:
@@ -412,27 +582,21 @@ def run(dry_run: bool = False) -> dict:
     new_report = build_report(existing_report, system_facts_section, now)
 
     n_contra, n_stale = len(result["contradicted"]), len(result["stale"])
-    # Guard against double-logging if this script runs twice the same day (e.g. a
-    # manual verification run followed by the real cron fire) — only the report
-    # regenerates every run; the changelog entry is a once-per-cycle summary.
-    # entries[0] is frequently the leading frontmatter block (it never starts
-    # with '## ', since the split only breaks *before* '## ' headers) — skip it
-    # to find the actual newest dated entry.
-    real_entries = [e for e in changelog_entries if e[1].startswith("## ")]
-    top_entry_title = real_entries[0][1].splitlines()[0] if real_entries else ""
-    already_logged_today = "vault-fact-lint-recurring:" in top_entry_title
 
+    # Report-only: this run never touches infrastructure.md, SYSTEM-FACTS.md,
+    # or infrastructure-changelog.md — only contradiction-lint-report.md is
+    # written. An earlier version of this script also prepended a summary
+    # entry to infrastructure-changelog.md on findings; that contradicted its
+    # own "those three files are never modified" claim and the precision-fix
+    # spec's hard constraint, so it's gone — findings live in the report only.
     if not dry_run:
         REPORT_PATH.write_text(new_report, encoding="utf-8")
-        if n_contra > 0 and not already_logged_today:
-            CHANGELOG_PATH.write_text(_bump_changelog(changelog_text, n_contra, n_stale, now), encoding="utf-8")
 
     summary = {
         "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "contradicted": n_contra,
         "stale": n_stale,
         "current": len(result["current"]),
-        "changelog_appended": n_contra > 0 and not dry_run,
         "report_path": str(REPORT_PATH),
     }
     print(
