@@ -101,9 +101,9 @@
     - "BS 2nd Brain/Alcove/Infrastructure/scheduled-reviews.md"
   category: infrastructure
 
-- question: "What did the vault-infra-retrieval-diagnosis build identify as the more fundamental root cause of infrastructure retrieval misses, beyond the single-file-flooding hypothesis?"
+- question: "Why did the fix-bo-stray-vault-write-path build fail before Phase 0 could even begin, and which global CLAUDE.md rule caused the conflict with dispatch.py's verbatim spec_path?"
   expected_paths:
-    - "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-infra-retrieval-diagnosis-output.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Build Logs/fix-bo-stray-vault-write-path-diagnosis.md"
   category: infrastructure
 
 - question: "What was the actual root cause of the 2026-07-29 WSL restart-loop incident, and what nonexistent PowerShell method broke the trading-hours safety gate?"

@@ -146,6 +146,23 @@ def _extract_paths(raw_json: str, vault_path: Path) -> list[str]:
     return [p for p in paths if not _is_eval_excluded(p, vault_path)]
 
 
+def _validate_no_excluded_expected_paths(eval_set: list[dict], vault_path: Path) -> None:
+    """An expected_paths entry that's itself excluded from scoring is a guaranteed
+    miss, not a real retrieval result — fail loudly instead of silently deflating
+    a category's score. See vault-eval-runner-commit-and-q8 spec."""
+    violations = [
+        (entry["category"], entry["question"], path)
+        for entry in eval_set
+        for path in entry["expected_paths"]
+        if _is_eval_excluded(path, vault_path)
+    ]
+    if violations:
+        print("[error] expected_paths excluded from scoring — these questions can never score a hit:", file=sys.stderr)
+        for category, question, path in violations:
+            print(f"  [{category}] {question!r} -> excluded expected path: {path}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _score_query(returned_paths: list[str], expected_paths: list[str]) -> tuple[float, float]:
     """Returns (hit_at_5, reciprocal_rank) for one query against one tool's results."""
     top_k = returned_paths[:R_AT_K]
@@ -319,6 +336,7 @@ def main() -> None:
 
     eval_set = load_eval_set()
     assert len(eval_set) == 50, f"expected 50 eval questions, found {len(eval_set)}"
+    _validate_no_excluded_expected_paths(eval_set, config.VAULT_PATH)
 
     runners = build_tool_runners(config, src_root)
     if not runners:
