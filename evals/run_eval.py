@@ -18,6 +18,7 @@ evals/history/, not in the vault.
 """
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import statistics
@@ -25,6 +26,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import frontmatter
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,13 +42,53 @@ LIVE_SRC_ROOT = Path(
 VAULT_NAME = __import__("os").environ.get("VAULT_NAME", "bs-brain")
 REPORT_DIR_IN_VAULT = "BS 2nd Brain/Alcove/Infrastructure/retrieval-eval"
 
-# eval-set.md (human-readable copy) lives in the vault and contains every question
-# verbatim — it would otherwise self-match as a literal substring hit on every query
-# and win vault_search's keyword-fallback leg. Exclude the eval's own artifacts from
-# scoring; they aren't real content.
-_SELF_REFERENTIAL_PREFIX = REPORT_DIR_IN_VAULT + "/"
+# The eval's own paperwork (the answer key, the build logs/specs that quote it
+# verbatim) lives inside the same vault it's scoring, so it self-matches as a
+# literal/keyword hit on every query and crowds out the real answer. These are
+# scoring-time exclusions only — the files stay in the vault untouched. Two
+# mechanisms: a static glob list (seeded from known contaminants; rots as new
+# ones appear) plus a self-maintaining `eval_exclude: true` frontmatter marker
+# any future document can carry. See vault-eval-corpus-decontamination spec.
+EVAL_EXCLUDE_GLOBS = [
+    "BS 2nd Brain/Alcove/Infrastructure/retrieval-eval/**",
+    "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-infra-retrieval-diagnosis-output.md",
+    "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-eval-set-infra-repair-output.md",
+    "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-keyword-leg-tokenization-output.md",
+    "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-eval-corpus-decontamination-output.md",
+    "Personal/Build Orchestrator/specs/vault-infra-retrieval-diagnosis.md",
+    "Personal/Build Orchestrator/specs/vault-eval-set-infra-repair.md",
+    "Personal/Build Orchestrator/specs/vault-keyword-leg-tokenization.md",
+    "Personal/Build Orchestrator/specs/vault-eval-corpus-decontamination.md",
+]
 
-TOP_N = 10        # results requested per tool call (MRR can rank beyond 5)
+# infrastructure-changelog.md is deliberately NOT in the glob list above — it is
+# a legitimate expected answer for a real question and must stay scoreable.
+
+_frontmatter_exclude_cache: dict[str, bool] = {}
+
+
+def _is_eval_excluded(path: str, vault_path: Path) -> bool:
+    """True if `path` (vault-root-relative) should be dropped from scoring."""
+    if any(fnmatch.fnmatch(path, pattern) for pattern in EVAL_EXCLUDE_GLOBS):
+        return True
+
+    cached = _frontmatter_exclude_cache.get(path)
+    if cached is not None:
+        return cached
+
+    excluded = False
+    full_path = vault_path / path
+    if full_path.is_file():
+        try:
+            post = frontmatter.load(full_path)
+            excluded = bool(post.metadata.get("eval_exclude", False))
+        except Exception:  # noqa: BLE001 - unreadable/malformed frontmatter isn't a match
+            excluded = False
+    _frontmatter_exclude_cache[path] = excluded
+    return excluded
+
+
+TOP_N = 15        # fetch depth: over-fetch so exclusion filtering doesn't deflate R@5
 R_AT_K = 5        # R@5
 
 
@@ -61,14 +103,6 @@ def _load_live_tools():
         sys.path.insert(0, str(src_root))
 
     from obsidian_vault_mcp import config  # noqa: E402
-
-    # eval-set.md and every dated report live under retrieval-eval/ and contain every
-    # question verbatim — without this, a query's own text is a guaranteed literal
-    # substring hit against that folder, which short-circuits vault_search's keyword
-    # fallback (it only engages when the ripgrep/literal leg returns zero matches) and
-    # starves the RRF keyword leg inside vault_query. This mutates only this process's
-    # in-memory config, not the live server, so it's safe to do unconditionally.
-    config.EXCLUDED_DIRS = config.EXCLUDED_DIRS | {"retrieval-eval"}
 
     return config, src_root
 
@@ -87,8 +121,11 @@ def load_eval_set() -> list[dict]:
         return yaml.safe_load(f)
 
 
-def _extract_paths(raw_json: str) -> list[str]:
-    """Normalise the three different result shapes into an ordered list of paths."""
+def _extract_paths(raw_json: str, vault_path: Path) -> list[str]:
+    """Normalise the three different result shapes into an ordered list of paths,
+    with eval-artifact contaminants dropped. Filtering happens on the full
+    over-fetched (TOP_N) list, before any top-5 truncation, so exclusion doesn't
+    silently deflate R@5."""
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError:
@@ -106,7 +143,7 @@ def _extract_paths(raw_json: str) -> list[str]:
     else:
         return []
 
-    return [p for p in paths if not p.startswith(_SELF_REFERENTIAL_PREFIX)]
+    return [p for p in paths if not _is_eval_excluded(p, vault_path)]
 
 
 def _score_query(returned_paths: list[str], expected_paths: list[str]) -> tuple[float, float]:
@@ -123,13 +160,13 @@ def _score_query(returned_paths: list[str], expected_paths: list[str]) -> tuple[
     return hit, rr
 
 
-def run_tool_eval(tool_fn, call_kwargs_fn, eval_set: list[dict]) -> dict:
+def run_tool_eval(tool_fn, call_kwargs_fn, eval_set: list[dict], vault_path: Path) -> dict:
     """Run one tool against every question. Returns per-category + overall R@5/MRR."""
     per_category: dict[str, list[tuple[float, float]]] = {}
 
     for entry in eval_set:
         raw = tool_fn(entry["question"], **call_kwargs_fn())
-        paths = _extract_paths(raw)
+        paths = _extract_paths(raw, vault_path)
         hit, rr = _score_query(paths, entry["expected_paths"])
         per_category.setdefault(entry["category"], []).append((hit, rr))
 
@@ -291,7 +328,7 @@ def main() -> None:
     results = {}
     for tool_name, (tool_fn, kwargs_fn) in runners.items():
         print(f"Scoring {tool_name}...", file=sys.stderr)
-        results[tool_name] = run_tool_eval(tool_fn, kwargs_fn, eval_set)
+        results[tool_name] = run_tool_eval(tool_fn, kwargs_fn, eval_set, config.VAULT_PATH)
 
     date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     previous = load_previous_history()
