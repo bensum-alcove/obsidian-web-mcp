@@ -31,6 +31,22 @@ under budget or the floor is hit (OVER-BUDGET-AT-FLOOR). Bullets over 250
 chars are flagged as LONG-BULLET (report-only, never auto-edited). This build
 also found BUILD_LOG_SEARCH_DIRS missing the "Infrastructure/Build Logs/"
 subdirectory where several real build logs live — added below.
+
+v3 additions (build_id: hot-md-curate-v3): budget_enforcement_pass now rotates
+from every canonical section (CANONICAL_SECTIONS), not just the two "capped"
+ones, so bulk in "What's current"/"Parked"/"Blockers / watchpoints" is no
+longer immune — same floor of 2 bullets each, no section ever emptied.
+Budget raised 2,500 -> 5,000 chars (Ben's steer 2026-08-14). Any level-2
+heading outside CANONICAL_SECTIONS is now named in the report as
+NON-CANONICAL-SECTION with its char count — report-only, never rotated or
+edited, since deleting arbitrary prose is out of scope. CONTENT-STALE detects
+when the newest date appearing anywhere in a file's body is more than
+CONTENT_STALE_DAYS old, which is the freshness-lie failure mode this build
+exists to catch. The curator no longer bumps frontmatter `updated:` on a
+rotation-only run — previously every --apply rotation stamped `updated:` to
+today even though rotating stale content out is not a content update, which
+is exactly how BO's hot.md ended up claiming 2026-08-14 while its body was
+six weeks stale.
 """
 
 import argparse
@@ -52,12 +68,23 @@ TARGETS = [
     "Personal/Build Orchestrator/hot.md",
 ]
 
-BUDGET_CHARS = 2500
+BUDGET_CHARS = 5000  # raised from 2500 in hot-md-curate-v3 — see docstring
 SECTION_CAP = 5
 BUDGET_FLOOR = 2
 LONG_BULLET_CHARS = 250
 MTIME_GUARD_SECONDS = 15 * 60
 ARCHIVE_DIR = "hot-archive"
+CONTENT_STALE_DAYS = 14
+
+# Canonical hot.md structure — see BS 2nd Brain/Alcove/Infrastructure/hot-md-structure.md.
+# Order matches document order and is the rotation order in budget_enforcement_pass.
+CANONICAL_SECTIONS = [
+    "what's current",
+    "last session shipped",
+    "in flight",
+    "parked",
+    "blockers / watchpoints",
+]
 
 BUILD_LOG_SEARCH_DIRS = [
     "Personal/Build Orchestrator/build-logs",
@@ -92,6 +119,7 @@ FRONTMATTER_RE = re.compile(r"\A---\n(.*?\n)---\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,2})\s+(.*?)\s*$")
 BACKTICK_CANDIDATE_RE = re.compile(r"`([a-z0-9]+(?:-[a-z0-9]+){1,6})`")
 BARE_CANDIDATE_RE = re.compile(r"\b([a-z0-9]+(?:-[a-z0-9]+){1,6})\b")
+BODY_DATE_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 
 
 def read_file(path):
@@ -114,20 +142,6 @@ def frontmatter_and_body(text):
 def char_count_excluding_frontmatter(text):
     _, body = frontmatter_and_body(text)
     return len(body)
-
-
-def bump_frontmatter_updated(text, date_str):
-    fm, body = frontmatter_and_body(text)
-    if not fm:
-        return text
-    new_fm, n = re.subn(
-        r"(?m)^(updated:\s*)('?)[0-9]{4}-[0-9]{2}-[0-9]{2}\2\s*$",
-        lambda m: f"{m.group(1)}'{date_str}'",
-        fm,
-    )
-    if n == 0:
-        return text
-    return new_fm + body
 
 
 def line_candidates(line):
@@ -279,6 +293,43 @@ def is_watchpoint_section(heading):
     return "blockers" in h or "watchpoints" in h
 
 
+def is_canonical_section(heading):
+    h = heading.strip().lower()
+    return any(h.startswith(prefix) for prefix in CANONICAL_SECTIONS)
+
+
+def non_canonical_section_report(lines, sections, rel_path):
+    """Report-only: names any level-2 heading outside CANONICAL_SECTIONS with
+    its char count. Never deletes, merges, or edits — that is a human call."""
+    report = []
+    for sec in sections:
+        if sec["level"] != 2 or is_canonical_section(sec["heading"]):
+            continue
+        text = "\n".join(lines[sec["start"]:sec["end"]])
+        report.append(
+            f'NON-CANONICAL-SECTION: {rel_path} — "{sec["heading"]}" ({len(text)} chars)'
+        )
+    return report
+
+
+def content_stale_check(lines, scan_start, today_str, rel_path):
+    """Report-only: flags rel_path if the newest YYYY-MM-DD date found anywhere
+    in the body (headings or inline) is more than CONTENT_STALE_DAYS before
+    today. Lexical max is safe here since all matches are well-formed ISO dates."""
+    dates = []
+    for l in lines[scan_start:]:
+        dates.extend(BODY_DATE_RE.findall(l))
+    if not dates:
+        return None
+    newest = max(dates)
+    age_days = (
+        datetime.strptime(today_str, "%Y-%m-%d") - datetime.strptime(newest, "%Y-%m-%d")
+    ).days
+    if age_days > CONTENT_STALE_DAYS:
+        return f"CONTENT-STALE: {rel_path} — newest body date {newest} is {age_days} days old (threshold {CONTENT_STALE_DAYS})"
+    return None
+
+
 def check_c(lines, sections, rel_path):
     """Returns (report_lines, remove_line_indices, archive_chunks)."""
     report = []
@@ -364,12 +415,13 @@ def long_bullet_check(lines, sections, rel_path):
 
 
 def budget_enforcement_pass(lines):
-    """Iteratively rotates the oldest bullet from "Last session shipped" then
-    "In flight" (never below BUDGET_FLOOR bullets in either) until the text
-    is under BUDGET_CHARS. Never touches any other section or frontmatter.
+    """Iteratively rotates the oldest bullet from every canonical section, in
+    CANONICAL_SECTIONS order, never below BUDGET_FLOOR bullets in any one,
+    until the text is under BUDGET_CHARS. Non-canonical sections are never
+    touched — their bulk is counted but not rotatable by this tool.
     Returns (lines, archive_entries, over_budget)."""
     archive_entries = []
-    section_order = ["last session shipped", "in flight"]
+    section_order = CANONICAL_SECTIONS
 
     def current_chars():
         return char_count_excluding_frontmatter("\n".join(lines) + "\n")
@@ -463,6 +515,7 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         "report_lines": [],
         "resolved_findings": [],
         "rotate_candidates": [],
+        "content_stale": None,
     }
     if not result["exists"]:
         result["report_lines"].append(f"MISSING: {rel_path} not found")
@@ -485,6 +538,13 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         trailing_newline = False
 
     sections = parse_sections(all_lines)
+
+    result["report_lines"].extend(non_canonical_section_report(all_lines, sections, rel_path))
+
+    content_stale_line = content_stale_check(all_lines, fm_lines_count, today_str, rel_path)
+    result["content_stale"] = content_stale_line
+    if content_stale_line:
+        result["report_lines"].append(content_stale_line)
 
     b_report, b_removal_specs = check_b(vault_root, all_lines, fm_lines_count, sections)
     result["resolved_findings"] = b_report
@@ -544,7 +604,6 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         return result
 
     new_text = "\n".join(working_lines) + ("\n" if trailing_newline else "")
-    new_text = bump_frontmatter_updated(new_text, today_str)
 
     write_file(abs_path, new_text)
     result["changed"] = True
@@ -620,6 +679,7 @@ def main():
     total_resolved = 0
     total_stale = 0
     total_rotate = 0
+    total_content_stale = 0
     tg_lines = []
 
     for res in all_results:
@@ -635,15 +695,26 @@ def main():
         resolved = sum(1 for f in res["resolved_findings"] if f.startswith("RESOLVED"))
         stale = sum(1 for f in res["resolved_findings"] if f.startswith("STALE-BLOCKER"))
         rotate = len(res["rotate_candidates"])
+        content_stale = 1 if res.get("content_stale") else 0
         total_resolved += resolved
         total_stale += stale
         total_rotate += rotate
+        total_content_stale += content_stale
 
         a = res.get("check_a", {})
         tg_lines.append(
             f"{res['rel_path']}: {a.get('chars', '?')}/{BUDGET_CHARS} chars "
-            f"(RESOLVED={resolved} STALE-BLOCKER={stale} ROTATE-CANDIDATE={rotate})"
+            f"(RESOLVED={resolved} STALE-BLOCKER={stale} ROTATE-CANDIDATE={rotate} "
+            f"CONTENT-STALE={content_stale})"
         )
+
+    totals_line = (
+        f"Totals: RESOLVED={total_resolved} STALE-BLOCKER={total_stale} "
+        f"ROTATE-CANDIDATE={total_rotate} CONTENT-STALE={total_content_stale}"
+    )
+    report_lines.append(f"## Totals")
+    report_lines.append(f"- {totals_line}")
+    report_lines.append("")
 
     review_due, review_warnings = check_e(args.vault_root, today_str)
     report_lines.append("## Scheduled Reviews")
@@ -692,8 +763,7 @@ def main():
         tg_message = (
             f"hot-md-curate ({'apply' if apply_mode else 'report'}) — {today_str}\n"
             + "\n".join(tg_lines)
-            + f"\nTotals: RESOLVED={total_resolved} STALE-BLOCKER={total_stale} "
-            f"ROTATE-CANDIDATE={total_rotate} REVIEW-DUE={len(review_due)}"
+            + f"\n{totals_line} REVIEW-DUE={len(review_due)}"
         )
         if review_due:
             tg_message += "\n" + "\n".join(review_due)
