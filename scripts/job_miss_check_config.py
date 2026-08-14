@@ -96,4 +96,31 @@ JOBS = [
         "period_hours": 24,
         "enabled": True,
     },
+    {
+        # Daily 07:30 AEST, BS Brain. Checked at 10:00 same day (~2.5h old when healthy).
+        "name": "hot-md-curate",
+        "artifact": "/home/ben_sum/vaults/bs-brain/BS 2nd Brain/Alcove/Infrastructure/hot-md-reports/*.md",
+        "max_age_hours": 25,
+        "period_hours": 24,
+        "enabled": True,
+    },
+    {
+        # bo-loop-heartbeat-and-slos: daily synthetic canary, 20:40 AEST every
+        # day (not just weekdays — the canary is synthetic and needs no real
+        # trading session). Checked at 10:00 next day (~13h old when healthy).
+        # Written ONLY when canary.py's run_daily_canary() completes all seven
+        # stages (audit emit -> parse -> proposal -> shadow-adjudicate ->
+        # shadow-remediate -> completion-review input) — a canary that dies
+        # mid-pipeline leaves this exactly as stale as one that never ran at
+        # all, and this checker cannot and does not need to tell the two apart.
+        # This is the terminal-stage assertion required by the build spec:
+        # the canary process reporting its own success is never the sole
+        # authority that the loop was observed alive — this externally-owned,
+        # read-only mtime check is.
+        "name": "bo-loop-heartbeat-canary",
+        "artifact": "/home/ben_sum/.build-orchestrator/canary/terminal-stage-heartbeat.json",
+        "max_age_hours": 14,
+        "period_hours": 24,
+        "enabled": True,
+    },
 ]
