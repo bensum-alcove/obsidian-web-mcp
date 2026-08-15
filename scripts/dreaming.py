@@ -32,6 +32,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from obsidian_vault_mcp import config  # noqa: E402
+from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
+    FrontmatterError,
+    update_frontmatter_field,
+)
 from obsidian_vault_mcp.tools import semantic_search as ss  # noqa: E402
 
 VAULT_PATH = config.VAULT_PATH
@@ -784,25 +788,8 @@ def find_autofix_candidates(vault_path: Path, md_files: list[str]) -> list[dict]
 
 
 def _bump_frontmatter_updated(content: str, today: str) -> str:
-    """Same conservative pattern as vault-audit.py's autofix_stale_frontmatter:
-    only touch an existing `updated:` line, never add one."""
-    if not content.startswith("---"):
-        return content
-    end = content.find("---", 3)
-    if end == -1:
-        return content
-    fm_block = content[3:end]
-    # [ \t]*$, not \s*$: \s matches literal newlines too, so when `updated:` is
-    # the last frontmatter line, a greedy \s*$ under MULTILINE swallows the
-    # block's trailing newline and glues the next line onto the closing `---`.
-    m = re.search(r'^(updated:\s*)([\'"]?)\d{4}-\d{2}-\d{2}([\'"]?)[ \t]*$', fm_block, re.MULTILINE)
-    if not m:
-        return content
-    prefix, q_open, q_close = m.group(1), m.group(2), m.group(3)
-    quote = q_open if q_open == q_close else q_open
-    new_line = f"{prefix}{quote}{today}{quote}"
-    new_fm_block = fm_block[: m.start()] + new_line + fm_block[m.end() :]
-    return content[:3] + new_fm_block + content[end:]
+    """Parse and update an existing ``updated`` field."""
+    return update_frontmatter_field(content, "updated", today, require_existing=True)
 
 
 def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tuple[list[str], Path | None]:
@@ -834,7 +821,15 @@ def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tu
 
         if not file_fixed:
             continue
-        new_content = _bump_frontmatter_updated("\n".join(lines), today)
+        try:
+            new_content = _bump_frontmatter_updated("\n".join(lines), today)
+        except FrontmatterError as exc:
+            print(
+                f"[dreaming] SKIPPED {rel}: invalid frontmatter: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
 
         backup_path = backup_dir / rel
         backup_path.parent.mkdir(parents=True, exist_ok=True)

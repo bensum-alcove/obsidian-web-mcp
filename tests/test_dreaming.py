@@ -377,7 +377,39 @@ def test_apply_autofix_backs_up_fixes_and_bumps_updated(dreaming, autofix_vault)
 
     fixed_content = (autofix_vault / "citing-note.md").read_text()
     assert "[[Real File]]" in fixed_content
-    assert "updated: 2026-08-01\n---\n" in fixed_content  # newline before closing fence must survive
+    assert "updated: '2026-08-01'\n---\n" in fixed_content
+
+
+def test_frontmatter_no_change_is_byte_identical(dreaming):
+    content = "---\r\nupdated: '2026-08-01'\r\ntags: [one, two]\r\n---\r\nBody\r\n---\r\n"
+    assert dreaming._bump_frontmatter_updated(content, "2026-08-01") == content
+
+
+def test_frontmatter_invalid_is_reported_not_rewritten(dreaming):
+    content = "---\nupdated: [broken\n---\nBody\n"
+    with pytest.raises(ValueError, match="unparseable"):
+        dreaming._bump_frontmatter_updated(content, "2026-08-01")
+
+
+def test_apply_autofix_skips_bad_frontmatter_and_continues(dreaming, tmp_path, capsys):
+    bad = tmp_path / "bad.md"
+    good = tmp_path / "good.md"
+    bad_original = "---\nupdated: [broken\n---\nSee [[old-bad]].\n"
+    bad.write_text(bad_original)
+    good.write_text("---\nupdated: 2026-01-01\n---\nSee [[old-good]].\n")
+    candidates = [
+        {"file": "bad.md", "line": 4, "col": 6, "old_target": "old-bad", "new_target": "new-bad"},
+        {"file": "good.md", "line": 4, "col": 6, "old_target": "old-good", "new_target": "new-good"},
+    ]
+
+    fixed, _ = dreaming.apply_autofix(
+        tmp_path, candidates, datetime(2026, 8, 15, tzinfo=timezone.utc)
+    )
+
+    assert bad.read_text() == bad_original
+    assert "SKIPPED bad.md" in capsys.readouterr().err
+    assert "[[new-good]]" in good.read_text()
+    assert len(fixed) == 1
 
 
 def test_apply_autofix_is_idempotent(dreaming, autofix_vault):

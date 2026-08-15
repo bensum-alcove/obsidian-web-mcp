@@ -51,6 +51,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from obsidian_vault_mcp import config  # noqa: E402
+from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
+    FrontmatterError,
+    parse_frontmatter,
+    update_frontmatter_field,
+)
 
 VAULT_PATH = config.VAULT_PATH
 INFRA_DIR = VAULT_PATH / "BS 2nd Brain" / "Alcove" / "Infrastructure"
@@ -366,13 +371,24 @@ def _doc_updated_date(text: str) -> str | None:
     last touched count as candidate contradictions. Without this floor, nearly
     every fact lacking its own dated confirmation matches nearly every recent
     changelog entry sharing any token, which is useless noise, not signal."""
-    if not text.startswith("---"):
+    try:
+        document = parse_frontmatter(text)
+    except FrontmatterError as exc:
+        print(f"[contradiction_lint] invalid SYSTEM-FACTS frontmatter: {exc}", file=sys.stderr)
         return None
-    end = text.find("\n---", 3)
-    if end == -1:
+    if document is None:
         return None
-    m = re.search(r"^updated:\s*['\"]?(\d{4}-\d{2}-\d{2})", text[:end], re.MULTILINE)
-    return m.group(1) if m else None
+    updated = document.metadata.get("updated")
+    if updated is None:
+        return None
+    updated_text = str(updated)
+    if not DATE_RE.fullmatch(updated_text):
+        print(
+            f"[contradiction_lint] invalid SYSTEM-FACTS updated date: {updated_text!r}",
+            file=sys.stderr,
+        )
+        return None
+    return updated_text
 
 
 def lint_system_facts(system_facts_text: str, changelog_entries: list[tuple[str | None, str]], now: datetime) -> dict:
@@ -541,13 +557,19 @@ def build_report(existing_text: str, system_facts_section: str, now: datetime) -
     2026-06-30 date inline so a fresh `generated:` value never implies the
     carried-forward content was re-verified."""
     today = now.strftime("%Y-%m-%d")
-    if existing_text.startswith("---"):
-        end = existing_text.find("\n---", 3)
-        fm_block, body = existing_text[: end + 4], existing_text[end + 4 :]
-    else:
+    document = parse_frontmatter(existing_text)
+    if document is None:
+        if existing_text:
+            raise FrontmatterError("existing report has no frontmatter block")
         fm_block, body = "", existing_text
-
-    fm_block = re.sub(r"^generated:\s*.*$", f"generated: '{today}'", fm_block, flags=re.MULTILINE)
+    else:
+        updated_text = update_frontmatter_field(
+            existing_text, "generated", today, require_existing=True
+        )
+        updated_document = parse_frontmatter(updated_text)
+        assert updated_document is not None
+        body = updated_document.body
+        fm_block = updated_text[: len(updated_text) - len(body)] if body else updated_text
 
     cut = body.find("\n" + SYSTEM_FACTS_MARKER)
     if cut == -1:
