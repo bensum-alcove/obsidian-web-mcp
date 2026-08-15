@@ -3,11 +3,15 @@
 import fnmatch
 import os
 import shutil
+import stat
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+
+
+NEW_FILE_MODE = 0o604
 
 
 def resolve_vault_path(relative_path: str) -> Path:
@@ -78,7 +82,12 @@ def write_file_atomic(
         )
 
     path = resolve_vault_path(relative_path)
-    is_new = not path.exists()
+    try:
+        original_mode = stat.S_IMODE(path.stat().st_mode)
+        is_new = False
+    except FileNotFoundError:
+        original_mode = NEW_FILE_MODE
+        is_new = True
 
     if create_dirs:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,6 +97,18 @@ def write_file_atomic(
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(encoded)
+            f.flush()
+            # Recheck immediately before committing. If an existing target was
+            # deleted while the temp file was being written, treat the commit as
+            # a new-file write instead of retaining stale metadata.
+            if not is_new:
+                try:
+                    original_mode = stat.S_IMODE(path.stat().st_mode)
+                except FileNotFoundError:
+                    original_mode = NEW_FILE_MODE
+                    is_new = True
+            os.fchmod(f.fileno(), original_mode)
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up the temp file on any failure
