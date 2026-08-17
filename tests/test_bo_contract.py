@@ -189,6 +189,21 @@ def test_preflight_schedule_move_payload_shape(monkeypatch):
     }
 
 
+def test_preflight_source_schedule_payload_shape(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, input=None, **kwargs):
+        captured["payload"] = json.loads(input)
+        return FakeCompletedProcess(stdout='{"results": {"scratch-build": "Personal/Build Orchestrator/schedules/x.yaml"}}')
+
+    monkeypatch.setattr(bo_contract.subprocess, "run", fake_run)
+    result = bo_contract.preflight_source_schedule(["scratch-build"])
+    assert captured["payload"] == {
+        "op": "preflight", "preflight_op": "source_schedule", "build_ids": ["scratch-build"],
+    }
+    assert result["results"]["scratch-build"] == "Personal/Build Orchestrator/schedules/x.yaml"
+
+
 # --- real end-to-end smoke tests against the actual CLI, if present ---
 
 _ADAPTER_PRESENT = Path(config.BO_AUTHORING_CONTRACT_PATH).exists()

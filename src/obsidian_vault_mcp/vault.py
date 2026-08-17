@@ -400,6 +400,22 @@ def write_file_atomic(
             actor=actor,
         ))
         raise
+    except vault_lock.LockTimeoutError:
+        # No read or write of the target happened -- source bytes/mtime are
+        # guaranteed unchanged. Ledgered as its own code, distinct from a
+        # generic reject, so operators can tell a busy path apart from a
+        # rejected write.
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool=tool,
+            path=relative_path,
+            operation=intended_operation,
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code="lock-timeout",
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
     except Exception as e:
         code = (
             "write-contract-rejected" if isinstance(e, WriteContractError)
@@ -521,6 +537,19 @@ def move_path(
             actor=actor,
         ))
         raise
+    except vault_lock.LockTimeoutError:
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_move",
+            path=source,
+            operation="move",
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code="lock-timeout",
+            destination=destination,
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
     except Exception as e:
         code = (
             "write-contract-rejected" if isinstance(e, WriteContractError)
@@ -609,6 +638,18 @@ def delete_path(
             result="conflict",
             old_hash=old_hash_for_ledger,
             code="revision-conflict",
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
+    except vault_lock.LockTimeoutError:
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_delete",
+            path=relative_path,
+            operation="delete",
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code="lock-timeout",
             correlation_id=correlation_id,
             actor=actor,
         ))

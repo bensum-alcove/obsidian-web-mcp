@@ -55,6 +55,29 @@ shadow-only:
     it, is evaluated against every schedule/spec file currently on disk
     underneath it -- not just a single exact-path DB lookup that silently
     matches nothing for a directory-shaped path.
+
+codex-review-bo-authoring-contract-v2 (2026-08-18) found three further
+bypasses (B7-B9), still shadow-only, all closed in
+vault-integrity-and-bo-authority-remediation-v2:
+
+  - B7: a pending/ready spec rewrite validated only the spec's own content
+    shape, never the graph of any schedule it's already bound to -- an
+    individually well-formed spec edit (e.g. changing its project) could
+    invalidate its schedule's project/dependency authority. Spec rewrites
+    now also resolve the referring schedule (if any) and revalidate its
+    complete resulting graph using the proposed spec bytes.
+  - B8: destination validation only ran when the source was NOT also a BO
+    path, so a specs/ <-> schedules/ cross-move skipped destination-type
+    validation entirely, and inbound directory moves skipped content
+    validation outright. Destination authority is now evaluated
+    independently of the source's own BO-path status, and inbound directory
+    moves enumerate and validate every nested artifact that would land
+    under the destination (fail-closed on anything unevaluable).
+  - B9: authoring_contract.validate_schedule_move() exempted terminal-only
+    schedules from move/delete protection -- a schedule containing only
+    closed rows could be renamed or deleted outright. It now rejects moving
+    or deleting a schedule bound to ANY row, terminal or not; closed history
+    remains authority and continuation requires a new schedule/new id.
 """
 
 from __future__ import annotations
@@ -361,7 +384,49 @@ def _spec_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
         )
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-    return _errors_to_issues("bo-guard-spec-rewrite", spec_result.get("errors", []))
+    issues = _errors_to_issues("bo-guard-spec-rewrite", spec_result.get("errors", []))
+
+    # Whole-graph validation of any schedule this build_id is already bound
+    # to, using the PROPOSED spec bytes (not what's currently on disk) --
+    # a spec that is individually well-formed can still invalidate its
+    # referring schedule's project/dependency/graph authority (B7,
+    # codex-review-bo-authoring-contract-v2). A spec not yet bound to any
+    # schedule has nothing to revalidate here.
+    issues.extend(_spec_rewrite_schedule_graph_issues(build_id, ctx))
+    return issues
+
+
+def _spec_rewrite_schedule_graph_issues(build_id: str, ctx: WriteContext) -> list[ValidationIssue]:
+    try:
+        sched_result = bo_contract.preflight_source_schedule([build_id])
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+    source_schedule = (sched_result.get("results") or {}).get(build_id)
+    if not source_schedule:
+        return []  # not bound to any schedule yet -- nothing to revalidate
+
+    schedule_content = _read_vault_text(source_schedule)
+    if schedule_content is None:
+        return []  # schedule file unreadable/missing -- degrade quietly, matching other _read_vault_text call sites
+
+    builds = parse_schedule_builds(schedule_content)
+    if builds is None:
+        return []  # schedule itself unparseable -- its own rewrite path already guards this
+
+    schedule_project = _schedule_project_from_content(schedule_content)
+    nodes = _nodes_for_schedule_builds(builds, source_schedule, schedule_project)
+    # Substitute the proposed new spec content for this build_id's node so
+    # the graph is validated against the bytes that WOULD exist after this
+    # write commits, not what's currently on disk under specs/.
+    for node in nodes:
+        if node["build_id"] == build_id:
+            node["spec_markdown"] = ctx.new_content
+
+    try:
+        graph_result = bo_contract.validate_graph(nodes, mode="strict_new", new_ids=[build_id])
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+    return _errors_to_issues("bo-guard-spec-rewrite-graph", graph_result.get("errors", []))
 
 
 def _content_issues(ctx: WriteContext) -> list[ValidationIssue]:
@@ -402,22 +467,53 @@ def _path_mutation_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
 
 
 def _inbound_move_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
-    """A move/rename whose DESTINATION lands inside specs/ or schedules/ from
-    an origin outside either. Without this, an arbitrary file can be moved
-    straight into schedule/spec authority with zero validation (B1:
-    "Moving an arbitrary file from a non-BO path into .../schedules/
-    bypasses the guard"). Validated as if it were a fresh write at the
-    destination path -- move never changes content, so the source's current
-    on-disk bytes are exactly what would land there.
+    """Validate whatever bytes/artifacts WOULD land at the DESTINATION,
+    independent of whether the source is also a BO path (B8,
+    codex-review-bo-authoring-contract-v2: "a BO-path source does not exempt
+    the BO-path destination" -- e.g. a specs/ -> schedules/ or schedules/ ->
+    specs/ move must validate the destination type against the bytes that
+    will land there, not just the source's own status). Also covers the
+    original B1 case of an inbound move from a non-BO path. Validated as if
+    it were a fresh write at the destination path -- move never changes
+    content, so the source's current on-disk bytes are exactly what would
+    land there.
     """
     destination = ctx.destination
     if not destination:
         return []
     content = _read_vault_text(ctx.path)
-    if content is None:
-        return []  # directory move or unreadable source; nothing to validate as content
-    synthetic_ctx = WriteContext(path=destination, old_content=None, new_content=content, tool=ctx.operation)
-    return _content_issues(synthetic_ctx)
+    if content is not None:
+        synthetic_ctx = WriteContext(path=destination, old_content=None, new_content=content, tool=ctx.operation)
+        return _content_issues(synthetic_ctx)
+
+    # Directory move/rename: `_read_vault_text` returns None both for an
+    # unreadable/missing path AND for a directory -- enumerate every file
+    # that would land under `destination` and validate each as a fresh
+    # write at its mapped path (B8's directory-move gap). Fails closed
+    # (reject) for any nested artifact that cannot itself be evaluated,
+    # rather than silently skipping it.
+    from . import config
+
+    source_full = (config.VAULT_PATH / ctx.path).resolve()
+    if not source_full.is_dir():
+        return []  # genuinely missing/unreadable source -- nothing to validate
+
+    issues: list[ValidationIssue] = []
+    source_prefix = ctx.path.replace("\\", "/").rstrip("/")
+    dest_prefix = destination.replace("\\", "/").rstrip("/")
+    for rel_file in _files_under(ctx.path):
+        mapped = dest_prefix + rel_file[len(source_prefix):]
+        nested_content = _read_vault_text(rel_file)
+        if nested_content is None:
+            issues.append(ValidationIssue(
+                "bo-guard-inbound-directory-move", "reject",
+                f"cannot evaluate {rel_file!r}, which would land at {mapped!r} under "
+                f"{destination!r} -- failing closed rather than silently skipping it",
+            ))
+            continue
+        nested_ctx = WriteContext(path=mapped, old_content=None, new_content=nested_content, tool=ctx.operation)
+        issues.extend(_content_issues(nested_ctx))
+    return issues
 
 
 def evaluate_content(ctx: WriteContext) -> BOGateResult:
@@ -442,7 +538,10 @@ def evaluate_path_mutation(ctx: PathMutationContext) -> BOGateResult:
     issues: list[ValidationIssue] = []
     if source_is_bo:
         issues.extend(_path_mutation_issues(ctx))
-    if dest_is_bo and not source_is_bo:
+    if dest_is_bo:
+        # Destination authority is evaluated independently of whether the
+        # source is also a BO path -- a BO-path source is not an exemption
+        # for the BO-path destination (B8).
         issues.extend(_inbound_move_issues(ctx))
 
     _log_issues(mode, ctx.path, ctx.operation, issues)

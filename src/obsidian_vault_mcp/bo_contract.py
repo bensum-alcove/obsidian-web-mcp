@@ -187,6 +187,22 @@ def preflight_ids(build_ids: list[str], timeout: float | None = None) -> dict:
     )
 
 
+def preflight_source_schedule(build_ids: list[str], timeout: float | None = None) -> dict:
+    """Bulk read-only lookup of which schedule (if any) each build id is
+    already bound to. Used to resolve which schedule(s) a spec rewrite must
+    revalidate the whole resulting graph of before the write commits (B7,
+    codex-review-bo-authoring-contract-v2) -- a pending/ready spec rewrite
+    that only validates the spec's own content shape can still invalidate an
+    active schedule's project/dependency/graph authority.
+
+    Returns {"results": {build_id: source_schedule_path_or_None}}.
+    """
+    return _invoke(
+        {"op": "preflight", "preflight_op": "source_schedule", "build_ids": build_ids},
+        timeout=timeout,
+    )
+
+
 def preflight_schedule_rewrite(schedule_path: str, new_builds: list[dict], mode: str = "strict_new",
                                 timeout: float | None = None) -> dict:
     """Preflight for rewriting an existing schedule file's `builds:` list.

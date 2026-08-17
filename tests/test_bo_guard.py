@@ -48,6 +48,18 @@ def _stub_graph_validation_ok(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_no_source_schedule(monkeypatch):
+    """Most spec-rewrite tests exercise the spec's own content rules, not
+    the B7 schedule-graph-revalidation path; default every build id to "not
+    yet bound to any schedule" so that path is a no-op unless a test
+    overrides it."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {bid: None for bid in build_ids}},
+    )
+
+
 def test_mode_defaults_to_shadow(monkeypatch):
     assert bo_guard.get_mode() == "shadow"
 
@@ -485,3 +497,179 @@ def test_outbound_move_from_bo_path_to_non_bo_path_still_evaluates_source(monkey
         PathMutationContext(path=SCHEDULE_PATH, operation="move", destination="Clients/moved-out.yaml")
     )
     assert any(i.rule_id == "bo-guard-schedule-move" for i in result.issues)
+
+
+# --------------------------------------------------------------------------
+# B7 (codex-review-bo-authoring-contract-v2): a pending/ready spec rewrite
+# must also revalidate the whole graph of any schedule it's already bound
+# to, using the PROPOSED spec bytes.
+# --------------------------------------------------------------------------
+
+
+def test_spec_rewrite_not_bound_to_any_schedule_skips_graph_revalidation(monkeypatch):
+    """Default fixture behaviour: a spec with no source_schedule has nothing
+    for the B7 path to revalidate."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_ids",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": "pending"}},
+    )
+
+    def boom(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        raise AssertionError("validate_graph should not be called when not bound to a schedule")
+
+    monkeypatch.setattr(bo_contract, "validate_graph", boom)
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert result.issues == []
+
+
+def test_spec_rewrite_bound_to_schedule_revalidates_whole_graph_with_proposed_bytes(monkeypatch, vault_dir):
+    """B7 reproduction: an individually well-formed spec rewrite (e.g.
+    changing its project) can still invalidate its referring schedule's
+    project/dependency authority -- the schedule's complete graph must be
+    revalidated using the PROPOSED spec bytes, not what's on disk."""
+    schedule_path = SCHEDULE_PATH
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# scratch\n\nbuilds:\n\n"
+        "  - id: scratch-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/scratch-build.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-scratch.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    monkeypatch.setattr(
+        bo_contract, "preflight_ids",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": "pending"}},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": schedule_path}},
+    )
+
+    seen_calls = []
+
+    def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        seen_calls.append((nodes, new_ids))
+        return {
+            "ok": False,
+            "errors": [{"code": "mixed_project_schedule", "message": "project changed", "build_id": "scratch-build"}],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(bo_contract, "validate_graph", fake_validate_graph)
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new spec body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite-graph" for i in result.issues)
+    assert seen_calls
+    nodes, new_ids = seen_calls[-1]
+    assert new_ids == ["scratch-build"]
+    assert nodes[0]["build_id"] == "scratch-build"
+    assert nodes[0]["spec_markdown"] == "new spec body"
+
+
+def test_spec_rewrite_bound_to_schedule_with_valid_graph_has_no_issues(monkeypatch, vault_dir):
+    schedule_path = SCHEDULE_PATH
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-scratch.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(VALID_SCHEDULE_OLD)
+
+    monkeypatch.setattr(
+        bo_contract, "preflight_ids",
+        lambda build_ids, timeout=None: {"results": {"existing-build": "pending"}},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"existing-build": schedule_path}},
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(
+            path="Personal/Build Orchestrator/specs/existing-build.md",
+            old_content="old body", new_content="new body", tool="vault_write",
+        )
+    )
+    assert result.issues == []
+
+
+# --------------------------------------------------------------------------
+# B8 (codex-review-bo-authoring-contract-v2): destination validation must
+# run independent of whether the source is also a BO path, and inbound
+# directory moves must enumerate and validate every nested artifact.
+# --------------------------------------------------------------------------
+
+
+def test_specs_to_schedules_cross_move_validates_destination_even_when_source_is_bo(monkeypatch, vault_dir):
+    """A BO-path source (specs/) must not exempt a BO-path destination
+    (schedules/) from validation."""
+    source = vault_dir / "Personal" / "Build Orchestrator" / "specs" / "scratch-build.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("---\nbuild_id: scratch-build\n---\n\nordinary spec body, not a schedule")
+
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": None}})
+
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(path=SPEC_PATH, operation="move", destination=SCHEDULE_PATH)
+    )
+    assert any(i.rule_id == "bo-guard-schedule-rewrite" for i in result.issues)
+
+
+def test_schedules_to_specs_cross_move_validates_destination_type(monkeypatch, vault_dir):
+    source = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-w1.yaml"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(VALID_SCHEDULE_OLD)
+
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_move",
+        lambda schedule_path, timeout=None: {"ok": True, "errors": [], "warnings": []},
+    )
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"2026-w1": None}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {
+            "ok": False,
+            "errors": [{"code": "spec_missing_field", "message": "not a spec", "build_id": build_id}],
+        },
+    )
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(
+            path="Personal/Build Orchestrator/schedules/2026-w1.yaml", operation="move",
+            destination="Personal/Build Orchestrator/specs/2026-w1.md",
+        )
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite" for i in result.issues)
+
+
+def test_inbound_directory_move_enumerates_and_validates_nested_files(monkeypatch, vault_dir):
+    source_dir = vault_dir / "Clients" / "incoming"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "a.yaml").write_text(VALID_SCHEDULE_NEW)
+    (source_dir / "b.yaml").write_text("not: valid: yaml: schedule: [")
+
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {"ok": True, "errors": [], "warnings": []},
+    )
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(
+            path="Clients/incoming", operation="move",
+            destination="Personal/Build Orchestrator/schedules/incoming",
+        )
+    )
+    assert any(i.rule_id == "bo-guard-schedule-rewrite" for i in result.issues)
+
+
+def test_inbound_directory_move_fails_closed_on_unevaluable_nested_file(vault_dir):
+    source_dir = vault_dir / "Clients" / "incoming2"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "binary.yaml").write_bytes(b"\xff\xfe\x00\x01binary garbage")
+
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(
+            path="Clients/incoming2", operation="move",
+            destination="Personal/Build Orchestrator/schedules/incoming2",
+        )
+    )
+    assert any(i.rule_id == "bo-guard-inbound-directory-move" for i in result.issues)
