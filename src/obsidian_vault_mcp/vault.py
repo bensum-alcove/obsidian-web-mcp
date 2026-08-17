@@ -12,9 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+from . import mutation_ledger
 from .write_contract import (
     PathMutationContext,
     WriteContext,
+    WriteContractError,
     enforce as _enforce_write_contract,
     enforce_path_mutation as _enforce_path_mutation,
     get_mode as _write_contract_mode,
@@ -242,6 +244,8 @@ def write_file_atomic(
     create_dirs: bool = True,
     tool: str = "",
     expected_revision: str | None = None,
+    correlation_id: str | None = None,
+    actor: str | None = None,
 ) -> tuple[bool, int]:
     """Write content to a file atomically.
 
@@ -259,75 +263,124 @@ def write_file_atomic(
     The revision check and the write itself happen inside one short-lived
     per-path lock, so no other write_file_atomic call for the same path can
     interleave between the check and the replace.
+
+    Every call also emits exactly one mutation-ledger event once the final
+    result (success/reject/conflict) is known -- see mutation_ledger.py.
+    correlation_id/actor are opaque passthrough fields recorded on that
+    event when a caller has them; no current caller supplies them, so they
+    are None in practice today.
     """
     encoded = content.encode("utf-8")
-    if len(encoded) > config.MAX_CONTENT_SIZE:
-        raise ValueError(
-            f"Content size {len(encoded)} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes"
-        )
-
-    path = resolve_vault_path(relative_path)
-
-    with _lock_for_path(path):
-        try:
-            current_bytes = path.read_bytes()
-        except FileNotFoundError:
-            current_bytes = None
-
-        _check_revision(relative_path, tool, expected_revision, current_bytes, encoded)
-
-        if _write_contract_mode() != "off":
-            old_content_for_gate = None
-            if current_bytes is not None:
-                try:
-                    old_content_for_gate = current_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    old_content_for_gate = None
-            _enforce_write_contract(
-                WriteContext(path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool)
+    old_hash_for_ledger: str | None = None
+    try:
+        if len(encoded) > config.MAX_CONTENT_SIZE:
+            raise ValueError(
+                f"Content size {len(encoded)} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes"
             )
 
-        try:
-            original_mode = stat.S_IMODE(path.stat().st_mode)
-            is_new = False
-        except FileNotFoundError:
-            original_mode = NEW_FILE_MODE
-            is_new = True
+        path = resolve_vault_path(relative_path)
 
-        if create_dirs:
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write to a temp file in the same directory, then atomic-replace.
-        fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(encoded)
-                f.flush()
-                # Recheck immediately before committing. If an existing target was
-                # deleted while the temp file was being written, treat the commit as
-                # a new-file write instead of retaining stale metadata.
-                if not is_new:
-                    try:
-                        original_mode = stat.S_IMODE(path.stat().st_mode)
-                    except FileNotFoundError:
-                        original_mode = NEW_FILE_MODE
-                        is_new = True
-                os.fchmod(f.fileno(), original_mode)
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-        except BaseException:
-            # Clean up the temp file on any failure
+        with _lock_for_path(path):
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                current_bytes = path.read_bytes()
+            except FileNotFoundError:
+                current_bytes = None
+            old_hash_for_ledger = compute_revision(current_bytes)
 
-        return is_new, len(encoded)
+            _check_revision(relative_path, tool, expected_revision, current_bytes, encoded)
+
+            if _write_contract_mode() != "off":
+                old_content_for_gate = None
+                if current_bytes is not None:
+                    try:
+                        old_content_for_gate = current_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        old_content_for_gate = None
+                _enforce_write_contract(
+                    WriteContext(path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool)
+                )
+
+            try:
+                original_mode = stat.S_IMODE(path.stat().st_mode)
+                is_new = False
+            except FileNotFoundError:
+                original_mode = NEW_FILE_MODE
+                is_new = True
+
+            if create_dirs:
+                path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write to a temp file in the same directory, then atomic-replace.
+            fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(encoded)
+                    f.flush()
+                    # Recheck immediately before committing. If an existing target was
+                    # deleted while the temp file was being written, treat the commit as
+                    # a new-file write instead of retaining stale metadata.
+                    if not is_new:
+                        try:
+                            original_mode = stat.S_IMODE(path.stat().st_mode)
+                        except FileNotFoundError:
+                            original_mode = NEW_FILE_MODE
+                            is_new = True
+                    os.fchmod(f.fileno(), original_mode)
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+            except BaseException:
+                # Clean up the temp file on any failure
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+
+            mutation_ledger.record(mutation_ledger.MutationEvent(
+                tool=tool,
+                path=relative_path,
+                operation="create" if is_new else "update",
+                result="success",
+                old_hash=old_hash_for_ledger,
+                new_hash=compute_revision(encoded),
+                correlation_id=correlation_id,
+                actor=actor,
+            ))
+            return is_new, len(encoded)
+    except RevisionConflictError:
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool=tool,
+            path=relative_path,
+            operation="write",
+            result="conflict",
+            old_hash=old_hash_for_ledger,
+            code="revision-conflict",
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
+    except Exception as e:
+        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool=tool,
+            path=relative_path,
+            operation="write",
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code=code,
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
 
 
 def move_path(
-    source: str, destination: str, create_dirs: bool = True, expected_revision: str | None = None
+    source: str,
+    destination: str,
+    create_dirs: bool = True,
+    expected_revision: str | None = None,
+    correlation_id: str | None = None,
+    actor: str | None = None,
 ) -> bool:
     """Move a file or directory from source to destination.
 
@@ -335,69 +388,159 @@ def move_path(
     already exists. expected_revision is only meaningful for files -- a
     directory has no single content hash to compare -- and raises ValueError
     if given for a directory source.
+
+    Emits exactly one mutation-ledger event once the final result is known.
     """
     src = resolve_vault_path(source)
     dst = resolve_vault_path(destination)
+    old_hash_for_ledger: str | None = None
 
-    with _lock_for_path(src):
-        if not src.exists():
-            raise FileNotFoundError(f"Source does not exist: {source}")
+    try:
+        with _lock_for_path(src):
+            if not src.exists():
+                raise FileNotFoundError(f"Source does not exist: {source}")
 
-        if dst.exists():
-            raise FileExistsError(f"Destination already exists: {destination}")
+            if dst.exists():
+                raise FileExistsError(f"Destination already exists: {destination}")
 
-        if expected_revision is not None and src.is_dir():
-            raise ValueError("expected_revision is only supported for files, not directories")
+            if expected_revision is not None and src.is_dir():
+                raise ValueError("expected_revision is only supported for files, not directories")
 
-        current_bytes = src.read_bytes() if src.is_file() else None
-        _check_revision(source, "move", expected_revision, current_bytes)
+            current_bytes = src.read_bytes() if src.is_file() else None
+            old_hash_for_ledger = compute_revision(current_bytes)
+            _check_revision(source, "move", expected_revision, current_bytes)
 
-        if _write_contract_mode() != "off":
-            _enforce_path_mutation(PathMutationContext(path=source, operation="move", destination=destination))
+            if _write_contract_mode() != "off":
+                _enforce_path_mutation(PathMutationContext(path=source, operation="move", destination=destination))
 
-        if create_dirs:
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            if create_dirs:
+                dst.parent.mkdir(parents=True, exist_ok=True)
 
-        shutil.move(str(src), str(dst))
-        return True
+            shutil.move(str(src), str(dst))
+
+            mutation_ledger.record(mutation_ledger.MutationEvent(
+                tool="vault_move",
+                path=source,
+                operation="move",
+                result="success",
+                old_hash=old_hash_for_ledger,
+                new_hash=old_hash_for_ledger,  # move never changes content
+                destination=destination,
+                correlation_id=correlation_id,
+                actor=actor,
+            ))
+            return True
+    except RevisionConflictError:
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_move",
+            path=source,
+            operation="move",
+            result="conflict",
+            old_hash=old_hash_for_ledger,
+            code="revision-conflict",
+            destination=destination,
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
+    except Exception as e:
+        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_move",
+            path=source,
+            operation="move",
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code=code,
+            destination=destination,
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
 
 
-def delete_path(relative_path: str, expected_revision: str | None = None) -> bool:
+def delete_path(
+    relative_path: str,
+    expected_revision: str | None = None,
+    correlation_id: str | None = None,
+    actor: str | None = None,
+) -> bool:
     """Soft-delete by moving the path into .trash/ at the vault root.
 
     Refuses to delete non-empty directories. expected_revision is only
     meaningful for files and raises ValueError if given for a directory.
+
+    Emits exactly one mutation-ledger event once the final result is known.
     """
     path = resolve_vault_path(relative_path)
+    old_hash_for_ledger: str | None = None
 
-    with _lock_for_path(path):
-        if not path.exists():
-            raise FileNotFoundError(f"Path does not exist: {relative_path}")
+    try:
+        with _lock_for_path(path):
+            if not path.exists():
+                raise FileNotFoundError(f"Path does not exist: {relative_path}")
 
-        if path.is_dir() and any(path.iterdir()):
-            raise ValueError(f"Refusing to delete non-empty directory: {relative_path}")
+            if path.is_dir() and any(path.iterdir()):
+                raise ValueError(f"Refusing to delete non-empty directory: {relative_path}")
 
-        if expected_revision is not None and path.is_dir():
-            raise ValueError("expected_revision is only supported for files, not directories")
+            if expected_revision is not None and path.is_dir():
+                raise ValueError("expected_revision is only supported for files, not directories")
 
-        current_bytes = path.read_bytes() if path.is_file() else None
-        _check_revision(relative_path, "delete", expected_revision, current_bytes)
+            current_bytes = path.read_bytes() if path.is_file() else None
+            old_hash_for_ledger = compute_revision(current_bytes)
+            _check_revision(relative_path, "delete", expected_revision, current_bytes)
 
-        if _write_contract_mode() != "off":
-            _enforce_path_mutation(PathMutationContext(path=relative_path, operation="delete"))
+            if _write_contract_mode() != "off":
+                _enforce_path_mutation(PathMutationContext(path=relative_path, operation="delete"))
 
-        trash_dir = config.VAULT_PATH.resolve() / ".trash"
-        trash_dir.mkdir(exist_ok=True)
+            trash_dir = config.VAULT_PATH.resolve() / ".trash"
+            trash_dir.mkdir(exist_ok=True)
 
-        dest = trash_dir / path.name
+            dest = trash_dir / path.name
 
-        # Avoid collisions in .trash by appending a timestamp
-        if dest.exists():
-            ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
-            dest = trash_dir / f"{path.stem}_{ts}{path.suffix}"
+            # Avoid collisions in .trash by appending a timestamp
+            if dest.exists():
+                ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+                dest = trash_dir / f"{path.stem}_{ts}{path.suffix}"
 
-        shutil.move(str(path), str(dest))
-        return True
+            shutil.move(str(path), str(dest))
+
+            mutation_ledger.record(mutation_ledger.MutationEvent(
+                tool="vault_delete",
+                path=relative_path,
+                operation="delete",
+                result="success",
+                old_hash=old_hash_for_ledger,
+                new_hash=None,
+                correlation_id=correlation_id,
+                actor=actor,
+            ))
+            return True
+    except RevisionConflictError:
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_delete",
+            path=relative_path,
+            operation="delete",
+            result="conflict",
+            old_hash=old_hash_for_ledger,
+            code="revision-conflict",
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
+    except Exception as e:
+        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        mutation_ledger.record(mutation_ledger.MutationEvent(
+            tool="vault_delete",
+            path=relative_path,
+            operation="delete",
+            result="reject",
+            old_hash=old_hash_for_ledger,
+            code=code,
+            correlation_id=correlation_id,
+            actor=actor,
+        ))
+        raise
 
 
 def list_directory(

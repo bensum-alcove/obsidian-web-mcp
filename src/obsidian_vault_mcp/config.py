@@ -32,7 +32,7 @@ MAX_LIST_DEPTH = 5            # Max directory recursion depth
 CONTEXT_LINES = 2             # Default lines of context in search results
 
 # Directories to never expose or modify
-EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index"}
+EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index", ".mutation-ledger"}
 
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
@@ -76,6 +76,25 @@ VAULT_WRITE_CONTRACT_MODE = os.environ.get("VAULT_WRITE_CONTRACT_MODE", "shadow"
 # mode can be flipped without an import-time cache. Fastest revert path: env var edit
 # + supervisorctl restart, no git operation needed.
 VAULT_OPTIMISTIC_CONCURRENCY_MODE = os.environ.get("VAULT_OPTIMISTIC_CONCURRENCY_MODE", "enforce").strip().lower()
+
+# Vault mutation ledger: "on" (default) | "off". See mutation_ledger.py for the
+# full contract. A ledger failure never blocks a write in either mode -- "off"
+# just skips recording entirely (fastest revert path: env var edit, no restart
+# even required since the mode is read fresh on every call).
+VAULT_MUTATION_LEDGER_MODE = os.environ.get("VAULT_MUTATION_LEDGER_MODE", "on").strip().lower()
+
+# Ledger storage directory. Defaults to <VAULT_PATH>/.mutation-ledger -- a
+# dot-directory, so resolve_vault_path already refuses any mutation tool from
+# targeting it, and it's included in EXCLUDED_DIRS above so vault_list/
+# vault_search/vault_semantic_search/vault_recent_changes/vault_stats/the
+# frontmatter index all skip it like every other excluded dir.
+VAULT_MUTATION_LEDGER_DIR = os.environ.get("VAULT_MUTATION_LEDGER_DIR", "")
+
+# Ledger rotation: size-bounded (bytes) and count-bounded (number of rotated
+# backups kept), via stdlib logging.handlers.RotatingFileHandler. Default caps
+# total ledger disk usage at roughly 5MB * 11 files = ~55MB per vault.
+VAULT_MUTATION_LEDGER_MAX_BYTES = int(os.environ.get("VAULT_MUTATION_LEDGER_MAX_BYTES", "5000000"))
+VAULT_MUTATION_LEDGER_BACKUP_COUNT = int(os.environ.get("VAULT_MUTATION_LEDGER_BACKUP_COUNT", "10"))
 
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
