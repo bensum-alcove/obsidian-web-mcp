@@ -9,6 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+from .write_contract import (
+    PathMutationContext,
+    WriteContext,
+    enforce as _enforce_write_contract,
+    enforce_path_mutation as _enforce_path_mutation,
+    get_mode as _write_contract_mode,
+)
 
 
 NEW_FILE_MODE = 0o604
@@ -68,12 +75,17 @@ def read_file(relative_path: str) -> tuple[str, dict]:
 
 
 def write_file_atomic(
-    relative_path: str, content: str, create_dirs: bool = True
+    relative_path: str, content: str, create_dirs: bool = True, tool: str = ""
 ) -> tuple[bool, int]:
     """Write content to a file atomically.
 
     Returns (is_new_file, bytes_written). Writes to a tempfile in the same
     directory then replaces the target, so readers never see a partial write.
+
+    Every mutation tool funnels through this one function, which is the
+    write-contract gate's single enforcement point (see write_contract.py):
+    a rejected write raises before any temp file is created, so the source
+    file's bytes are never touched.
     """
     encoded = content.encode("utf-8")
     if len(encoded) > config.MAX_CONTENT_SIZE:
@@ -82,6 +94,18 @@ def write_file_atomic(
         )
 
     path = resolve_vault_path(relative_path)
+
+    if _write_contract_mode() != "off":
+        old_content_for_gate = None
+        if path.is_file():
+            try:
+                old_content_for_gate = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                old_content_for_gate = None
+        _enforce_write_contract(
+            WriteContext(path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool)
+        )
+
     try:
         original_mode = stat.S_IMODE(path.stat().st_mode)
         is_new = False
@@ -138,6 +162,9 @@ def move_path(
     if dst.exists():
         raise FileExistsError(f"Destination already exists: {destination}")
 
+    if _write_contract_mode() != "off":
+        _enforce_path_mutation(PathMutationContext(path=source, operation="move", destination=destination))
+
     if create_dirs:
         dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +184,9 @@ def delete_path(relative_path: str) -> bool:
 
     if path.is_dir() and any(path.iterdir()):
         raise ValueError(f"Refusing to delete non-empty directory: {relative_path}")
+
+    if _write_contract_mode() != "off":
+        _enforce_path_mutation(PathMutationContext(path=relative_path, operation="delete"))
 
     trash_dir = config.VAULT_PATH.resolve() / ".trash"
     trash_dir.mkdir(exist_ok=True)

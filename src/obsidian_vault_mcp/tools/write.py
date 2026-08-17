@@ -33,7 +33,7 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
             except Exception as e:
                 logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
 
-        is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
+        is_new, size = write_file_atomic(path, content, create_dirs=create_dirs, tool="vault_write")
 
         return json.dumps({"path": path, "created": is_new, "size": size})
     except ValueError as e:
@@ -59,7 +59,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
                 post.metadata[key] = value
 
             new_content = frontmatter.dumps(post)
-            write_file_atomic(file_path, new_content, create_dirs=False)
+            write_file_atomic(file_path, new_content, create_dirs=False, tool="vault_batch_frontmatter_update")
 
             results.append({"path": file_path, "updated": True})
         except FileNotFoundError:
@@ -151,7 +151,7 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
 
         new_content = ''.join(lines[:target_line + 1]) + replacement + ''.join(lines[end_line:])
 
-        _, size = write_file_atomic(path, new_content)
+        _, size = write_file_atomic(path, new_content, tool="vault_patch_section")
         return json.dumps({"path": path, "section": section, "size": size})
     except FileNotFoundError as e:
         return json.dumps({"error": str(e), "path": path})
@@ -186,7 +186,7 @@ def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False
                     "path": path,
                 })
             new_content = content.replace(old_str, new_str, 1)
-        _, size = write_file_atomic(path, new_content)
+        _, size = write_file_atomic(path, new_content, tool="vault_str_replace")
         return json.dumps(sanitize_for_json({
             "path": path,
             "old_length": len(content),
@@ -240,7 +240,7 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
                     failed += 1
                     continue
                 new_content = content.replace(old_str, new_str, 1)
-            write_file_atomic(file_path, new_content)
+            write_file_atomic(file_path, new_content, tool="vault_batch_str_replace")
             results.append({
                 "path": file_path,
                 "changed": True,
@@ -282,7 +282,7 @@ def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
 
         new_content = existing_content + content
 
-        is_new, size = write_file_atomic(path, new_content, create_dirs=True)
+        is_new, size = write_file_atomic(path, new_content, create_dirs=True, tool="vault_append")
         return json.dumps({
             "path": path,
             "created": is_new,
@@ -308,7 +308,7 @@ def vault_batch_write(files: list[dict]) -> str:
         create_dirs = item.get("create_dirs", True)
 
         try:
-            is_new, size = write_file_atomic(file_path, file_content, create_dirs=create_dirs)
+            is_new, size = write_file_atomic(file_path, file_content, create_dirs=create_dirs, tool="vault_batch_write")
             results.append({"path": file_path, "written": True, "created": is_new, "size": size})
             written += 1
         except (ValueError, OSError) as e:

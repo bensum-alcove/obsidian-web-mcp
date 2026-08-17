@@ -58,6 +58,13 @@ VAULT_SEARCH_TOKENIZE = os.environ.get("VAULT_SEARCH_TOKENIZE", "1") not in (
     "0", "false", "False", "",
 )
 
+# Write-contract gate mode: "off" | "shadow" (default) | "enforce". See
+# write_contract.py for the full contract. Read directly from the environment
+# there (not this module) so the mode can be flipped without importing config
+# in a hot loop; surfaced here purely so every runtime flag is documented in
+# one place. Fastest revert path: env var edit + supervisorctl restart.
+VAULT_WRITE_CONTRACT_MODE = os.environ.get("VAULT_WRITE_CONTRACT_MODE", "shadow").strip().lower()
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))
