@@ -6,13 +6,19 @@ import re
 
 import frontmatter
 
-from ..vault import resolve_vault_path, read_file, write_file_atomic
+from ..vault import resolve_vault_path, read_file, write_file_atomic, RevisionConflictError, conflict_payload
 from ..utils import sanitize_for_json, SafeJSONEncoder
 
 logger = logging.getLogger(__name__)
 
 
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    expected_revision: str | None = None,
+) -> str:
     """Write a file to the vault, optionally merging frontmatter with existing content."""
     try:
         resolve_vault_path(path)
@@ -33,9 +39,13 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
             except Exception as e:
                 logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
 
-        is_new, size = write_file_atomic(path, content, create_dirs=create_dirs, tool="vault_write")
+        is_new, size = write_file_atomic(
+            path, content, create_dirs=create_dirs, tool="vault_write", expected_revision=expected_revision
+        )
 
         return json.dumps({"path": path, "created": is_new, "size": size})
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "path": path, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except Exception as e:
@@ -44,12 +54,16 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 
 
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
-    """Update frontmatter fields on multiple files without changing body content."""
+    """Update frontmatter fields on multiple files without changing body content.
+
+    Each update dict may include an optional 'expected_revision' key.
+    """
     results = []
 
     for update in updates:
         file_path = update.get("path", "")
         fields = update.get("fields", {})
+        expected_revision = update.get("expected_revision")
 
         try:
             content, _ = read_file(file_path)
@@ -59,11 +73,19 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
                 post.metadata[key] = value
 
             new_content = frontmatter.dumps(post)
-            write_file_atomic(file_path, new_content, create_dirs=False, tool="vault_batch_frontmatter_update")
+            write_file_atomic(
+                file_path,
+                new_content,
+                create_dirs=False,
+                tool="vault_batch_frontmatter_update",
+                expected_revision=expected_revision,
+            )
 
             results.append({"path": file_path, "updated": True})
         except FileNotFoundError:
             results.append({"path": file_path, "updated": False, "error": "File not found"})
+        except RevisionConflictError as e:
+            results.append({"path": file_path, "updated": False, "error": str(e), **conflict_payload(e)})
         except ValueError as e:
             results.append({"path": file_path, "updated": False, "error": str(e)})
         except Exception as e:
@@ -93,7 +115,7 @@ def _split_leading_heading(text: str) -> tuple[str | None, str]:
     return candidate, remainder
 
 
-def vault_patch_section(path: str, section: str, content: str) -> str:
+def vault_patch_section(path: str, section: str, content: str, expected_revision: str | None = None) -> str:
     """Replace the content of a single markdown section without rewriting the entire file."""
     try:
         file_content, _ = read_file(path)
@@ -151,10 +173,14 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
 
         new_content = ''.join(lines[:target_line + 1]) + replacement + ''.join(lines[end_line:])
 
-        _, size = write_file_atomic(path, new_content, tool="vault_patch_section")
+        _, size = write_file_atomic(
+            path, new_content, tool="vault_patch_section", expected_revision=expected_revision
+        )
         return json.dumps({"path": path, "section": section, "size": size})
     except FileNotFoundError as e:
         return json.dumps({"error": str(e), "path": path})
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "path": path, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except Exception as e:
@@ -162,7 +188,9 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
         return json.dumps({"error": str(e), "path": path})
 
 
-def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False) -> str:
+def vault_str_replace(
+    path: str, old_str: str, new_str: str, regex: bool = False, expected_revision: str | None = None
+) -> str:
     """Replace a unique string in a vault file with another string. Supports regex."""
     try:
         content, _ = read_file(path)
@@ -186,7 +214,9 @@ def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False
                     "path": path,
                 })
             new_content = content.replace(old_str, new_str, 1)
-        _, size = write_file_atomic(path, new_content, tool="vault_str_replace")
+        _, size = write_file_atomic(
+            path, new_content, tool="vault_str_replace", expected_revision=expected_revision
+        )
         return json.dumps(sanitize_for_json({
             "path": path,
             "old_length": len(content),
@@ -195,6 +225,8 @@ def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False
         }), cls=SafeJSONEncoder)
     except FileNotFoundError as e:
         return json.dumps({"error": str(e), "path": path})
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "path": path, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except re.error as e:
@@ -205,7 +237,10 @@ def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False
 
 
 def vault_batch_str_replace(replacements: list[dict]) -> str:
-    """Replace unique strings in multiple files in one call."""
+    """Replace unique strings in multiple files in one call.
+
+    Each replacement dict may include an optional 'expected_revision' key.
+    """
     results = []
     changed = 0
     failed = 0
@@ -215,6 +250,7 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
         old_str = item.get("old_str", "")
         new_str = item.get("new_str", "")
         use_regex = item.get("regex", False)
+        expected_revision = item.get("expected_revision")
 
         try:
             content, _ = read_file(file_path)
@@ -240,7 +276,9 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
                     failed += 1
                     continue
                 new_content = content.replace(old_str, new_str, 1)
-            write_file_atomic(file_path, new_content, tool="vault_batch_str_replace")
+            write_file_atomic(
+                file_path, new_content, tool="vault_batch_str_replace", expected_revision=expected_revision
+            )
             results.append({
                 "path": file_path,
                 "changed": True,
@@ -250,6 +288,9 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
             changed += 1
         except FileNotFoundError:
             results.append({"path": file_path, "error": f"File not found: {file_path}"})
+            failed += 1
+        except RevisionConflictError as e:
+            results.append({"path": file_path, "error": str(e), **conflict_payload(e)})
             failed += 1
         except re.error as e:
             results.append({"path": file_path, "error": f"Invalid regex: {e}"})
@@ -262,7 +303,9 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
     return json.dumps(sanitize_for_json({"results": results, "changed": changed, "failed": failed}), cls=SafeJSONEncoder)
 
 
-def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
+def vault_append(
+    path: str, content: str, ensure_newline: bool = True, expected_revision: str | None = None
+) -> str:
     """Append content to an existing vault file, creating it if absent."""
     try:
         try:
@@ -282,13 +325,17 @@ def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
 
         new_content = existing_content + content
 
-        is_new, size = write_file_atomic(path, new_content, create_dirs=True, tool="vault_append")
+        is_new, size = write_file_atomic(
+            path, new_content, create_dirs=True, tool="vault_append", expected_revision=expected_revision
+        )
         return json.dumps({
             "path": path,
             "created": is_new,
             "size": size,
             "appended_bytes": len(content.encode("utf-8")),
         })
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "path": path, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except Exception as e:
@@ -297,7 +344,10 @@ def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
 
 
 def vault_batch_write(files: list[dict]) -> str:
-    """Write multiple files in a single call; failures are reported, not raised."""
+    """Write multiple files in a single call; failures are reported, not raised.
+
+    Each file dict may include an optional 'expected_revision' key.
+    """
     results = []
     written = 0
     failed = 0
@@ -306,11 +356,21 @@ def vault_batch_write(files: list[dict]) -> str:
         file_path = item.get("path", "")
         file_content = item.get("content", "")
         create_dirs = item.get("create_dirs", True)
+        expected_revision = item.get("expected_revision")
 
         try:
-            is_new, size = write_file_atomic(file_path, file_content, create_dirs=create_dirs, tool="vault_batch_write")
+            is_new, size = write_file_atomic(
+                file_path,
+                file_content,
+                create_dirs=create_dirs,
+                tool="vault_batch_write",
+                expected_revision=expected_revision,
+            )
             results.append({"path": file_path, "written": True, "created": is_new, "size": size})
             written += 1
+        except RevisionConflictError as e:
+            results.append({"path": file_path, "written": False, "error": str(e), **conflict_payload(e)})
+            failed += 1
         except (ValueError, OSError) as e:
             results.append({"path": file_path, "written": False, "error": str(e)})
             failed += 1

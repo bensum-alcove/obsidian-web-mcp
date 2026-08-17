@@ -124,6 +124,8 @@ from .models import (
     name="vault_read",
     description=(
         "Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter. "
+        "metadata.revision identifies the file's current on-disk state — pass it back as expected_revision "
+        "to a write tool to reject the write with a conflict if the file changed since this read. "
         "If the file has read_policy: section-only in its frontmatter, returns a preview and warning instead of full content — "
         "use vault_read_section for targeted reading, or pass force=True to read the full file regardless. "
         "Use max_chars to truncate large files."
@@ -152,13 +154,29 @@ def vault_batch_read(paths: list[str], include_content: bool = True, force: bool
 
 @mcp.tool(
     name="vault_write",
-    description="Write a file to the Obsidian vault. Supports frontmatter merging with existing files. Creates parent directories by default.",
+    description=(
+        "Write a file to the Obsidian vault. Supports frontmatter merging with existing files. "
+        "Creates parent directories by default. Pass expected_revision (from a prior read's "
+        "metadata.revision) to reject the write with a conflict if the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontmatter: bool = False) -> str:
+def vault_write(
+    path: str,
+    content: str,
+    create_dirs: bool = True,
+    merge_frontmatter: bool = False,
+    expected_revision: str | None = None,
+) -> str:
     """Write a file to the vault."""
-    inp = VaultWriteInput(path=path, content=content, create_dirs=create_dirs, merge_frontmatter=merge_frontmatter)
-    result = _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter)
+    inp = VaultWriteInput(
+        path=path,
+        content=content,
+        create_dirs=create_dirs,
+        merge_frontmatter=merge_frontmatter,
+        expected_revision=expected_revision,
+    )
+    result = _vault_write(inp.path, inp.content, inp.create_dirs, inp.merge_frontmatter, inp.expected_revision)
     try:
         _schedule_reindex(inp.path)
     except Exception:
@@ -168,7 +186,11 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 
 @mcp.tool(
     name="vault_batch_frontmatter_update",
-    description="Update YAML frontmatter fields on multiple files without changing body content. Each update merges new fields into existing frontmatter.",
+    description=(
+        "Update YAML frontmatter fields on multiple files without changing body content. Each update merges "
+        "new fields into existing frontmatter. Each update dict may include 'expected_revision' (from a "
+        "prior read's metadata.revision) to reject that update with a conflict if the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def vault_batch_frontmatter_update(updates: list[dict]) -> str:
@@ -241,13 +263,21 @@ def vault_list(
 
 @mcp.tool(
     name="vault_move",
-    description="Move a file or directory within the vault. Validates both source and destination paths.",
+    description=(
+        "Move a file or directory within the vault. Validates both source and destination paths. "
+        "Pass expected_revision (from a prior read's metadata.revision; files only) to reject the "
+        "move with a conflict if the source has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
+def vault_move(
+    source: str, destination: str, create_dirs: bool = True, expected_revision: str | None = None
+) -> str:
     """Move a file or directory."""
-    inp = VaultMoveInput(source=source, destination=destination, create_dirs=create_dirs)
-    result = _vault_move(inp.source, inp.destination, inp.create_dirs)
+    inp = VaultMoveInput(
+        source=source, destination=destination, create_dirs=create_dirs, expected_revision=expected_revision
+    )
+    result = _vault_move(inp.source, inp.destination, inp.create_dirs, inp.expected_revision)
     try:
         _schedule_reindex(inp.source)
         _schedule_reindex(inp.destination)
@@ -258,13 +288,17 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
 
 @mcp.tool(
     name="vault_delete",
-    description="Delete a file by moving it to .trash/ in the vault root. Requires confirm=true as a safety gate. Does NOT hard delete.",
+    description=(
+        "Delete a file by moving it to .trash/ in the vault root. Requires confirm=true as a safety gate. "
+        "Does NOT hard delete. Pass expected_revision (from a prior read's metadata.revision) to reject "
+        "the delete with a conflict if the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_delete(path: str, confirm: bool = False) -> str:
+def vault_delete(path: str, confirm: bool = False, expected_revision: str | None = None) -> str:
     """Delete a file (move to .trash/)."""
-    inp = VaultDeleteInput(path=path, confirm=confirm)
-    result = _vault_delete(inp.path, inp.confirm)
+    inp = VaultDeleteInput(path=path, confirm=confirm, expected_revision=expected_revision)
+    result = _vault_delete(inp.path, inp.confirm, inp.expected_revision)
     try:
         _schedule_reindex(inp.path)
     except Exception:
@@ -275,13 +309,18 @@ def vault_delete(path: str, confirm: bool = False) -> str:
 
 @mcp.tool(
     name="vault_patch_section",
-    description="Replace the content of a single markdown section without rewriting the entire file. Targets a heading and replaces everything between it and the next heading of the same or higher level.",
+    description=(
+        "Replace the content of a single markdown section without rewriting the entire file. Targets a "
+        "heading and replaces everything between it and the next heading of the same or higher level. "
+        "Pass expected_revision (from a prior read's metadata.revision) to reject the patch with a "
+        "conflict if the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_patch_section(path: str, section: str, content: str) -> str:
+def vault_patch_section(path: str, section: str, content: str, expected_revision: str | None = None) -> str:
     """Patch a single markdown section in a vault file."""
-    inp = VaultPatchSectionInput(path=path, section=section, content=content)
-    result = _vault_patch_section(inp.path, inp.section, inp.content)
+    inp = VaultPatchSectionInput(path=path, section=section, content=content, expected_revision=expected_revision)
+    result = _vault_patch_section(inp.path, inp.section, inp.content, inp.expected_revision)
     try:
         _schedule_reindex(inp.path)
     except Exception:
@@ -291,13 +330,22 @@ def vault_patch_section(path: str, section: str, content: str) -> str:
 
 @mcp.tool(
     name="vault_append",
-    description="Append content to an existing vault file without reading or rewriting the whole file. Creates the file if it does not exist. Optionally inserts a blank-line separator before the new content.",
+    description=(
+        "Append content to an existing vault file without reading or rewriting the whole file. Creates the "
+        "file if it does not exist. Optionally inserts a blank-line separator before the new content. Pass "
+        "expected_revision (from a prior read's metadata.revision) to reject the append with a conflict if "
+        "the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
+def vault_append(
+    path: str, content: str, ensure_newline: bool = True, expected_revision: str | None = None
+) -> str:
     """Append content to a vault file."""
-    inp = VaultAppendInput(path=path, content=content, ensure_newline=ensure_newline)
-    result = _vault_append(inp.path, inp.content, inp.ensure_newline)
+    inp = VaultAppendInput(
+        path=path, content=content, ensure_newline=ensure_newline, expected_revision=expected_revision
+    )
+    result = _vault_append(inp.path, inp.content, inp.ensure_newline, inp.expected_revision)
     try:
         _schedule_reindex(inp.path)
     except Exception:
@@ -307,7 +355,12 @@ def vault_append(path: str, content: str, ensure_newline: bool = True) -> str:
 
 @mcp.tool(
     name="vault_batch_write",
-    description="Write up to 20 files in a single call. Each file is written atomically. Failures are reported per-file — the batch does not abort on a single error.",
+    description=(
+        "Write up to 20 files in a single call. Each file is written atomically. Failures are reported "
+        "per-file — the batch does not abort on a single error. Each file dict may include "
+        "'expected_revision' (from a prior read's metadata.revision) to reject that write with a conflict "
+        "if the file has changed since."
+    ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
 def vault_batch_write(files: list[dict]) -> str:
@@ -326,14 +379,20 @@ def vault_batch_write(files: list[dict]) -> str:
     description=(
         "Replace a unique string in a vault file with another string. old_str must appear exactly once in the file. "
         "Safer and cheaper than vault_write for inline edits. "
-        "Pass regex=True to treat old_str as a Python regex pattern (must match exactly once)."
+        "Pass regex=True to treat old_str as a Python regex pattern (must match exactly once). "
+        "Pass expected_revision (from a prior read's metadata.revision) to reject the replace with a "
+        "conflict if the file has changed since."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_str_replace(path: str, old_str: str, new_str: str, regex: bool = False) -> str:
+def vault_str_replace(
+    path: str, old_str: str, new_str: str, regex: bool = False, expected_revision: str | None = None
+) -> str:
     """Replace a unique string in a vault file."""
-    inp = VaultStrReplaceInput(path=path, old_str=old_str, new_str=new_str, regex=regex)
-    result = _vault_str_replace(inp.path, inp.old_str, inp.new_str, inp.regex)
+    inp = VaultStrReplaceInput(
+        path=path, old_str=old_str, new_str=new_str, regex=regex, expected_revision=expected_revision
+    )
+    result = _vault_str_replace(inp.path, inp.old_str, inp.new_str, inp.regex, inp.expected_revision)
     try:
         _schedule_reindex(inp.path)
     except Exception:
@@ -362,21 +421,28 @@ def vault_read_section(path: str, section: str) -> str:
     description=(
         "Delete multiple files in one call by moving them to .trash/. "
         "Requires confirm=true as a safety gate. "
-        "Results reported per-file — the batch does not abort on individual failures."
+        "Results reported per-file — the batch does not abort on individual failures. "
+        "Pass expected_revisions as a {path: revision} map (from prior reads' metadata.revision) to "
+        "reject specific paths' deletes with a conflict if they've changed since; paths omitted from "
+        "the map are deleted unprotected."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )
-def vault_batch_delete(paths: list[str], confirm: bool = False) -> str:
+def vault_batch_delete(
+    paths: list[str], confirm: bool = False, expected_revisions: dict[str, str] | None = None
+) -> str:
     """Delete multiple files (move to .trash/)."""
-    inp = VaultBatchDeleteInput(paths=paths, confirm=confirm)
-    return _vault_batch_delete(inp.paths, inp.confirm)
+    inp = VaultBatchDeleteInput(paths=paths, confirm=confirm, expected_revisions=expected_revisions)
+    return _vault_batch_delete(inp.paths, inp.confirm, inp.expected_revisions)
 
 
 @mcp.tool(
     name="vault_batch_str_replace",
     description=(
         "Replace unique strings in multiple files in one call. "
-        "Each replacement specifies path, old_str, new_str, and an optional regex flag. "
+        "Each replacement specifies path, old_str, new_str, and an optional regex flag, plus optionally "
+        "expected_revision (from a prior read's metadata.revision) to reject that replacement with a "
+        "conflict if the file has changed since. "
         "Results reported per-file — the batch does not abort on individual failures. "
         "Safer and cheaper than multiple individual vault_str_replace calls."
     ),

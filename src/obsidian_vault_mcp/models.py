@@ -60,6 +60,15 @@ class VaultWriteInput(BaseModel):
         default=False,
         description="If true, merge YAML frontmatter with existing file's frontmatter instead of replacing",
     )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). If given and the file's "
+            "current revision doesn't match, the write is rejected with a conflict instead of "
+            "silently overwriting newer content. Omit for legacy unprotected behavior."
+        ),
+        max_length=100,
+    )
 
 
 class VaultListInput(BaseModel):
@@ -118,6 +127,15 @@ class VaultMoveInput(BaseModel):
         default=True,
         description="Create destination parent directories if they don't exist",
     )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). Only valid for files, not "
+            "directories. If given and the source's current revision doesn't match, the move is rejected "
+            "with a conflict."
+        ),
+        max_length=100,
+    )
 
 
 class VaultDeleteInput(BaseModel):
@@ -134,6 +152,14 @@ class VaultDeleteInput(BaseModel):
     confirm: bool = Field(
         ...,
         description="Must be true to execute deletion -- safety gate to prevent accidental deletes",
+    )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). If given and the file's "
+            "current revision doesn't match, the delete is rejected with a conflict."
+        ),
+        max_length=100,
     )
 
 
@@ -233,7 +259,11 @@ class VaultBatchFrontmatterUpdateInput(BaseModel):
 
     updates: list[dict] = Field(
         ...,
-        description="List of updates, each a dict with 'path' (str) and 'fields' (dict of key-value pairs to set)",
+        description=(
+            "List of updates, each a dict with 'path' (str), 'fields' (dict of key-value pairs to set), "
+            "and optionally 'expected_revision' (str, from a prior read's metadata.revision) to reject "
+            "the update as a conflict if the file has changed since"
+        ),
         min_length=1,
         max_length=MAX_BATCH_SIZE,
     )
@@ -271,6 +301,14 @@ class VaultPatchSectionInput(BaseModel):
         description="Replacement content for that section (not including the heading line itself)",
         max_length=MAX_CONTENT_SIZE,
     )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). If given and the file's "
+            "current revision doesn't match, the patch is rejected with a conflict."
+        ),
+        max_length=100,
+    )
 
 
 class VaultAppendInput(BaseModel):
@@ -292,6 +330,14 @@ class VaultAppendInput(BaseModel):
     ensure_newline: bool = Field(
         default=True,
         description="If true, ensure a blank line separator before the appended content",
+    )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). If given and the file's "
+            "current revision doesn't match, the append is rejected with a conflict."
+        ),
+        max_length=100,
     )
 
 
@@ -321,6 +367,14 @@ class VaultStrReplaceInput(BaseModel):
         default=False,
         description="If true, treat old_str as a Python regex pattern (must match exactly once)",
     )
+    expected_revision: str | None = Field(
+        default=None,
+        description=(
+            "Optional revision token from a prior read (metadata.revision). If given and the file's "
+            "current revision doesn't match, the replace is rejected with a conflict."
+        ),
+        max_length=100,
+    )
 
 
 class VaultBatchWriteInput(BaseModel):
@@ -332,7 +386,8 @@ class VaultBatchWriteInput(BaseModel):
         ...,
         description=(
             "List of files to write. Each item must have 'path' (str) and 'content' (str); "
-            "optionally 'create_dirs' (bool, default true)."
+            "optionally 'create_dirs' (bool, default true) and 'expected_revision' (str, from a prior "
+            "read's metadata.revision) to reject the write as a conflict if the file has changed since."
         ),
         min_length=1,
         max_length=20,
@@ -383,6 +438,14 @@ class VaultBatchDeleteInput(BaseModel):
         default=False,
         description="Must be true to execute deletions -- safety gate to prevent accidental deletes",
     )
+    expected_revisions: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional map of path -> revision token (from a prior read's metadata.revision). Paths "
+            "present in this map are rejected as a conflict if their current revision doesn't match; "
+            "paths omitted from the map are deleted unprotected, as before this parameter existed."
+        ),
+    )
 
 
 class VaultBatchStrReplaceInput(BaseModel):
@@ -394,7 +457,8 @@ class VaultBatchStrReplaceInput(BaseModel):
         ...,
         description=(
             "List of replacements. Each item must have 'path' (str), 'old_str' (str), 'new_str' (str); "
-            "optionally 'regex' (bool, default false)."
+            "optionally 'regex' (bool, default false) and 'expected_revision' (str, from a prior read's "
+            "metadata.revision) to reject the replacement as a conflict if the file has changed since."
         ),
         min_length=1,
         max_length=MAX_BATCH_SIZE,

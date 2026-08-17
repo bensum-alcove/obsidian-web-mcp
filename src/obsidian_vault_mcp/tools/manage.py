@@ -8,7 +8,15 @@ from pathlib import Path
 import yaml
 
 from ..config import EXCLUDED_DIRS, VAULT_PATH
-from ..vault import list_directory, move_path, delete_path, resolve_vault_path, _iso_timestamp
+from ..vault import (
+    list_directory,
+    move_path,
+    delete_path,
+    resolve_vault_path,
+    _iso_timestamp,
+    RevisionConflictError,
+    conflict_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +75,15 @@ def vault_list(
         return json.dumps({"error": str(e)})
 
 
-def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
+def vault_move(
+    source: str, destination: str, create_dirs: bool = True, expected_revision: str | None = None
+) -> str:
     """Move a file or directory within the vault."""
     try:
-        moved = move_path(source, destination, create_dirs=create_dirs)
+        moved = move_path(source, destination, create_dirs=create_dirs, expected_revision=expected_revision)
         return json.dumps({"source": source, "destination": destination, "moved": moved})
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "source": source, "destination": destination, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "source": source, "destination": destination})
     except Exception as e:
@@ -79,7 +91,7 @@ def vault_move(source: str, destination: str, create_dirs: bool = True) -> str:
         return json.dumps({"error": str(e), "source": source, "destination": destination})
 
 
-def vault_delete(path: str, confirm: bool = False) -> str:
+def vault_delete(path: str, confirm: bool = False, expected_revision: str | None = None) -> str:
     """Delete a file by moving it to .trash/ in the vault."""
     if not confirm:
         return json.dumps({
@@ -88,8 +100,10 @@ def vault_delete(path: str, confirm: bool = False) -> str:
         })
 
     try:
-        deleted = delete_path(path)
+        deleted = delete_path(path, expected_revision=expected_revision)
         return json.dumps({"path": path, "deleted": deleted})
+    except RevisionConflictError as e:
+        return json.dumps({"error": str(e), "path": path, **conflict_payload(e)})
     except ValueError as e:
         return json.dumps({"error": str(e), "path": path})
     except Exception as e:
@@ -97,23 +111,34 @@ def vault_delete(path: str, confirm: bool = False) -> str:
         return json.dumps({"error": str(e), "path": path})
 
 
-def vault_batch_delete(paths: list[str], confirm: bool = False) -> str:
-    """Delete multiple files by moving them to .trash/ in one call."""
+def vault_batch_delete(
+    paths: list[str], confirm: bool = False, expected_revisions: dict[str, str] | None = None
+) -> str:
+    """Delete multiple files by moving them to .trash/ in one call.
+
+    expected_revisions optionally maps a path to the revision it must
+    currently be at; paths not present in the mapping are deleted
+    unprotected, same as before this parameter existed.
+    """
     if not confirm:
         return json.dumps({
             "error": "Set confirm=true to execute deletions. Files are moved to .trash/, not hard deleted.",
             "paths": paths,
         })
 
+    expected_revisions = expected_revisions or {}
     results = []
     deleted_count = 0
     failed_count = 0
 
     for path in paths:
         try:
-            delete_path(path)
+            delete_path(path, expected_revision=expected_revisions.get(path))
             results.append({"path": path, "deleted": True})
             deleted_count += 1
+        except RevisionConflictError as e:
+            results.append({"path": path, "deleted": False, "error": str(e), **conflict_payload(e)})
+            failed_count += 1
         except (ValueError, FileNotFoundError) as e:
             results.append({"path": path, "deleted": False, "error": str(e)})
             failed_count += 1

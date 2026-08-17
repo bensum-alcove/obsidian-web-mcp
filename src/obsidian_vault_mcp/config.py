@@ -65,6 +65,18 @@ VAULT_SEARCH_TOKENIZE = os.environ.get("VAULT_SEARCH_TOKENIZE", "1") not in (
 # one place. Fastest revert path: env var edit + supervisorctl restart.
 VAULT_WRITE_CONTRACT_MODE = os.environ.get("VAULT_WRITE_CONTRACT_MODE", "shadow").strip().lower()
 
+# Optimistic-concurrency mode for revision-guarded writes: "off" | "shadow" | "enforce"
+# (default enforce). See vault.py's _check_revision/_concurrency_mode for the full
+# contract. Unlike the write-contract gate above, this only ever activates when a
+# caller explicitly passes expected_revision to a mutation tool -- legacy callers
+# that never send it are byte-identical to pre-this-feature behaviour in every mode.
+# "shadow" runs the revision comparison and logs the outcome without ever blocking a
+# write; "off" skips the comparison entirely (expected_revision is accepted but
+# ignored). Read directly from the environment in vault.py (not this module) so the
+# mode can be flipped without an import-time cache. Fastest revert path: env var edit
+# + supervisorctl restart, no git operation needed.
+VAULT_OPTIMISTIC_CONCURRENCY_MODE = os.environ.get("VAULT_OPTIMISTIC_CONCURRENCY_MODE", "enforce").strip().lower()
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))
