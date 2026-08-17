@@ -229,6 +229,55 @@ def test_normal_paths_accepted(path):
 
 
 # --------------------------------------------------------------------------
+# unsafe-path-chars on move DESTINATION (codex-review-phase2-write-integrity:
+# "the enforced unsafe-path-chars contract is bypassed by vault_move
+# destinations" -- previously only the source basename was checked for a
+# move; the destination was never validated at all).
+# --------------------------------------------------------------------------
+
+
+def test_move_rejects_unsafe_destination_even_when_source_is_safe():
+    issues = wc._validate_unsafe_path_chars_for_move(
+        wc.PathMutationContext(path="notes/safe-source.md", operation="move", destination="bad:name.md")
+    )
+    assert issues, "unsafe destination characters must be caught"
+    assert all(i.rule_id == "unsafe-path-chars" for i in issues)
+
+
+def test_move_rejects_unsafe_source_even_when_destination_is_safe():
+    issues = wc._validate_unsafe_path_chars_for_move(
+        wc.PathMutationContext(path="bad:name.md", operation="move", destination="notes/safe-dest.md")
+    )
+    assert issues, "unsafe source characters must still be caught for a move"
+
+
+def test_move_with_safe_source_and_destination_passes():
+    issues = wc._validate_unsafe_path_chars_for_move(
+        wc.PathMutationContext(path="notes/a.md", operation="move", destination="notes/b.md")
+    )
+    assert issues == []
+
+
+def test_move_with_unsafe_destination_is_registered_as_a_path_rule_and_enforced():
+    assert "unsafe-path-chars" in wc.registered_path_rules()
+    assert wc.is_rule_enforced("unsafe-path-chars")
+
+
+def test_enforce_mode_blocks_move_to_bad_destination_before_any_mutation(vault_dir, monkeypatch):
+    """End-to-end reproduction of the exact Phase 2 finding: in enforce mode,
+    move_path("source.md", "bad:name.md") must fail before the filesystem is
+    touched -- not merely be logged."""
+    from obsidian_vault_mcp import vault as v
+
+    monkeypatch.setenv("VAULT_WRITE_CONTRACT_MODE", "enforce")
+    (vault_dir / "source.md").write_text("hello")
+    with pytest.raises(ValueError):
+        v.move_path("source.md", "bad:name.md")
+    assert (vault_dir / "source.md").exists()
+    assert not (vault_dir / "bad:name.md").exists()
+
+
+# --------------------------------------------------------------------------
 # unsafe-file-extension
 # --------------------------------------------------------------------------
 

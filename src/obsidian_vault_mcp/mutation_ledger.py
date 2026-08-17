@@ -109,6 +109,25 @@ def _backup_count() -> int:
         return 10
 
 
+class _StrictRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A RotatingFileHandler whose emit failures are never silently swallowed.
+
+    The stdlib's default ``Handler.handleError`` prints a traceback to
+    stderr and returns -- it never re-raises. That means ``Logger.info()``
+    (and therefore ``record()`` below) cannot tell a real write failure
+    (disk full, permissions revoked mid-run, handle closed) from a success:
+    both return normally. Overriding ``handleError`` to re-raise makes the
+    failure visible to ``record()``'s own try/except, which is what keeps
+    the ``recorded``/``failed`` health metrics honest -- a "recorded" count
+    that quietly includes failed emits was the exact MEDIUM finding this
+    class exists to close.
+    """
+
+    def handleError(self, record):
+        if logging.raiseExceptions:
+            raise
+
+
 def _ensure_handler() -> logging.Handler | None:
     """Lazily (re)create the rotating file handler for the current ledger dir.
 
@@ -129,7 +148,7 @@ def _ensure_handler() -> logging.Handler | None:
 
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            handler = logging.handlers.RotatingFileHandler(
+            handler = _StrictRotatingFileHandler(
                 target_path,
                 maxBytes=_max_bytes(),
                 backupCount=_backup_count(),

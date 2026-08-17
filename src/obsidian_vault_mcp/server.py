@@ -613,19 +613,21 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
 @mcp.tool(
     name="bo_create_build",
     description=(
-        "Create one new Build Orchestrator build: validates the full proposed graph against the "
-        "authoritative BO authoring contract, writes the new spec file, then appends its schedule entry to "
-        "schedule_path (an EXISTING schedule file -- this tool never creates a new schedule file) as the "
-        "activation boundary. Writes nothing if validation fails. Delegates all BO schema/project/risk/"
-        "dependency rules to the authoring-contract adapter; fails closed (no writes) if that adapter is "
-        "unavailable or reports a mismatched schema version."
+        "Create one new Build Orchestrator build: validates the full proposed graph (including every "
+        "pre-existing entry already in schedule_path) against the authoritative BO authoring contract, "
+        "writes the new spec file, then appends its schedule entry to schedule_path (an EXISTING schedule "
+        "file -- this tool never creates a new schedule file) as the activation boundary. Writes nothing if "
+        "validation fails. Always validates strict_new (compat_existing is a read-only audit mode, not "
+        "selectable here). Delegates all BO schema/project/risk/dependency rules to the authoring-contract "
+        "adapter; fails closed (no writes) if that adapter is unavailable or reports a mismatched schema or "
+        "contract version."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def bo_create_build(build: dict, schedule_path: str, mode: str = "strict_new") -> str:
+def bo_create_build(build: dict, schedule_path: str) -> str:
     """Create one new Build Orchestrator build (spec file + schedule entry)."""
-    inp = BOCreateBuildInput(build=build, schedule_path=schedule_path, mode=mode)
-    return _bo_create_build(inp.build.model_dump(), inp.schedule_path, inp.mode)
+    inp = BOCreateBuildInput(build=build, schedule_path=schedule_path)
+    return _bo_create_build(inp.build.model_dump(), inp.schedule_path)
 
 
 @mcp.tool(
@@ -633,16 +635,18 @@ def bo_create_build(build: dict, schedule_path: str, mode: str = "strict_new") -
     description=(
         "Create a same-project multi-build chain in Build Orchestrator: validates the WHOLE proposed graph "
         "at once (forward references -- a later build's depends_on may name an earlier build in this same "
-        "request -- are allowed) against the authoring contract, writes every new spec file, then appends "
-        "all schedule entries to schedule_path (an EXISTING schedule file) in one final write as the "
-        "activation boundary. Writes nothing if validation fails for any build in the chain."
+        "request -- are allowed, and every pre-existing entry already in schedule_path is included too) "
+        "against the authoring contract, writes every new spec file, then appends all schedule entries to "
+        "schedule_path (an EXISTING schedule file) in one final write as the activation boundary. Writes "
+        "nothing if validation fails for any build in the chain. Always validates strict_new (compat_existing "
+        "is a read-only audit mode, not selectable here)."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def bo_create_chain(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
+def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
     """Create a multi-build chain (specs + schedule entries) in one activation."""
-    inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path, mode=mode)
-    return _bo_create_chain([b.model_dump() for b in inp.builds], inp.schedule_path, inp.mode)
+    inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path)
+    return _bo_create_chain([b.model_dump() for b in inp.builds], inp.schedule_path)
 
 
 if SEMANTIC_AVAILABLE:

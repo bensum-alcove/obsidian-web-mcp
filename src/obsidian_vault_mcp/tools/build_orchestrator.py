@@ -89,24 +89,67 @@ def _render_spec_item(build: dict, schedule_entry: dict) -> dict:
     return item
 
 
-def _existing_schedule_project(schedule_path: str) -> str | None:
+def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[list[dict], str | None]:
+    """Load every entry already in schedule_path's builds: list (excluding
+    ids the caller is about to (re)supply) as additional graph nodes, each
+    paired with its own on-disk spec content.
+
+    Without this, whole-graph checks (mixed-project, duplicate-id) only ever
+    saw the newly-proposed nodes -- a strict-new build appended to a schedule
+    that already contained a different project's build validated cleanly
+    because the existing entry was never part of the graph being checked
+    (codex-review-bo-authoring-contract-v1, B2). Returns (nodes,
+    schedule_project) -- schedule_project is None for a brand-new schedule.
+    """
     try:
         content, _ = read_file(schedule_path)
     except FileNotFoundError:
-        return None
+        return [], None
+
+    project = None
     try:
-        return frontmatter.loads(content).metadata.get("project")
+        project = frontmatter.loads(content).metadata.get("project")
     except Exception:
-        return None
+        pass
+
+    nodes = []
+    for entry in parse_schedule_builds(content) or []:
+        if not isinstance(entry, dict) or entry.get("id") in new_build_ids:
+            continue
+        spec_path = entry.get("spec_path")
+        spec_markdown = ""
+        if isinstance(spec_path, str):
+            try:
+                spec_markdown, _ = read_file(spec_path)
+            except FileNotFoundError:
+                spec_markdown = ""
+        nodes.append({
+            "build_id": entry.get("id"),
+            "schedule_entry": entry,
+            "spec_markdown": spec_markdown,
+            "schedule_path": schedule_path,
+            "schedule_project": project,
+        })
+    return nodes, project
 
 
 def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
     """Shape + render + validate a proposed graph. Never writes anything.
 
+    Validates the COMPLETE resulting graph -- every entry already in
+    schedule_path plus the newly-proposed ones -- not just the newly-proposed
+    rows in isolation (B2). `mode` (and its strict-new-only checks) applies
+    only to the newly-proposed build ids; pre-existing entries are still
+    included in every cross-node check (duplicate id, mixed project,
+    dependency/cycle) but evaluated leniently at the per-node level, via
+    `bo_contract.validate_graph`'s `new_ids` parameter.
+
     Returns {"ok", "errors", "warnings", "nodes", "rendered", "version_info"}
-    where "nodes"/"rendered" are only meaningful when "ok" is True. Raises
-    BOToolError for a malformed tool input, bo_contract.BOContractError if the
-    adapter itself is unavailable/wrong-version/failing (fail closed).
+    where "nodes"/"rendered" are only meaningful when "ok" is True, and
+    contain ONLY the newly-proposed nodes (existing nodes are read-only graph
+    context, never re-rendered or re-written). Raises BOToolError for a
+    malformed tool input, bo_contract.BOContractError if the adapter itself
+    is unavailable/wrong-version/failing (fail closed).
     """
     normalized_builds = [_normalize_build(dict(b)) for b in builds]
     # Duplicate build_id within this request is deliberately left to the adapter's
@@ -115,13 +158,15 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
 
     version_info = bo_contract.check_version()
 
-    schedule_project = _existing_schedule_project(schedule_path)
+    new_build_ids = {b["build_id"] for b in normalized_builds}
+    existing_nodes, schedule_project = _existing_schedule_nodes(schedule_path, new_build_ids)
+
     schedule_entries = {b["build_id"]: _schedule_entry_for(b) for b in normalized_builds}
     render_specs = [_render_spec_item(b, schedule_entries[b["build_id"]]) for b in normalized_builds]
 
     rendered = bo_contract.render_graph(render_specs)["rendered"]
 
-    nodes = [
+    new_nodes = [
         {
             "build_id": b["build_id"],
             "schedule_entry": schedule_entries[b["build_id"]],
@@ -132,12 +177,12 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
         for b in normalized_builds
     ]
 
-    result = bo_contract.validate_graph(nodes, mode=mode)
+    result = bo_contract.validate_graph(existing_nodes + new_nodes, mode=mode, new_ids=sorted(new_build_ids))
     return {
         "ok": bool(result.get("ok", False)),
         "errors": result.get("errors", []),
         "warnings": result.get("warnings", []),
-        "nodes": nodes,
+        "nodes": new_nodes,
         "rendered": rendered,
         "version_info": version_info,
     }
@@ -174,10 +219,16 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     })
 
 
-def _activate(builds: list[dict], schedule_path: str, mode: str, tool_name: str) -> str:
-    """Shared create path for bo_create_build (1 build) and bo_create_chain (N builds)."""
+def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
+    """Shared create path for bo_create_build (1 build) and bo_create_chain (N builds).
+
+    Always validates in "strict_new" mode -- `compat_existing` is a read-only
+    audit/compatibility mode for the historical corpus and must not be
+    caller-selectable on a path that writes new artifacts (B3: "compatibility
+    mode is exposed on mutation tools ... allows new malformed artifacts").
+    """
     try:
-        prep = _prepare_graph(builds, schedule_path, mode)
+        prep = _prepare_graph(builds, schedule_path, "strict_new")
     except BOToolError as e:
         return json.dumps({"ok": False, "error": str(e), "activated": False})
     except bo_contract.BOContractError as e:
@@ -281,15 +332,15 @@ def _activate(builds: list[dict], schedule_path: str, mode: str, tool_name: str)
     })
 
 
-def bo_create_build(build: dict, schedule_path: str, mode: str = "strict_new") -> str:
+def bo_create_build(build: dict, schedule_path: str) -> str:
     """Structured single-build create: validate, write the spec, then append the
-    schedule entry as the activation boundary."""
-    return _activate([build], schedule_path, mode, "bo_create_build")
+    schedule entry as the activation boundary. Always strict_new -- see _activate."""
+    return _activate([build], schedule_path, "bo_create_build")
 
 
-def bo_create_chain(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
+def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
     """Structured same-project multi-build chain create, including forward
     references (a later build's depends_on may name an earlier build in the
     same request). Validates the whole graph, writes every spec, then appends
-    all schedule entries in one final schedule write."""
-    return _activate(builds, schedule_path, mode, "bo_create_chain")
+    all schedule entries in one final schedule write. Always strict_new -- see _activate."""
+    return _activate(builds, schedule_path, "bo_create_chain")

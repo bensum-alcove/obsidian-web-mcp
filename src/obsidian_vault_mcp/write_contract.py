@@ -347,6 +347,30 @@ def _validate_read_policy_full_rewrite(ctx: WriteContext) -> list[ValidationIssu
     ]
 
 
+def _unsafe_path_chars_issues(path: str) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    bad_chars = sorted(set(_WINDOWS_RESERVED_CHARS_RE.findall(path)))
+    if bad_chars:
+        issues.append(
+            ValidationIssue(
+                "unsafe-path-chars",
+                "reject",
+                f"path {path!r} contains characters illegal on Windows filesystems: {bad_chars!r}",
+            )
+        )
+    for part in path.replace("\\", "/").split("/"):
+        stem = part.rsplit(".", 1)[0].upper()
+        if stem in _WINDOWS_RESERVED_BASENAMES:
+            issues.append(
+                ValidationIssue(
+                    "unsafe-path-chars",
+                    "reject",
+                    f"path component {part!r} in {path!r} is a reserved Windows device name",
+                )
+            )
+    return issues
+
+
 @register_content_rule("unsafe-path-chars", enforced=True)
 def _validate_unsafe_path_chars(ctx: WriteContext) -> list[ValidationIssue]:
     """Reject paths containing characters/names illegal on Windows filesystems.
@@ -356,26 +380,22 @@ def _validate_unsafe_path_chars(ctx: WriteContext) -> list[ValidationIssue]:
     can silently fail or get mangled at the filesystem layer well after this
     server's own path-traversal checks pass.
     """
-    issues: list[ValidationIssue] = []
-    bad_chars = sorted(set(_WINDOWS_RESERVED_CHARS_RE.findall(ctx.path)))
-    if bad_chars:
-        issues.append(
-            ValidationIssue(
-                "unsafe-path-chars",
-                "reject",
-                f"path contains characters illegal on Windows filesystems: {bad_chars!r}",
-            )
-        )
-    for part in ctx.path.replace("\\", "/").split("/"):
-        stem = part.rsplit(".", 1)[0].upper()
-        if stem in _WINDOWS_RESERVED_BASENAMES:
-            issues.append(
-                ValidationIssue(
-                    "unsafe-path-chars",
-                    "reject",
-                    f"path component {part!r} is a reserved Windows device name",
-                )
-            )
+    return _unsafe_path_chars_issues(ctx.path)
+
+
+@register_path_rule("unsafe-path-chars", enforced=True)
+def _validate_unsafe_path_chars_for_move(ctx: PathMutationContext) -> list[ValidationIssue]:
+    """Same check as the content rule, but for move/delete -- and, critically,
+    for the move *destination* too.
+
+    Previously the only registered path rule was ``protected-structural-file``
+    (source basename only); an enforced ``vault_move`` could still land an
+    existing file at a destination containing Windows-illegal characters,
+    because nothing ever validated ``ctx.destination``.
+    """
+    issues = _unsafe_path_chars_issues(ctx.path)
+    if ctx.destination:
+        issues.extend(_unsafe_path_chars_issues(ctx.destination))
     return issues
 
 

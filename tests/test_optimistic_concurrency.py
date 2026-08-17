@@ -1,11 +1,16 @@
 """Race and contract tests for optimistic-concurrency (revision-guarded) writes."""
 
 import json
+import subprocess
+import sys
+import textwrap
 import threading
+import time
 
 import pytest
 
 from obsidian_vault_mcp import vault as v
+from obsidian_vault_mcp import vault_lock
 from obsidian_vault_mcp.tools.manage import vault_delete, vault_move
 from obsidian_vault_mcp.tools.read import vault_read
 from obsidian_vault_mcp.tools.write import (
@@ -60,6 +65,57 @@ def test_revision_changes_after_a_write(vault_dir):
     write_file_atomic("test-note.md", "new body")
     _, after = read_file("test-note.md")
     assert before["revision"] != after["revision"]
+
+
+def test_read_file_opens_the_target_exactly_once(vault_dir, monkeypatch):
+    """codex-review-phase2-write-integrity HIGH #1: content and revision used
+    to come from separate stat()/read_text()/read_bytes() calls, leaving a
+    seam for a writer to land in between and produce an incoherent pair.
+    read_file() must now open the file exactly once and derive both values
+    from that single read -- there should be no second syscall left for a
+    writer to land between.
+    """
+    import os as os_module
+
+    real_open = os_module.open
+    open_calls = []
+
+    def counting_open(path, *a, **k):
+        open_calls.append(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(os_module, "open", counting_open)
+    read_file("test-note.md")
+    target_opens = [c for c in open_calls if str(c).endswith("test-note.md")]
+    assert len(target_opens) == 1
+
+
+def test_read_file_content_and_revision_always_agree_under_concurrent_writes(vault_dir):
+    """Stress-test the coherent-snapshot guarantee: a background thread keeps
+    replacing the file's content in a tight loop while the foreground thread
+    repeatedly calls read_file(). For every single read, the returned
+    content's hash must equal the returned revision -- by construction, not
+    by luck -- since both now come from one read of one file descriptor.
+    """
+    stop = threading.Event()
+    counter = {"n": 0}
+
+    def writer():
+        while not stop.is_set():
+            counter["n"] += 1
+            write_file_atomic("test-note.md", f"version {counter['n']}")
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        for _ in range(200):
+            content, metadata = read_file("test-note.md")
+            assert metadata["revision"] == compute_revision(content.encode("utf-8")), (
+                "content and revision must always come from the same on-disk snapshot"
+            )
+    finally:
+        stop.set()
+        t.join()
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +228,85 @@ def test_concurrent_threads_same_path_exactly_one_wins(vault_dir):
     assert len(conflicts) == 1
 
 
+def test_subprocess_cooperating_writer_forces_explicit_conflict_not_silent_overwrite(vault_dir, tmp_path, monkeypatch):
+    """codex-review-phase2-write-integrity HIGH #2 reproduction target:
+    "paused immediately before os.replace, wrote external directly to the
+    target after the expected revision had passed, then resumed. The guarded
+    MCP write returned success and the final content was mcp; the
+    intervening external version was silently lost." That probe used a raw
+    filesystem write with zero coordination -- vault_lock.py's own docstring
+    is explicit that its process-shared lock only protects a writer that
+    ALSO acquires it (a "cooperating" writer, the framing this build's spec
+    uses), not an arbitrary uncoordinated one.
+
+    This test proves the mechanism holds for exactly that class: a REAL
+    separate process that cooperates via vault_lock.path_lock, holds the
+    lock, mutates the target directly, and only then releases it. The
+    guarded write in THIS process must block until the lock is released and
+    then raise RevisionConflictError (never silently overwrite) -- and the
+    external writer's bytes must survive on disk.
+    """
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setenv("VAULT_MUTATION_LOCK_DIR", str(lock_dir))
+
+    target = vault_dir / "test-note.md"
+    _, meta = read_file("test-note.md")
+    resolved_path = str(target.resolve())
+
+    ready_marker = tmp_path / "subprocess-holds-lock"
+    release_marker = tmp_path / "main-thread-is-waiting"
+
+    script = tmp_path / "external_writer.py"
+    script.write_text(textwrap.dedent(f"""
+        import time
+        from pathlib import Path
+        from obsidian_vault_mcp import vault_lock
+
+        target = Path({resolved_path!r})
+        ready = Path({str(ready_marker)!r})
+        release = Path({str(release_marker)!r})
+
+        with vault_lock.path_lock(target):
+            ready.write_text("ready")
+            for _ in range(500):
+                if release.exists():
+                    break
+                time.sleep(0.01)
+            target.write_bytes(b"external writer content")
+            time.sleep(0.3)  # keep holding the lock so the main write is still blocked on it
+    """))
+
+    env = {"VAULT_MUTATION_LOCK_DIR": str(lock_dir), "PYTHONPATH": str(
+        __import__("pathlib").Path(__file__).resolve().parent.parent / "src"
+    )}
+    import os as os_module
+    full_env = dict(os_module.environ)
+    full_env.update(env)
+
+    proc = subprocess.Popen([sys.executable, str(script)], env=full_env)
+    try:
+        for _ in range(500):
+            if ready_marker.exists():
+                break
+            time.sleep(0.01)
+        else:
+            proc.kill()
+            pytest.fail("external-writer subprocess never acquired the lock")
+
+        # Give the main thread's write_file_atomic call a moment to actually
+        # start blocking on the same lock before telling the subprocess it
+        # may proceed with its write.
+        release_marker.write_text("go")
+
+        with pytest.raises(RevisionConflictError):
+            write_file_atomic("test-note.md", "mcp content", expected_revision=meta["revision"])
+    finally:
+        proc.wait(timeout=10)
+
+    content, _ = read_file("test-note.md")
+    assert content == "external writer content"  # the cooperating external writer's bytes survive intact
+
+
 # --------------------------------------------------------------------------
 # Delete-recreate race
 # --------------------------------------------------------------------------
@@ -226,6 +361,61 @@ def test_move_with_matching_revision_succeeds(vault_dir):
     move_path("test-note.md", "moved-note.md", expected_revision=reader["revision"])
     assert (vault_dir / "moved-note.md").exists()
     assert not (vault_dir / "test-note.md").exists()
+
+
+def test_concurrent_moves_to_same_destination_exactly_one_wins_loser_source_intact(vault_dir):
+    """codex-review-phase2-write-integrity HIGH #3 reproduction target:
+    "Two moves from different sources therefore hold different locks, both
+    observe an absent destination, and race at rename/replace ... Both calls
+    returned True; both sources disappeared; only one source's bytes
+    remained." Source and destination are now locked together (in
+    deterministic order) for the whole operation, so exactly one of two
+    concurrent movers to the same destination must succeed and the other
+    must fail explicitly with its own source left untouched.
+    """
+    (vault_dir / "source-a.md").write_text("content from a")
+    (vault_dir / "source-b.md").write_text("content from b")
+
+    barrier = threading.Barrier(2)
+    outcomes = []
+    outcomes_lock = threading.Lock()
+
+    def attempt(source, label):
+        barrier.wait()
+        try:
+            move_path(source, "dest.md")
+            with outcomes_lock:
+                outcomes.append(("ok", label))
+        except FileExistsError:
+            with outcomes_lock:
+                outcomes.append(("exists", label))
+
+    threads = [
+        threading.Thread(target=attempt, args=("source-a.md", "a")),
+        threading.Thread(target=attempt, args=("source-b.md", "b")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [o for o in outcomes if o[0] == "ok"]
+    losers = [o for o in outcomes if o[0] == "exists"]
+    assert len(successes) == 1
+    assert len(losers) == 1
+
+    # Exactly one source disappeared (the winner's); the loser's source must
+    # still be present and untouched -- not silently lost.
+    loser_label = losers[0][1]
+    loser_source = vault_dir / f"source-{loser_label}.md"
+    assert loser_source.exists()
+    assert loser_source.read_text() == f"content from {loser_label}"
+
+    winner_label = successes[0][1]
+    winner_source = vault_dir / f"source-{winner_label}.md"
+    assert not winner_source.exists()
+
+    assert (vault_dir / "dest.md").read_text() == f"content from {winner_label}"
 
 
 def test_expected_revision_rejected_for_directory_move(vault_dir):

@@ -123,6 +123,41 @@ def test_check_version_mismatch_fails_closed(monkeypatch):
     assert exc.value.code == "version_mismatch"
 
 
+def test_check_version_contract_version_drift_fails_closed_even_with_matching_schema(monkeypatch):
+    """codex-review-bo-authoring-contract-v1, B5: 'MCP defines
+    EXPECTED_CONTRACT_VERSION = "1.0.0" but check_version() checks only
+    schema_version, so a changed contract implementation under schema v6 is
+    accepted.' schema_version matches here; only contract_version drifted --
+    this must still fail closed."""
+    monkeypatch.setattr(
+        bo_contract.subprocess, "run",
+        lambda *a, **k: FakeCompletedProcess(
+            stdout=json.dumps({"ok": True, "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION, "contract_version": "9.9.9"})
+        ),
+    )
+    with pytest.raises(bo_contract.BOContractError) as exc:
+        bo_contract.check_version()
+    assert exc.value.code == "version_mismatch"
+    assert "contract_version" in str(exc.value)
+
+
+def test_freely_mutable_statuses_derived_from_adapter_vocabulary(monkeypatch):
+    """B5: the freely-mutable-status set is sourced from the adapter's own
+    vocabulary, not a hardcoded local copy."""
+    monkeypatch.setattr(
+        bo_contract.subprocess, "run",
+        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
+            "ok": True,
+            "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION,
+            "contract_version": bo_contract.EXPECTED_CONTRACT_VERSION,
+            "known_statuses": ["proposed", "pending", "ready", "dispatched", "done"],
+            "terminal_statuses": ["done"],
+            "dispatched_statuses": ["dispatched"],
+        })),
+    )
+    assert bo_contract.freely_mutable_statuses() == {"proposed", "pending", "ready"}
+
+
 def test_validate_graph_passes_payload_shape(monkeypatch):
     captured = {}
 

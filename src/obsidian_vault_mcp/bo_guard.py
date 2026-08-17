@@ -11,10 +11,11 @@ and move/rename/delete (vault.move_path / vault.delete_path) -- for two paths:
 This is a second, independently-flagged gate alongside write_contract.py's
 general-purpose one: mode is BO_PATH_GUARD_MODE ("off" | "shadow" (default) |
 "enforce"), read fresh on every call, never shared with VAULT_WRITE_CONTRACT_MODE.
-vault-bo-authoring-mcp-v1 deploys this as shadow only -- every rule below is
-"reject" severity (mechanically meaningful, not merely advisory) and fully
-wired for enforce, but turning the mode to "enforce" is an explicit, separate,
-later build (vault-bo-authoring-enforce-v1) gated on independent Codex review.
+Deployed shadow-only in both vault-bo-authoring-mcp-v1 and this remediation
+build -- every rule below is "reject" severity (mechanically meaningful, not
+merely advisory) and fully wired for enforce, but turning the mode to
+"enforce" is an explicit, separate, later build gated on independent Codex
+review (codex-review-bo-authoring-contract-v2).
 
 Validation logic is delegated entirely to the BO authoring contract adapter
 (bo_contract.py -> authoring_contract.py's JSON CLI) for anything that needs
@@ -31,6 +32,29 @@ If the authoring-contract adapter itself is unavailable, every rule here
 reports its own findings as "reject" severity (matching the tools' own
 fail-closed policy) -- but since this guard is deployed shadow-only, that can
 still never block a real write in this build; it only ever logs.
+
+codex-review-bo-authoring-contract-v1 (2026-08-17) found this first cut fails
+open in several ways -- see B1 in that review. This build's fixes, all still
+shadow-only:
+
+  - brand-new schedules/specs are no longer exempt from validation (the old
+    ``old_content is None -> return []`` short-circuit only skips a true
+    same-content no-op now);
+  - an unparseable/malformed schedule rewrite is "reject" severity, not
+    "advisory" -- an enforce-mode future build can actually block it;
+  - schedule rewrites are validated against the COMPLETE resulting graph
+    (every entry that will exist in the file after the write, each paired
+    with its on-disk spec content), not just bound-row preservation;
+  - spec rewrites are validated against the spec's own content shape
+    (frontmatter/identity/tier/risk fields), not just a status lookup;
+  - path mutation now evaluates the DESTINATION too, so an inbound move from
+    a non-BO path into specs/ or schedules/ is validated as if it were a
+    fresh write there;
+  - BO directories (specs/, schedules/) and their ancestors are protected
+    recursively: moving/deleting the directory itself, or any ancestor of
+    it, is evaluated against every schedule/spec file currently on disk
+    underneath it -- not just a single exact-path DB lookup that silently
+    matches nothing for a directory-shaped path.
 """
 
 from __future__ import annotations
@@ -59,18 +83,48 @@ class BOGuardError(ValueError):
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
 
-# Statuses a spec is still safely, casually editable in -- i.e. it has never
-# been claimed by a dispatch. Deliberately an allowlist of the small
-# "pre-dispatch" surface (mirrors authoring_contract.KNOWN_STATUSES minus
-# DISPATCHED_STATUSES/TERMINAL_STATUSES) rather than a mirror of BO's full
-# status vocabulary -- see module docstring for why this one piece of
-# domain knowledge is kept local instead of round-tripped through the adapter.
-_SPEC_FREELY_MUTABLE_STATUSES = {"proposed", "pending", "ready"}
+# Fallback only, used solely when the adapter itself is unavailable (see
+# _freely_mutable_statuses below) -- the authoritative set is now sourced
+# from the adapter's own op=version vocabulary
+# (known_statuses - terminal_statuses - dispatched_statuses), not hardcoded
+# here (codex-review-bo-authoring-contract-v1, B5: "the status classification
+# should be owned by and returned from the contract adapter").
+_SPEC_FREELY_MUTABLE_STATUSES_FALLBACK = {"proposed", "pending", "ready"}
+
+_freely_mutable_statuses_cache: set | None = None
+
+
+def _freely_mutable_statuses() -> set:
+    """Cached (process-lifetime) lookup of the adapter's own
+    freely-mutable-status vocabulary. A restart is required to pick up a
+    change in the adapter's vocabulary, matching how EXPECTED_SCHEMA_VERSION/
+    EXPECTED_CONTRACT_VERSION drift already requires a restart. On adapter
+    failure, the fallback allowlist above is used for that one call without
+    poisoning the cache -- being shadow-only, a staleness here can only ever
+    produce a wrong log line, never a wrong block.
+    """
+    global _freely_mutable_statuses_cache
+    if _freely_mutable_statuses_cache is not None:
+        return _freely_mutable_statuses_cache
+    try:
+        _freely_mutable_statuses_cache = bo_contract.freely_mutable_statuses()
+    except bo_contract.BOContractError:
+        return _SPEC_FREELY_MUTABLE_STATUSES_FALLBACK
+    return _freely_mutable_statuses_cache
 
 
 def _is_bo_path(path: str) -> bool:
-    normalized = path.replace("\\", "/")
-    return normalized.startswith(SPECS_PREFIX) or normalized.startswith(SCHEDULES_PREFIX)
+    """True if `path` is inside specs/schedules, IS one of those directories,
+    or is an ancestor of either -- e.g. moving/deleting
+    "Personal/Build Orchestrator" (which contains both) must not silently
+    skip evaluation just because it isn't itself under a specs/schedules
+    prefix (codex-review-bo-authoring-contract-v1, B1)."""
+    normalized = path.replace("\\", "/").rstrip("/")
+    for prefix in (SPECS_PREFIX, SCHEDULES_PREFIX):
+        prefix_no_slash = prefix.rstrip("/")
+        if normalized.startswith(prefix) or (prefix_no_slash + "/").startswith(normalized + "/"):
+            return True
+    return False
 
 
 def get_mode() -> str:
@@ -139,39 +193,175 @@ def parse_schedule_builds(content: str) -> list[dict] | None:
     return builds if isinstance(builds, list) else None
 
 
+def _schedule_project_from_content(content: str) -> str | None:
+    import frontmatter
+    try:
+        return frontmatter.loads(content).metadata.get("project")
+    except Exception:
+        return None
+
+
+def _read_vault_text(relative_path: str) -> str | None:
+    """Best-effort read of a vault-relative path's raw text off disk.
+
+    Used only for read-only shadow evaluation (never for a mutation) --
+    returns None rather than raising for a missing/unreadable/binary file so
+    a dangling spec_path reference degrades to "no content to check" instead
+    of blowing up the guard.
+    """
+    from . import config
+
+    try:
+        full = (config.VAULT_PATH / relative_path).resolve()
+        if not full.is_file():
+            return None
+        return full.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _files_under(relative_dir: str) -> list[str]:
+    """Vault-relative file paths currently on disk under `relative_dir`.
+
+    Used when a guard check must cover an entire directory being moved or
+    deleted in bulk (e.g. the whole schedules/ directory, or an ancestor of
+    it) rather than one exact path -- a single-path DB/adapter lookup
+    silently matches nothing for a directory-shaped path.
+    """
+    from . import config
+
+    base = (config.VAULT_PATH / relative_dir).resolve()
+    vault_root = config.VAULT_PATH.resolve()
+    if not base.is_dir():
+        return []
+    out: list[str] = []
+    try:
+        for p in sorted(base.rglob("*")):
+            if p.is_file():
+                try:
+                    out.append(str(p.relative_to(vault_root)).replace("\\", "/"))
+                except ValueError:
+                    continue
+    except OSError:
+        return out
+    return out
+
+
+def _affected_paths(path: str, prefix: str) -> list[str]:
+    """Vault-relative file paths that a move/delete of `path` would affect,
+    given a protected directory `prefix` (SPECS_PREFIX or SCHEDULES_PREFIX).
+
+    Three cases: `path` is a file/subpath under `prefix` (returns that one
+    path); `path` IS `prefix`'s directory itself, or an ancestor of it
+    (returns every file currently under `prefix` on disk -- the bulk case);
+    otherwise empty.
+    """
+    normalized = path.replace("\\", "/").rstrip("/")
+    prefix_no_slash = prefix.rstrip("/")
+    if (prefix_no_slash + "/").startswith(normalized + "/"):
+        return _files_under(prefix)
+    if normalized.startswith(prefix):
+        return [normalized]
+    return []
+
+
+def _nodes_for_schedule_builds(builds: list[dict], schedule_path: str, schedule_project: str | None) -> list[dict]:
+    nodes = []
+    for entry in builds:
+        if not isinstance(entry, dict):
+            continue
+        spec_path = entry.get("spec_path")
+        nodes.append({
+            "build_id": entry.get("id"),
+            "schedule_entry": entry,
+            "spec_markdown": _read_vault_text(spec_path) or "" if isinstance(spec_path, str) else "",
+            "schedule_path": schedule_path,
+            "schedule_project": schedule_project,
+        })
+    return nodes
+
+
 def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
-    if ctx.old_content is None or ctx.old_content == ctx.new_content:
-        return []  # brand-new schedule file, or a no-op write -- nothing bound yet / nothing changing
+    if ctx.old_content is not None and ctx.old_content == ctx.new_content:
+        return []  # true no-op write
+
     new_builds = parse_schedule_builds(ctx.new_content)
     if new_builds is None:
+        # Previously "advisory" -- an unparseable/malformed rewrite is a real,
+        # reject-severity finding so a future enforce-mode build can actually
+        # block it (codex-review-bo-authoring-contract-v1, B1).
         return [ValidationIssue(
-            "bo-guard-schedule-rewrite", "advisory",
-            f"could not parse a builds: list from the proposed content for {ctx.path!r}; "
-            "BO schedule-authority preflight skipped for this write",
+            "bo-guard-schedule-rewrite", "reject",
+            f"proposed content for {ctx.path!r} does not parse as a valid schedule "
+            "builds: list -- rejecting rather than allowing an unparseable rewrite through",
         )]
+
+    issues: list[ValidationIssue] = []
+
+    # 1. Bound-row preservation / terminal-entry-edit preflight. Runs
+    #    regardless of whether this is a brand-new or existing schedule -- a
+    #    brand-new schedule simply has no bound rows to preserve, which is a
+    #    no-op result here, not an exemption from validation overall.
     try:
-        result = bo_contract.preflight_schedule_rewrite(ctx.path, new_builds, mode="compat_existing")
+        preflight_result = bo_contract.preflight_schedule_rewrite(ctx.path, new_builds, mode="compat_existing")
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-    return _errors_to_issues("bo-guard-schedule-rewrite", result.get("errors", []))
+    issues.extend(_errors_to_issues("bo-guard-schedule-rewrite", preflight_result.get("errors", [])))
+
+    # 2. Whole-resulting-graph validation: every entry that will exist in the
+    #    file after this write, each paired with its on-disk spec content --
+    #    not just the rows this particular write happens to touch. Closes the
+    #    "mixed execution projects / duplicate un-ingested ID across the
+    #    whole schedule not detected" gap (B2).
+    schedule_project = _schedule_project_from_content(ctx.new_content)
+    old_builds = parse_schedule_builds(ctx.old_content) if ctx.old_content else None
+    old_by_id = {b.get("id"): b for b in (old_builds or []) if isinstance(b, dict)}
+    new_ids = sorted({
+        entry.get("id") for entry in new_builds
+        if isinstance(entry, dict) and entry.get("id") is not None
+        and entry != old_by_id.get(entry.get("id"))
+    })
+    nodes = _nodes_for_schedule_builds(new_builds, ctx.path, schedule_project)
+    try:
+        graph_result = bo_contract.validate_graph(nodes, mode="strict_new", new_ids=new_ids)
+    except bo_contract.BOContractError as e:
+        issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
+        return issues
+    issues.extend(_errors_to_issues("bo-guard-schedule-graph", graph_result.get("errors", [])))
+
+    return issues
 
 
 def _spec_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
-    if ctx.old_content is None or ctx.old_content == ctx.new_content:
-        return []  # brand-new spec, or a no-op write
+    if ctx.old_content is not None and ctx.old_content == ctx.new_content:
+        return []  # true no-op write
+
     build_id = _build_id_from_spec_path(ctx.path)
     try:
         result = bo_contract.preflight_ids([build_id])
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     status = (result.get("results") or {}).get(build_id)
-    if status is not None and status not in _SPEC_FREELY_MUTABLE_STATUSES:
+    if status is not None and status not in _freely_mutable_statuses():
         return [ValidationIssue(
             "bo-guard-spec-rewrite", "reject",
             f"{build_id!r} has status {status!r} — its spec content is bound to a dispatched-or-later "
             "or closed build and cannot be rewritten by the normal authoring path",
         )]
-    return []
+
+    # Content-shape check (frontmatter validity, identity, tier, risk fields)
+    # so a pre-dispatch spec can't be rewritten to arbitrary invalid bytes
+    # just because its status is still freely-mutable (B1). Lenient
+    # (compat_existing) since this may be a pre-v6 spec -- catches malformed
+    # YAML / identity mismatch / unknown enums without false-positiving on
+    # legacy risk-field shape.
+    try:
+        spec_result = bo_contract.preflight_spec_validate(
+            build_id, ctx.new_content, ctx.path, mode="compat_existing",
+        )
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+    return _errors_to_issues("bo-guard-spec-rewrite", spec_result.get("errors", []))
 
 
 def _content_issues(ctx: WriteContext) -> list[ValidationIssue]:
@@ -184,27 +374,50 @@ def _content_issues(ctx: WriteContext) -> list[ValidationIssue]:
 
 
 def _path_mutation_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
-    normalized = ctx.path.replace("\\", "/")
-    if normalized.startswith(SCHEDULES_PREFIX):
+    issues: list[ValidationIssue] = []
+
+    for schedule_path in _affected_paths(ctx.path, SCHEDULES_PREFIX):
         try:
-            result = bo_contract.preflight_schedule_move(ctx.path)
+            result = bo_contract.preflight_schedule_move(schedule_path)
         except bo_contract.BOContractError as e:
-            return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-        return _errors_to_issues("bo-guard-schedule-move", result.get("errors", []))
-    if normalized.startswith(SPECS_PREFIX):
-        build_id = _build_id_from_spec_path(ctx.path)
+            issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
+            continue
+        issues.extend(_errors_to_issues("bo-guard-schedule-move", result.get("errors", [])))
+
+    for spec_path in _affected_paths(ctx.path, SPECS_PREFIX):
+        build_id = _build_id_from_spec_path(spec_path)
         try:
             result = bo_contract.preflight_ids([build_id])
         except bo_contract.BOContractError as e:
-            return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+            issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
+            continue
         status = (result.get("results") or {}).get(build_id)
-        if status is not None and status not in _SPEC_FREELY_MUTABLE_STATUSES:
-            return [ValidationIssue(
+        if status is not None and status not in _freely_mutable_statuses():
+            issues.append(ValidationIssue(
                 "bo-guard-spec-move", "reject",
                 f"{build_id!r} has status {status!r} — {ctx.operation}ing its spec risks orphaning a "
                 "bound or closed build (schedule_unbound-style regression)",
-            )]
-    return []
+            ))
+    return issues
+
+
+def _inbound_move_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
+    """A move/rename whose DESTINATION lands inside specs/ or schedules/ from
+    an origin outside either. Without this, an arbitrary file can be moved
+    straight into schedule/spec authority with zero validation (B1:
+    "Moving an arbitrary file from a non-BO path into .../schedules/
+    bypasses the guard"). Validated as if it were a fresh write at the
+    destination path -- move never changes content, so the source's current
+    on-disk bytes are exactly what would land there.
+    """
+    destination = ctx.destination
+    if not destination:
+        return []
+    content = _read_vault_text(ctx.path)
+    if content is None:
+        return []  # directory move or unreadable source; nothing to validate as content
+    synthetic_ctx = WriteContext(path=destination, old_content=None, new_content=content, tool=ctx.operation)
+    return _content_issues(synthetic_ctx)
 
 
 def evaluate_content(ctx: WriteContext) -> BOGateResult:
@@ -218,9 +431,20 @@ def evaluate_content(ctx: WriteContext) -> BOGateResult:
 
 def evaluate_path_mutation(ctx: PathMutationContext) -> BOGateResult:
     mode = get_mode()
-    if mode == "off" or not _is_bo_path(ctx.path):
+    if mode == "off":
         return BOGateResult(mode=mode, issues=[])
-    issues = _path_mutation_issues(ctx)
+
+    source_is_bo = _is_bo_path(ctx.path)
+    dest_is_bo = bool(ctx.destination) and _is_bo_path(ctx.destination)
+    if not source_is_bo and not dest_is_bo:
+        return BOGateResult(mode=mode, issues=[])
+
+    issues: list[ValidationIssue] = []
+    if source_is_bo:
+        issues.extend(_path_mutation_issues(ctx))
+    if dest_is_bo and not source_is_bo:
+        issues.extend(_inbound_move_issues(ctx))
+
     _log_issues(mode, ctx.path, ctx.operation, issues)
     return BOGateResult(mode=mode, issues=issues)
 

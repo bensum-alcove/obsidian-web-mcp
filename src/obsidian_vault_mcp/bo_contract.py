@@ -100,9 +100,17 @@ def _invoke(payload: dict, timeout: float | None = None) -> dict:
 
 
 def check_version(timeout: float | None = None) -> dict:
-    """Call op=version and assert schema_version matches what this adapter was
-    built against. Raises BOContractError (version_mismatch) on drift -- this is
-    the fail-closed check every BO tool call must pass before doing anything else.
+    """Call op=version and assert BOTH schema_version and contract_version
+    match what this adapter was built against. Raises BOContractError
+    (version_mismatch) on drift -- this is the fail-closed check every BO
+    tool call must pass before doing anything else.
+
+    Checking schema_version alone was insufficient
+    (codex-review-bo-authoring-contract-v1, B5): a changed contract
+    *implementation* under an unchanged schema_version -- e.g. a behavioural
+    change to validate_build_graph -- would previously pass this check
+    silently. contract_version is bumped independently of schema_version
+    specifically to catch that class of drift.
     """
     result = _invoke({"op": "version"}, timeout=timeout)
     schema_version = result.get("schema_version")
@@ -112,19 +120,49 @@ def check_version(timeout: float | None = None) -> dict:
             f"authoring contract schema_version {schema_version!r} != expected "
             f"{EXPECTED_SCHEMA_VERSION!r} -- refusing to trust a drifted adapter",
         )
+    contract_version = result.get("contract_version")
+    if contract_version != EXPECTED_CONTRACT_VERSION:
+        raise BOContractError(
+            "version_mismatch",
+            f"authoring contract contract_version {contract_version!r} != expected "
+            f"{EXPECTED_CONTRACT_VERSION!r} -- refusing to trust a drifted adapter",
+        )
     return result
 
 
+def freely_mutable_statuses(timeout: float | None = None) -> set[str]:
+    """The set of spec statuses that have never been claimed by a dispatch,
+    sourced from the adapter's own vocabulary (op=version) rather than a
+    locally-hardcoded copy -- see bo_guard.py's _SPEC_FREELY_MUTABLE_STATUSES
+    and codex-review-bo-authoring-contract-v1, B5 ("status classification
+    should be owned by and returned from the contract adapter").
+    """
+    info = check_version(timeout=timeout)
+    known = set(info.get("known_statuses") or [])
+    terminal = set(info.get("terminal_statuses") or [])
+    dispatched = set(info.get("dispatched_statuses") or [])
+    return known - terminal - dispatched
+
+
 def validate_graph(nodes: list[dict], mode: str = "strict_new", config_override: dict | None = None,
-                    timeout: float | None = None) -> dict:
+                    new_ids: list[str] | None = None, timeout: float | None = None) -> dict:
     """Validate a whole proposed build graph. Read-only -- never mutates anything
     (the adapter's own DB preflight lookups are plain SELECTs).
+
+    `new_ids`, if given, restricts strict-new-only per-node checks (risk
+    fields, entry shape) to nodes whose build_id is in this list; every other
+    node in `nodes` is still included in cross-node checks (duplicate id,
+    mixed-project, dependency/cycle) but checked leniently
+    (compat_existing-shaped) at the per-node level. Omit it (None) to keep
+    the original all-nodes-are-new behaviour.
 
     Returns {"ok": bool, "errors": [...], "warnings": [...]}.
     """
     payload = {"op": "validate_graph", "mode": mode, "nodes": nodes}
     if config_override is not None:
         payload["config"] = config_override
+    if new_ids is not None:
+        payload["new_ids"] = list(new_ids)
     return _invoke(payload, timeout=timeout)
 
 
@@ -177,5 +215,27 @@ def preflight_schedule_move(schedule_path: str, timeout: float | None = None) ->
     """
     return _invoke(
         {"op": "preflight", "preflight_op": "schedule_move", "schedule_path": schedule_path},
+        timeout=timeout,
+    )
+
+
+def preflight_spec_validate(build_id: str, spec_markdown: str, spec_path: str, mode: str = "compat_existing",
+                             timeout: float | None = None) -> dict:
+    """Validate one spec's frontmatter/identity/tier/risk-field shape in
+    isolation (no graph/DB context) -- the same check `validate_build_graph`
+    runs per-node, exposed standalone so a spec rewrite can be checked
+    without needing the whole schedule graph. Read-only.
+
+    Returns {"ok": bool, "errors": [...]}.
+    """
+    return _invoke(
+        {
+            "op": "preflight",
+            "preflight_op": "spec_validate",
+            "build_id": build_id,
+            "spec_markdown": spec_markdown,
+            "spec_path": spec_path,
+            "mode": mode,
+        },
         timeout=timeout,
     )

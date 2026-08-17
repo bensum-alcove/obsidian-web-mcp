@@ -135,6 +135,60 @@ def test_record_failure_never_raises_and_increments_failed_metric(tmp_path, monk
     assert after == before + 1
 
 
+def test_emit_failure_after_handler_already_open_is_counted_failed_not_recorded(tmp_path, monkeypatch):
+    """codex-review-phase2-write-integrity MEDIUM finding: stdlib logging
+    handlers can swallow a write error internally (via the default
+    handleError) so `_events_logger.info(line)` returns normally even though
+    nothing was written -- record() used to unconditionally count that as
+    "recorded". Force a real emit-time failure (handler already open, then
+    its underlying stream is closed from under it) and confirm it's now
+    counted as "failed", never "recorded".
+    """
+    monkeypatch.setenv("VAULT_MUTATION_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    # First call opens the handler successfully.
+    ml.record(ml.MutationEvent(tool="vault_write", path="a.md", operation="create", result="success"))
+    recorded_before = ml.health_metrics()["recorded"]
+    failed_before = ml.health_metrics()["failed"]
+
+    # Sabotage the already-open handler's stream so the NEXT emit fails --
+    # this is exactly the "handler that follows logging's error-swallowing
+    # behavior during emit" scenario from the review.
+    handler = ml._events_logger.handlers[0]
+    handler.stream.close()
+
+    ml.record(ml.MutationEvent(tool="vault_write", path="b.md", operation="create", result="success"))
+
+    metrics = ml.health_metrics()
+    assert metrics["failed"] == failed_before + 1
+    assert metrics["recorded"] == recorded_before  # NOT incremented for the failed emit
+
+    # And the failed event must not silently appear as if it landed.
+    events = ml.query_events(ledger_dir=tmp_path / "ledger")
+    assert all(e.get("path") != "b.md" for e in events)
+
+    # The handler's stream is now deliberately closed -- discard it directly
+    # (rather than via handler.close(), which would itself raise trying to
+    # flush a closed stream) so the shared autouse teardown fixture doesn't
+    # choke on it.
+    ml._events_logger.removeHandler(handler)
+    ml._configured_path = None
+
+
+def test_strict_handler_reraises_instead_of_swallowing():
+    """Unit-level proof of the mechanism: _StrictRotatingFileHandler's
+    handleError must re-raise rather than the stdlib default (print to
+    stderr and continue)."""
+    import logging
+
+    handler = ml._StrictRotatingFileHandler.__new__(ml._StrictRotatingFileHandler)
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        with pytest.raises(ValueError):
+            handler.handleError(logging.makeLogRecord({}))
+
+
 # --------------------------------------------------------------------------
 # Integration through vault.py: write_file_atomic / move_path / delete_path
 # --------------------------------------------------------------------------
@@ -169,6 +223,9 @@ def test_noop_write_with_stale_revision_still_succeeds_and_is_ledgered(vault_dir
     assert events[0]["old_hash"] == events[0]["new_hash"] == meta["revision"]
 
 
+_VALID_OPERATIONS = {"create", "update", "delete", "move"}
+
+
 def test_rejected_write_via_write_contract_gate_is_ledgered(vault_dir, monkeypatch):
     monkeypatch.setenv("VAULT_WRITE_CONTRACT_MODE", "enforce")
     with pytest.raises(ValueError):
@@ -176,6 +233,11 @@ def test_rejected_write_via_write_contract_gate_is_ledgered(vault_dir, monkeypat
     events = ml.query_events(ledger_dir=_ledger_dir(vault_dir), tool="vault_write", path_prefix="bad:name.md")
     assert events[0]["result"] == "reject"
     assert events[0]["code"] == "write-contract-rejected"
+    # codex-review-phase2-write-integrity MEDIUM: a rejected write must be
+    # classified as the operation it would have been (create, since
+    # bad:name.md doesn't exist), never the undeclared "write".
+    assert events[0]["operation"] in _VALID_OPERATIONS
+    assert events[0]["operation"] == "create"
 
 
 def test_content_size_limit_rejection_is_ledgered(vault_dir, monkeypatch):
@@ -185,6 +247,7 @@ def test_content_size_limit_rejection_is_ledgered(vault_dir, monkeypatch):
     events = ml.query_events(ledger_dir=_ledger_dir(vault_dir), tool="vault_write", path_prefix="too-big.md")
     assert events[0]["result"] == "reject"
     assert events[0]["code"] == "ValueError"
+    assert events[0]["operation"] in _VALID_OPERATIONS
 
 
 def test_conflict_on_write_is_ledgered(vault_dir):
@@ -193,6 +256,21 @@ def test_conflict_on_write_is_ledgered(vault_dir):
     events = ml.query_events(ledger_dir=_ledger_dir(vault_dir), tool="vault_write", path_prefix="test-note.md", result="conflict")
     assert events
     assert events[0]["code"] == "revision-conflict"
+    # test-note.md already exists, so a conflicted guarded write on it is
+    # classified "update", never the undeclared "write".
+    assert events[0]["operation"] == "update"
+
+
+def test_rejected_write_of_existing_file_is_classified_update_not_write(vault_dir, monkeypatch):
+    """Same enum-consistency guarantee, but for a REJECT against a file that
+    already exists (previously this and the create case above were
+    indistinguishable -- both emitted the invalid "write")."""
+    monkeypatch.setattr("obsidian_vault_mcp.config.MAX_CONTENT_SIZE", 1)
+    with pytest.raises(ValueError):
+        write_file_atomic("test-note.md", "hello", tool="vault_write")
+    events = ml.query_events(ledger_dir=_ledger_dir(vault_dir), tool="vault_write", path_prefix="test-note.md", result="reject")
+    assert events
+    assert events[0]["operation"] == "update"
 
 
 def test_move_success_event(vault_dir):

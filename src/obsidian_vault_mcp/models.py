@@ -673,7 +673,9 @@ class BOValidateBuildGraphInput(BaseModel):
 
 
 class BOCreateBuildInput(BaseModel):
-    """Structured single-build create."""
+    """Structured single-build create. Always validated strict_new -- compat_existing
+    is a read-only audit mode and is deliberately not selectable on a create/mutation path
+    (codex-review-bo-authoring-contract-v1, B3)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -681,11 +683,11 @@ class BOCreateBuildInput(BaseModel):
     schedule_path: str = Field(
         ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
     )
-    mode: Literal["strict_new", "compat_existing"] = Field(default="strict_new")
 
 
 class BOCreateChainInput(BaseModel):
-    """Structured same-project multi-build chain create, including forward references."""
+    """Structured same-project multi-build chain create, including forward references.
+    Always validated strict_new -- see BOCreateBuildInput."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -693,7 +695,6 @@ class BOCreateChainInput(BaseModel):
     schedule_path: str = Field(
         ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
     )
-    mode: Literal["strict_new", "compat_existing"] = Field(default="strict_new")
 
 
 class VaultReadSmartInput(BaseModel):

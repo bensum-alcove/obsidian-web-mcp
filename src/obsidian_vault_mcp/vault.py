@@ -1,5 +1,6 @@
 """Core filesystem operations for the Obsidian vault."""
 
+import contextlib
 import fnmatch
 import hashlib
 import logging
@@ -14,6 +15,7 @@ from pathlib import Path
 from . import bo_guard
 from . import config
 from . import mutation_ledger
+from . import vault_lock
 from .bo_guard import BOGuardError
 from .write_contract import (
     PathMutationContext,
@@ -214,26 +216,35 @@ def read_file(relative_path: str) -> tuple[str, dict]:
     Metadata keys: size (int), modified (ISO str), created (ISO str), revision
     (str). Pass revision back as expected_revision to a mutation tool to
     guard against overwriting changes made since this read.
+
+    content and metadata["revision"] are derived from one single raw-bytes
+    read on one open file descriptor -- never two separate filesystem calls.
+    A writer landing between a stat()/read_text() pair and a later
+    read_bytes() call used to be able to produce an incoherent (old content,
+    new revision) pair; there is no second syscall here for a writer to land
+    between.
     """
     path = resolve_vault_path(relative_path)
 
-    if not path.is_file():
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except (FileNotFoundError, NotADirectoryError):
         raise FileNotFoundError(f"Not a file: {relative_path}")
 
-    stat = path.stat()
-    content = path.read_text(encoding="utf-8")
+    with os.fdopen(fd, "rb") as f:
+        file_stat = os.fstat(f.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise FileNotFoundError(f"Not a file: {relative_path}")
+        raw = f.read()
 
-    # Revision is hashed from raw bytes, not the (possibly newline-normalised)
-    # text above, so it always matches what write_file_atomic checks against.
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        raw = content.encode("utf-8")
+    content = raw.decode("utf-8")
 
     metadata = {
-        "size": stat.st_size,
-        "modified": _iso_timestamp(stat.st_mtime),
-        "created": _iso_timestamp(stat.st_birthtime if hasattr(stat, "st_birthtime") else stat.st_ctime),
+        "size": file_stat.st_size,
+        "modified": _iso_timestamp(file_stat.st_mtime),
+        "created": _iso_timestamp(
+            file_stat.st_birthtime if hasattr(file_stat, "st_birthtime") else file_stat.st_ctime
+        ),
         "revision": compute_revision(raw),
     }
 
@@ -263,8 +274,13 @@ def write_file_atomic(
     logs, in "shadow" mode) before any temp file is created.
 
     The revision check and the write itself happen inside one short-lived
-    per-path lock, so no other write_file_atomic call for the same path can
-    interleave between the check and the replace.
+    per-path lock (both an in-process threading.Lock and a process-shared
+    flock -- see vault_lock.py), so no other write_file_atomic call for the
+    same path, and no other cooperating process, can interleave between the
+    check and the replace. A second revision check immediately before the
+    final os.replace() closes the remaining TOCTOU window against a writer
+    that raced past the first check (see vault_lock.py's documented trust
+    boundary for exactly which writers this does and doesn't cover).
 
     Every call also emits exactly one mutation-ledger event once the final
     result (success/reject/conflict) is known -- see mutation_ledger.py.
@@ -274,6 +290,7 @@ def write_file_atomic(
     """
     encoded = content.encode("utf-8")
     old_hash_for_ledger: str | None = None
+    intended_operation = "update"  # refined below once file existence is known; never the invalid "write"
     try:
         if len(encoded) > config.MAX_CONTENT_SIZE:
             raise ValueError(
@@ -282,12 +299,13 @@ def write_file_atomic(
 
         path = resolve_vault_path(relative_path)
 
-        with _lock_for_path(path):
+        with _lock_for_path(path), vault_lock.path_lock(path):
             try:
                 current_bytes = path.read_bytes()
             except FileNotFoundError:
                 current_bytes = None
             old_hash_for_ledger = compute_revision(current_bytes)
+            intended_operation = "create" if current_bytes is None else "update"
 
             _check_revision(relative_path, tool, expected_revision, current_bytes, encoded)
 
@@ -333,6 +351,23 @@ def write_file_atomic(
                             is_new = True
                     os.fchmod(f.fileno(), original_mode)
                     os.fsync(f.fileno())
+
+                    # Final on-disk revalidation at the activation boundary: this
+                    # is the exact moment the Phase 2 review's probe injected an
+                    # external write ("paused immediately before os.replace,
+                    # wrote external ... then resumed"). Re-reading and
+                    # re-checking here, still inside the same held locks, turns
+                    # that race into an explicit RevisionConflictError instead of
+                    # a silent overwrite for any caller that opted in via
+                    # expected_revision (a no-op for legacy unprotected callers,
+                    # exactly like the first _check_revision call).
+                    try:
+                        revalidate_bytes = path.read_bytes()
+                    except FileNotFoundError:
+                        revalidate_bytes = None
+                    intended_operation = "create" if revalidate_bytes is None else "update"
+                    _check_revision(relative_path, tool, expected_revision, revalidate_bytes, encoded)
+
                 os.replace(tmp_path, path)
             except BaseException:
                 # Clean up the temp file on any failure
@@ -357,7 +392,7 @@ def write_file_atomic(
         mutation_ledger.record(mutation_ledger.MutationEvent(
             tool=tool,
             path=relative_path,
-            operation="write",
+            operation=intended_operation,
             result="conflict",
             old_hash=old_hash_for_ledger,
             code="revision-conflict",
@@ -374,7 +409,7 @@ def write_file_atomic(
         mutation_ledger.record(mutation_ledger.MutationEvent(
             tool=tool,
             path=relative_path,
-            operation="write",
+            operation=intended_operation,
             result="reject",
             old_hash=old_hash_for_ledger,
             code=code,
@@ -399,14 +434,35 @@ def move_path(
     directory has no single content hash to compare -- and raises ValueError
     if given for a directory source.
 
+    Source AND destination are locked together (in-process lock plus the
+    process-shared flock from vault_lock.py) for the whole operation, in a
+    deterministic order (sorted by resolved path) so two concurrent movers
+    that both touch the same pair of paths can never deadlock. Because the
+    destination is locked for the *entire* operation -- not just checked once
+    up front -- two concurrent moves to the same destination are strictly
+    serialised: whichever acquires the destination lock first completes and
+    the other observes the now-existing destination and fails explicitly,
+    with its own source left untouched. Path-contract validation runs against
+    both source and destination.
+
     Emits exactly one mutation-ledger event once the final result is known.
     """
     src = resolve_vault_path(source)
     dst = resolve_vault_path(destination)
     old_hash_for_ledger: str | None = None
 
+    # Deterministic lock ordering across the (up to) two distinct paths
+    # involved avoids deadlock between two movers that both need locks on an
+    # overlapping pair of paths (e.g. two sources racing to the same
+    # destination) -- see module docstring / vault_lock.py.
+    lock_targets = sorted({src, dst}, key=str)
+
     try:
-        with _lock_for_path(src):
+        with contextlib.ExitStack() as stack:
+            for target in lock_targets:
+                stack.enter_context(_lock_for_path(target))
+                stack.enter_context(vault_lock.path_lock(target))
+
             if not src.exists():
                 raise FileNotFoundError(f"Source does not exist: {source}")
 
@@ -428,6 +484,15 @@ def move_path(
 
             if create_dirs:
                 dst.parent.mkdir(parents=True, exist_ok=True)
+
+            # Final destination-existence recheck at the activation boundary,
+            # immediately before the filesystem mutation. Both locks for `dst`
+            # have been held continuously since before the first existence
+            # check above, so this is defence-in-depth against any code path
+            # (create_dirs, symlink races) that could otherwise have
+            # materialised something at `dst` in between.
+            if dst.exists():
+                raise FileExistsError(f"Destination already exists: {destination}")
 
             shutil.move(str(src), str(dst))
 
@@ -493,7 +558,7 @@ def delete_path(
     old_hash_for_ledger: str | None = None
 
     try:
-        with _lock_for_path(path):
+        with _lock_for_path(path), vault_lock.path_lock(path):
             if not path.exists():
                 raise FileNotFoundError(f"Path does not exist: {relative_path}")
 
