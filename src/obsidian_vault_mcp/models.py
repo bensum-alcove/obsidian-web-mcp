@@ -605,6 +605,97 @@ class VaultAnswerContextInput(BaseModel):
     )
 
 
+class BOBuildSpecInput(BaseModel):
+    """One typed Build Orchestrator build spec -- never raw schedule YAML."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    build_id: str = Field(
+        ...,
+        description="Lowercase-hyphenated build id; must match the generated spec filename stem",
+        min_length=1,
+        max_length=200,
+    )
+    title: str = Field(..., description="Human-readable build title", min_length=1, max_length=300)
+    body_markdown: str = Field(
+        ...,
+        description=(
+            "Spec body markdown. The mandatory /tmp/cc-summary-{build_id}.txt completion instruction is "
+            "auto-appended if not already present."
+        ),
+        min_length=1,
+        max_length=MAX_CONTENT_SIZE,
+    )
+    description: str | None = Field(default=None, description="Schedule entry description", max_length=1000)
+    run_when: str | None = Field(
+        default=None, description="Schedule entry run_when, e.g. 'no deps — dispatch immediately'", max_length=300
+    )
+    tier: str = Field(..., description="One of: simple, lean, dev, critical", max_length=50)
+    project: str = Field(
+        ...,
+        description=(
+            "Execution project name -- must have a config.yaml projects: entry with a resolvable repo_dir. "
+            "Kept distinct from any 'program' label; never guessed."
+        ),
+        max_length=200,
+    )
+    program: str | None = Field(
+        default=None,
+        description="Optional program metadata (e.g. a multi-repo initiative name); never used as the execution project",
+        max_length=200,
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Build ids this build depends on -- may reference another build in the same request (forward reference) or an existing live build",
+    )
+    risk_domain: str | None = Field(default=None, max_length=100)
+    blast_radius: str | None = Field(default=None, max_length=100)
+    reversible: bool | None = Field(default=None)
+    shadowable: bool | None = Field(default=None)
+    engine: str | None = Field(default=None, description="One of: auto, cc, codex", max_length=20)
+    tags: list[str] | None = Field(default=None)
+    status: str = Field(default="ready", description="'ready' (dispatch-eligible) or 'proposed'", max_length=20)
+    completion_contract: dict | None = Field(default=None)
+    notes: str | None = Field(default=None, max_length=2000)
+    created: str | None = Field(default=None, max_length=50)
+
+
+class BOValidateBuildGraphInput(BaseModel):
+    """Read-only preflight: validate a proposed BO build graph, no writes ever."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    builds: list[BOBuildSpecInput] = Field(..., min_length=1, max_length=MAX_BATCH_SIZE)
+    schedule_path: str = Field(
+        ..., description="Vault-relative path to the schedule this graph would be appended to", min_length=1, max_length=500
+    )
+    mode: Literal["strict_new", "compat_existing"] = Field(default="strict_new")
+
+
+class BOCreateBuildInput(BaseModel):
+    """Structured single-build create."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    build: BOBuildSpecInput
+    schedule_path: str = Field(
+        ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
+    )
+    mode: Literal["strict_new", "compat_existing"] = Field(default="strict_new")
+
+
+class BOCreateChainInput(BaseModel):
+    """Structured same-project multi-build chain create, including forward references."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    builds: list[BOBuildSpecInput] = Field(..., min_length=1, max_length=MAX_BATCH_SIZE)
+    schedule_path: str = Field(
+        ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
+    )
+    mode: Literal["strict_new", "compat_existing"] = Field(default="strict_new")
+
+
 class VaultReadSmartInput(BaseModel):
     """Read only the relevant sections of a large file by semantic similarity."""
 

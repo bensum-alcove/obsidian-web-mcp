@@ -11,8 +11,10 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import bo_guard
 from . import config
 from . import mutation_ledger
+from .bo_guard import BOGuardError
 from .write_contract import (
     PathMutationContext,
     WriteContext,
@@ -289,16 +291,20 @@ def write_file_atomic(
 
             _check_revision(relative_path, tool, expected_revision, current_bytes, encoded)
 
-            if _write_contract_mode() != "off":
+            if _write_contract_mode() != "off" or bo_guard.get_mode() != "off":
                 old_content_for_gate = None
                 if current_bytes is not None:
                     try:
                         old_content_for_gate = current_bytes.decode("utf-8")
                     except UnicodeDecodeError:
                         old_content_for_gate = None
-                _enforce_write_contract(
-                    WriteContext(path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool)
+                write_ctx = WriteContext(
+                    path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool
                 )
+                if _write_contract_mode() != "off":
+                    _enforce_write_contract(write_ctx)
+                if bo_guard.get_mode() != "off":
+                    bo_guard.enforce(write_ctx)
 
             try:
                 original_mode = stat.S_IMODE(path.stat().st_mode)
@@ -360,7 +366,11 @@ def write_file_atomic(
         ))
         raise
     except Exception as e:
-        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        code = (
+            "write-contract-rejected" if isinstance(e, WriteContractError)
+            else "bo-guard-rejected" if isinstance(e, BOGuardError)
+            else type(e).__name__
+        )
         mutation_ledger.record(mutation_ledger.MutationEvent(
             tool=tool,
             path=relative_path,
@@ -410,8 +420,11 @@ def move_path(
             old_hash_for_ledger = compute_revision(current_bytes)
             _check_revision(source, "move", expected_revision, current_bytes)
 
+            move_ctx = PathMutationContext(path=source, operation="move", destination=destination)
             if _write_contract_mode() != "off":
-                _enforce_path_mutation(PathMutationContext(path=source, operation="move", destination=destination))
+                _enforce_path_mutation(move_ctx)
+            if bo_guard.get_mode() != "off":
+                bo_guard.enforce_path_mutation(move_ctx)
 
             if create_dirs:
                 dst.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +457,11 @@ def move_path(
         ))
         raise
     except Exception as e:
-        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        code = (
+            "write-contract-rejected" if isinstance(e, WriteContractError)
+            else "bo-guard-rejected" if isinstance(e, BOGuardError)
+            else type(e).__name__
+        )
         mutation_ledger.record(mutation_ledger.MutationEvent(
             tool="vault_move",
             path=source,
@@ -490,8 +507,11 @@ def delete_path(
             old_hash_for_ledger = compute_revision(current_bytes)
             _check_revision(relative_path, "delete", expected_revision, current_bytes)
 
+            delete_ctx = PathMutationContext(path=relative_path, operation="delete")
             if _write_contract_mode() != "off":
-                _enforce_path_mutation(PathMutationContext(path=relative_path, operation="delete"))
+                _enforce_path_mutation(delete_ctx)
+            if bo_guard.get_mode() != "off":
+                bo_guard.enforce_path_mutation(delete_ctx)
 
             trash_dir = config.VAULT_PATH.resolve() / ".trash"
             trash_dir.mkdir(exist_ok=True)
@@ -529,7 +549,11 @@ def delete_path(
         ))
         raise
     except Exception as e:
-        code = "write-contract-rejected" if isinstance(e, WriteContractError) else type(e).__name__
+        code = (
+            "write-contract-rejected" if isinstance(e, WriteContractError)
+            else "bo-guard-rejected" if isinstance(e, BOGuardError)
+            else type(e).__name__
+        )
         mutation_ledger.record(mutation_ledger.MutationEvent(
             tool="vault_delete",
             path=relative_path,

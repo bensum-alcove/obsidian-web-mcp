@@ -92,6 +92,11 @@ from .tools.semantic_search import SEMANTIC_AVAILABLE, startup_then_periodic, va
 from .tools.context import vault_client_context as _vault_client_context
 from .tools.entity import vault_entity as _vault_entity
 from .tools.query import vault_query as _vault_query, vault_answer_context as _vault_answer_context
+from .tools.build_orchestrator import (
+    bo_validate_build_graph as _bo_validate_build_graph,
+    bo_create_build as _bo_create_build,
+    bo_create_chain as _bo_create_chain,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -117,6 +122,9 @@ from .models import (
     VaultEntityInput,
     VaultQueryInput,
     VaultAnswerContextInput,
+    BOValidateBuildGraphInput,
+    BOCreateBuildInput,
+    BOCreateChainInput,
 )
 
 
@@ -583,6 +591,58 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
     """Brain-first pre-flight bundle: vault_query + hot.md + warnings."""
     inp = VaultAnswerContextInput(question=question, top_k=top_k)
     return _vault_answer_context(inp.question, inp.top_k)
+
+
+@mcp.tool(
+    name="bo_validate_build_graph",
+    description=(
+        "Read-only Build Orchestrator preflight: validate a proposed build graph (one or more typed build "
+        "specs plus the existing schedule they would be appended to) against the authoritative BO authoring "
+        "contract. Never writes anything. Returns ok/errors/warnings plus a canonicalized graph (resolved "
+        "spec paths, execution project, dependency edges) so a caller can see exactly what would be created "
+        "before committing to bo_create_build/bo_create_chain."
+    ),
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
+    """Validate a proposed Build Orchestrator build graph without writing anything."""
+    inp = BOValidateBuildGraphInput(builds=builds, schedule_path=schedule_path, mode=mode)
+    return _bo_validate_build_graph([b.model_dump() for b in inp.builds], inp.schedule_path, inp.mode)
+
+
+@mcp.tool(
+    name="bo_create_build",
+    description=(
+        "Create one new Build Orchestrator build: validates the full proposed graph against the "
+        "authoritative BO authoring contract, writes the new spec file, then appends its schedule entry to "
+        "schedule_path (an EXISTING schedule file -- this tool never creates a new schedule file) as the "
+        "activation boundary. Writes nothing if validation fails. Delegates all BO schema/project/risk/"
+        "dependency rules to the authoring-contract adapter; fails closed (no writes) if that adapter is "
+        "unavailable or reports a mismatched schema version."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def bo_create_build(build: dict, schedule_path: str, mode: str = "strict_new") -> str:
+    """Create one new Build Orchestrator build (spec file + schedule entry)."""
+    inp = BOCreateBuildInput(build=build, schedule_path=schedule_path, mode=mode)
+    return _bo_create_build(inp.build.model_dump(), inp.schedule_path, inp.mode)
+
+
+@mcp.tool(
+    name="bo_create_chain",
+    description=(
+        "Create a same-project multi-build chain in Build Orchestrator: validates the WHOLE proposed graph "
+        "at once (forward references -- a later build's depends_on may name an earlier build in this same "
+        "request -- are allowed) against the authoring contract, writes every new spec file, then appends "
+        "all schedule entries to schedule_path (an EXISTING schedule file) in one final write as the "
+        "activation boundary. Writes nothing if validation fails for any build in the chain."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def bo_create_chain(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
+    """Create a multi-build chain (specs + schedule entries) in one activation."""
+    inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path, mode=mode)
+    return _bo_create_chain([b.model_dump() for b in inp.builds], inp.schedule_path, inp.mode)
 
 
 if SEMANTIC_AVAILABLE:

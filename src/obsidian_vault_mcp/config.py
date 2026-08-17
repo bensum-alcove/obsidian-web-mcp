@@ -96,6 +96,26 @@ VAULT_MUTATION_LEDGER_DIR = os.environ.get("VAULT_MUTATION_LEDGER_DIR", "")
 VAULT_MUTATION_LEDGER_MAX_BYTES = int(os.environ.get("VAULT_MUTATION_LEDGER_MAX_BYTES", "5000000"))
 VAULT_MUTATION_LEDGER_BACKUP_COUNT = int(os.environ.get("VAULT_MUTATION_LEDGER_BACKUP_COUNT", "10"))
 
+# Build Orchestrator authoring contract adapter (vault-bo-authoring-mcp-v1). The
+# bo_validate_build_graph/bo_create_build/bo_create_chain tools invoke this CLI as
+# a subprocess (shell=False, JSON stdin/stdout) rather than re-encoding BO schema
+# rules in this repo -- see bo_contract.py. Absent/wrong-version/failing adapter
+# means those tools fail closed (no schedule activation), by design.
+BO_AUTHORING_CONTRACT_PATH = os.environ.get(
+    "BO_AUTHORING_CONTRACT_PATH",
+    os.path.expanduser("~/build-orchestrator/authoring_contract.py"),
+)
+BO_AUTHORING_CONTRACT_PYTHON = os.environ.get("BO_AUTHORING_CONTRACT_PYTHON", "python3")
+BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS = float(os.environ.get("BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS", "15"))
+
+# Build Orchestrator path-mutation guard mode: "off" | "shadow" (default) | "enforce".
+# Independent of VAULT_WRITE_CONTRACT_MODE above -- this guard is specific to
+# Personal/Build Orchestrator/specs/ and Personal/Build Orchestrator/schedules/ and
+# is deployed shadow-only in vault-bo-authoring-mcp-v1 per its spec (enforcement is
+# a separate, later build gated on independent Codex review). See bo_guard.py.
+# Fastest revert path: env var edit + supervisorctl restart, no git operation needed.
+BO_PATH_GUARD_MODE = os.environ.get("BO_PATH_GUARD_MODE", "shadow").strip().lower()
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))
