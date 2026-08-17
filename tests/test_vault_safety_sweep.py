@@ -111,3 +111,74 @@ def test_content_repair_refuses_concurrent_mode_change(tmp_path):
             target, opened, original, repaired, 0o600, {}
         )
     assert stat.S_IMODE(target.stat().st_mode) == 0o604
+
+
+def test_atomic_replace_serializes_against_concurrent_mcp_lock_holder(tmp_path, monkeypatch):
+    """vault-integrity-and-bo-authority-remediation-v2: a real subprocess
+    holding vault_lock.path_lock for the exact target (standing in for the
+    live Vault MCP server's own write_file_atomic) must serialize this
+    script's content repair -- it must wait, not race past it."""
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    sweep = _load()
+    lock_dir = tmp_path / "locks"
+    monkeypatch.setenv("VAULT_MUTATION_LOCK_DIR", str(lock_dir))
+
+    target = tmp_path / "damaged.md"
+    original = b"---\nupdated: value---\nbody\n"
+    repaired = b"---\nupdated: value\n---\nbody\n"
+    target.write_bytes(original)
+    os.chmod(target, 0o604)
+    opened = target.stat()
+
+    ready_marker = tmp_path / "holder-ready"
+    release_marker = tmp_path / "holder-release"
+    src_dir = str(Path(__file__).resolve().parent.parent / "src")
+
+    script = tmp_path / "mcp_holder.py"
+    script.write_text(textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {src_dir!r})
+        import time
+        from pathlib import Path
+        from obsidian_vault_mcp import vault_lock
+
+        target = Path({str(target.resolve())!r})
+        ready = Path({str(ready_marker)!r})
+        release = Path({str(release_marker)!r})
+
+        with vault_lock.path_lock(target):
+            ready.write_text("ready")
+            for _ in range(500):
+                if release.exists():
+                    break
+                time.sleep(0.01)
+            time.sleep(0.2)
+    """))
+
+    full_env = dict(os.environ)
+    full_env["VAULT_MUTATION_LOCK_DIR"] = str(lock_dir)
+    full_env["PYTHONPATH"] = src_dir
+
+    proc = subprocess.Popen([sys.executable, str(script)], env=full_env)
+    try:
+        for _ in range(500):
+            if ready_marker.exists():
+                break
+            time.sleep(0.01)
+        else:
+            proc.kill()
+            pytest.fail("MCP-holder subprocess never acquired the lock")
+
+        start = time.monotonic()
+        release_marker.write_text("go")
+        sweep._atomic_replace_if_unchanged(target, opened, original, repaired, 0o604, {})
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.15
+    finally:
+        proc.wait(timeout=10)
+
+    assert target.read_bytes() == repaired

@@ -32,6 +32,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from obsidian_vault_mcp import config  # noqa: E402
+from obsidian_vault_mcp import vault_lock  # noqa: E402
 from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     update_frontmatter_field,
@@ -834,7 +835,12 @@ def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tu
         backup_path = backup_dir / rel
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         backup_path.write_text(original_content, encoding="utf-8")
-        path.write_text(new_content, encoding="utf-8")
+        # Shared cross-process mutation authority (vault-integrity-and-bo-
+        # authority-remediation-v2) -- serializes against a concurrent
+        # Vault MCP write to the same resolved path. Low risk as currently
+        # deployed (cron invocation never passes --autofix), migrated
+        # anyway rather than left ambiguous.
+        vault_lock.atomic_write(path.resolve(), new_content.encode("utf-8"))
         fixed_lines.extend(file_fixed)
 
     return fixed_lines, (backup_dir if fixed_lines else None)
@@ -866,8 +872,7 @@ def run(autofix: bool = False) -> Path:
     )
 
     out_path = report_path_for(VAULT_PATH, VAULT_NAME, now)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(report, encoding="utf-8")
+    vault_lock.atomic_write(out_path.resolve(), report.encode("utf-8"))
 
     entities_path = write_entities_json(VAULT_PATH, VAULT_NAME, now, entities)
 

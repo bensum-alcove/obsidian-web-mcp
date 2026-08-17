@@ -51,6 +51,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from obsidian_vault_mcp import config  # noqa: E402
+from obsidian_vault_mcp import vault_lock  # noqa: E402
 from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     parse_frontmatter,
@@ -612,7 +613,10 @@ def run(dry_run: bool = False) -> dict:
     # own "those three files are never modified" claim and the precision-fix
     # spec's hard constraint, so it's gone — findings live in the report only.
     if not dry_run:
-        REPORT_PATH.write_text(new_report, encoding="utf-8")
+        # Shared cross-process mutation authority (vault-integrity-and-bo-
+        # authority-remediation-v2) -- serializes against a concurrent
+        # Vault MCP write to the same resolved path.
+        vault_lock.atomic_write(REPORT_PATH.resolve(), new_report.encode("utf-8"))
 
     summary = {
         "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

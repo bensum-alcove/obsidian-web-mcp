@@ -59,6 +59,12 @@ import time
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from pathlib import Path
+
+_DEV_SRC = "/home/ben_sum/obsidian-web-mcp/src"
+if _DEV_SRC not in sys.path:
+    sys.path.insert(0, _DEV_SRC)
+from obsidian_vault_mcp import vault_lock  # noqa: E402
 
 VAULT_ROOT_DEFAULT = "/home/ben_sum/vaults/bs-brain"
 
@@ -128,8 +134,12 @@ def read_file(path):
 
 
 def write_file(path, text):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    # Shared cross-process mutation authority (vault-integrity-and-bo-
+    # authority-remediation-v2) -- the same lock/atomic-replace primitive
+    # the live Vault MCP server's own write_file_atomic uses, so a
+    # concurrent MCP write to the same resolved path can no longer be
+    # silently overwritten by this --apply run (or vice versa).
+    vault_lock.atomic_write(Path(path).resolve(), text.encode("utf-8"))
 
 
 def frontmatter_and_body(text):
@@ -610,15 +620,16 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
 
     if archive_entries:
         archive_path = os.path.join(vault_root, ARCHIVE_DIR, f"{today_str[:7]}.md")
-        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
         header = f"## Rotated {today_str} from {rel_path}\n\n"
         pieces = [
             f"{prefix} {today_str}\n{chunk}" if prefix else chunk
             for prefix, chunk in archive_entries
         ]
         chunk_text = header + "\n".join(pieces) + "\n\n"
-        with open(archive_path, "a", encoding="utf-8") as f:
-            f.write(chunk_text)
+        # Shared cross-process mutation authority -- read-append-replace
+        # under the same lock atomic_write uses, so two concurrent
+        # appenders (or a concurrent MCP write) can never interleave bytes.
+        vault_lock.atomic_append(Path(archive_path).resolve(), chunk_text.encode("utf-8"))
         result["report_lines"].append(
             f"Archived {len(archive_entries)} bullet block(s) to {os.path.relpath(archive_path, vault_root)}"
         )

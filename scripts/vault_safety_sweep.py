@@ -19,6 +19,7 @@ SRC_ROOT = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from obsidian_vault_mcp import vault_lock  # noqa: E402
 from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     parse_frontmatter,
@@ -102,41 +103,51 @@ def _atomic_replace_if_unchanged(
     mode: int,
     xattrs: dict[str, bytes],
 ) -> str:
-    """Replace only if the scanned regular file still has the same identity."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    current_fd = os.open(path, os.O_RDONLY | nofollow)
-    try:
-        current = os.fstat(current_fd)
-        current_data = _read_fd(current_fd)
-        if not stat.S_ISREG(current.st_mode) or (
-            current.st_dev,
-            current.st_ino,
-        ) != (original_stat.st_dev, original_stat.st_ino):
-            raise RuntimeError("identity changed before content repair; refused")
-        if current_data != original_data:
-            raise RuntimeError("content changed before content repair; refused")
-        if stat.S_IMODE(current.st_mode) != mode:
-            raise RuntimeError("mode changed before content repair; refused")
-    finally:
-        os.close(current_fd)
+    """Replace only if the scanned regular file still has the same identity.
 
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".vault-safety.tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fchmod(handle.fileno(), mode)
-            for name, value in xattrs.items():
-                os.setxattr(handle.fileno(), name, value)
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
+    The whole check-then-replace sequence runs inside vault_lock.path_lock
+    (vault-integrity-and-bo-authority-remediation-v2) -- the same
+    cross-process mutation authority the live Vault MCP server's own
+    write_file_atomic uses -- so a concurrent MCP write landing between this
+    function's own identity check and its os.replace can no longer race
+    past it. This is on top of, not instead of, the existing dev/inode
+    +content+mode identity check below, which stays unchanged.
+    """
+    with vault_lock.path_lock(path.resolve()):
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(path, os.O_RDONLY | nofollow)
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-    return "committed"
+            current = os.fstat(current_fd)
+            current_data = _read_fd(current_fd)
+            if not stat.S_ISREG(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != (original_stat.st_dev, original_stat.st_ino):
+                raise RuntimeError("identity changed before content repair; refused")
+            if current_data != original_data:
+                raise RuntimeError("content changed before content repair; refused")
+            if stat.S_IMODE(current.st_mode) != mode:
+                raise RuntimeError("mode changed before content repair; refused")
+        finally:
+            os.close(current_fd)
+
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".vault-safety.tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fchmod(handle.fileno(), mode)
+                for name, value in xattrs.items():
+                    os.setxattr(handle.fileno(), name, value)
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        return "committed"
 
 
 def scan_vault(
