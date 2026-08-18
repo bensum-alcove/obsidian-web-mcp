@@ -38,6 +38,16 @@ shared token is not evidence. High-frequency infra nouns (`.wslconfig`,
 `vault_search`, ...) need a second independent corroborating signal beyond
 the noun itself, since they're mentioned in nearly every entry regardless of
 topic. If a match can't state a concrete current truth, it isn't flagged.
+
+Extended 2026-08-18 (vault-infrastructure-state-migration) with a second,
+independent cross-check: `check_canonical_state_alignment()` resolves every
+canonical-state `component_id` literally backtick-quoted in
+infrastructure.md/SYSTEM-FACTS.md against
+`Canonical State/records/` and flags duplicate-authority, missing, or stale
+(>90d unverified) records. Also zero-LLM (exact substring match, no topic
+matching) and report-only — appended as its own dated subsection of
+`contradiction-lint-report.md`, independent of the SYSTEM-FACTS/changelog
+check above.
 """
 from __future__ import annotations
 
@@ -52,6 +62,11 @@ if str(SRC_ROOT) not in sys.path:
 
 from obsidian_vault_mcp import config  # noqa: E402
 from obsidian_vault_mcp import vault_lock  # noqa: E402
+from obsidian_vault_mcp.canonical_state import (  # noqa: E402
+    DuplicateAuthorityError,
+    load_all_records,
+    resolve_current_state,
+)
 from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     parse_frontmatter,
@@ -64,6 +79,7 @@ INFRA_PATH = INFRA_DIR / "infrastructure.md"
 CHANGELOG_PATH = INFRA_DIR / "infrastructure-changelog.md"
 SYSTEM_FACTS_PATH = INFRA_DIR / "SYSTEM-FACTS.md"
 REPORT_PATH = INFRA_DIR / "contradiction-lint-report.md"
+CANONICAL_STATE_RECORDS_DIR = INFRA_DIR / "Canonical State" / "records"
 
 STALE_DAYS = 90
 
@@ -465,6 +481,111 @@ def lint_system_facts(system_facts_text: str, changelog_entries: list[tuple[str 
     }
 
 
+def check_canonical_state_alignment(
+    sources: dict[str, str], records_dir: Path, now: datetime
+) -> list[dict]:
+    """Cross-check derived-layer prose (infrastructure.md, SYSTEM-FACTS.md, ...)
+    against the canonical-state records they cite (build:
+    vault-infrastructure-state-migration).
+
+    Zero-LLM, exact-match only: a component is "referenced" by a source file
+    iff its `component_id` appears literally backtick-quoted (`` `component-id` ``)
+    somewhere in that file's text -- the same convention every pointer this
+    migration added to infrastructure.md/SYSTEM-FACTS.md actually uses. No
+    topic/fuzzy matching, so this can only under-report (an un-backticked or
+    misspelled reference is silently missed), never fabricate a false link.
+
+    For each referenced component, flags:
+      - ``duplicate_authority``: more than one current record claims the id.
+      - ``referenced_but_missing``: the source cites an id with no current
+        (non-superseded) canonical-state record to back it.
+      - ``stale``: a resolving record's own ``verified_at`` is more than
+        ``STALE_DAYS`` old -- the prose points at a record, but the record
+        itself hasn't been re-checked against primary evidence recently.
+
+    Returns an empty list if every reference resolves cleanly (or if no
+    source references any known component_id) -- ``run()`` still records that
+    as an explicit "0 findings" section, not silence, per this migration's
+    "no unexplained current-state conflicts" completion criterion.
+    """
+    records, _load_errors = load_all_records(records_dir)
+    known_ids = sorted({r.component_id for r in records})
+    findings: list[dict] = []
+    for source_name, text in sources.items():
+        for component_id in known_ids:
+            if f"`{component_id}`" not in text:
+                continue
+            try:
+                record = resolve_current_state(component_id, records_dir)
+            except DuplicateAuthorityError as exc:
+                findings.append(
+                    {
+                        "component_id": component_id,
+                        "source": source_name,
+                        "issue": "duplicate_authority",
+                        "detail": str(exc),
+                    }
+                )
+                continue
+            if record is None:
+                findings.append(
+                    {
+                        "component_id": component_id,
+                        "source": source_name,
+                        "issue": "referenced_but_missing",
+                        "detail": (
+                            f"{source_name} references `{component_id}` but no "
+                            "current (non-superseded) canonical-state record resolves"
+                        ),
+                    }
+                )
+                continue
+            if _days_since(record.verified_at[:10], now) > STALE_DAYS:
+                findings.append(
+                    {
+                        "component_id": component_id,
+                        "source": source_name,
+                        "issue": "stale",
+                        "detail": (
+                            f"canonical-state record verified_at={record.verified_at} "
+                            f"is more than {STALE_DAYS}d old"
+                        ),
+                    }
+                )
+    return findings
+
+
+def render_canonical_state_section(findings: list[dict], now: datetime) -> str:
+    lines = [
+        "",
+        f"### Canonical State cross-check (generated {now.strftime('%Y-%m-%d')})",
+        "",
+        "Zero-LLM exact-match check: every canonical-state `component_id` literally "
+        "backtick-quoted in infrastructure.md or SYSTEM-FACTS.md is resolved against "
+        "`Canonical State/records/` and flagged if duplicate, missing, or stale. "
+        "See `scripts/canonical_state_scan.py` for the separate all-records scan "
+        "(covers records regardless of whether prose references them).",
+        "",
+    ]
+    if findings:
+        lines.append(
+            _md_table(
+                ["Component", "Referenced in", "Issue", "Detail"],
+                [
+                    [f["component_id"], f["source"], f["issue"], f["detail"]]
+                    for f in findings
+                ],
+            )
+        )
+    else:
+        lines.append(
+            "No findings -- every canonical-state component referenced by "
+            "infrastructure.md/SYSTEM-FACTS.md resolves to exactly one current, "
+            "recently-verified record."
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _md_table(headers: list[str], rows: list[list[str]]) -> str:
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
     for row in rows:
@@ -596,10 +717,18 @@ def run(dry_run: bool = False) -> dict:
 
     changelog_text = CHANGELOG_PATH.read_text(encoding="utf-8", errors="replace")
     system_facts_text = SYSTEM_FACTS_PATH.read_text(encoding="utf-8", errors="replace")
+    infra_text = INFRA_PATH.read_text(encoding="utf-8", errors="replace")
     changelog_entries = _split_changelog_entries(changelog_text)
 
     result = lint_system_facts(system_facts_text, changelog_entries, now)
-    system_facts_section = render_system_facts_section(result, now)
+    canonical_findings = check_canonical_state_alignment(
+        {"SYSTEM-FACTS.md": system_facts_text, "infrastructure.md": infra_text},
+        CANONICAL_STATE_RECORDS_DIR,
+        now,
+    )
+    system_facts_section = render_system_facts_section(
+        result, now
+    ) + render_canonical_state_section(canonical_findings, now)
 
     existing_report = REPORT_PATH.read_text(encoding="utf-8", errors="replace") if REPORT_PATH.exists() else ""
     new_report = build_report(existing_report, system_facts_section, now)
@@ -623,11 +752,13 @@ def run(dry_run: bool = False) -> dict:
         "contradicted": n_contra,
         "stale": n_stale,
         "current": len(result["current"]),
+        "canonical_state_findings": len(canonical_findings),
         "report_path": str(REPORT_PATH),
     }
     print(
         f"[contradiction_lint] {summary['generated']} — "
-        f"{n_contra} contradicted, {n_stale} stale, {summary['current']} current "
+        f"{n_contra} contradicted, {n_stale} stale, {summary['current']} current, "
+        f"{len(canonical_findings)} canonical-state cross-check findings "
         f"→ {REPORT_PATH}"
         + (" (dry-run, nothing written)" if dry_run else ""),
         flush=True,
