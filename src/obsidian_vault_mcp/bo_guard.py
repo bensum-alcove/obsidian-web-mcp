@@ -143,6 +143,81 @@ all closed in vault-bo-authoring-guard-remediation-v5, still shadow-only:
   commit is not caught. No stronger guarantee is claimed; the opus-v4
   review itself could not reproduce a committing bypass of this exact
   mechanism either (it required monkeypatching internals to force one).
+
+opus-review-bo-authoring-contract-v5 (2026-08-18) found one further BLOCKER
+and three further HIGHs against the real adapter and the real deployed
+schedule corpus (v5's remediation had only been tested against synthetic
+fixtures), plus three MEDIUM/LOW findings, all closed in
+vault-bo-authoring-guard-remediation-v6, still shadow-only:
+
+  - BL5-1 (BLOCKER): this module's own parse_schedule_builds -- a naive
+    whole-body yaml.safe_load -- could not parse 67 of 120 real deployed
+    schedule files (56%) because the real corpus's `>` blockquote
+    program-note line parses as a YAML block-scalar indicator under a
+    whole-body parse. That single defect fails open for un-ingested builds
+    (a graph-breaking spec rewrite could commit) and over-blocks benign
+    edits to DB-bound specs referencing a real-shaped schedule. Removed
+    entirely; schedule content is now always parsed via
+    bo_contract.parse_schedule_document, a thin reference (not a vendored
+    copy -- see bo_contract.py's _schedule_parser) to the BO repo's own
+    contract.parse_schedule_document, the same canonical parser
+    schedule_loader.py/db.py/build_generator.py/project_resolve.py already
+    use. There is now exactly one schedule parser in this whole system.
+  - HI5-1: move_path/delete_path never got the activation-boundary
+    re-enforce() call write_file_atomic already had -- a directory-move's
+    validation enumerates and reads every nested file, but nothing
+    re-checked those files' bytes immediately before the actual
+    shutil.move(), so a concurrent write landing mid-enumeration could land
+    unvalidated, malformed bytes under BO authority. Reproduced 12/12 with
+    real cooperating processes. Both functions now re-run
+    bo_guard.enforce_path_mutation() immediately before their filesystem
+    mutation, matching write_file_atomic's own pattern -- same "narrows,
+    does not provably eliminate" caveat as the race-window note above.
+  - HI5-3: _revalidate_schedule_with_proposed_spec's whole-graph check
+    always resolved live DB state for every sibling node in the referring
+    schedule (there is no JSON-safe way to pass BO's own
+    existing_state_lookup=lambda _bid: None over the adapter's CLI
+    boundary), so ANY terminal/dispatched/duplicate-authority sibling
+    sitting unchanged in the same schedule file could block an otherwise
+    benign edit -- contradicting authoring_contract's own documented
+    semantics for exactly this graph-context use (its
+    whole_graph_errors_for_new_build deliberately disables that lookup).
+    Fixed by filtering the adapter's returned errors client-side: a
+    terminal_id_reuse/duplicate_authority/frozen_contract_mutation finding
+    attributed to a DIFFERENT build_id than the one actually being
+    rewritten is dropped (see _SIBLING_CONTEXT_ONLY_CODES); the same finding
+    attributed to build_id itself, and every other check (mixed-project,
+    duplicate id, unknown dependency, cycles), still applies in full.
+  - MD5-1: _path_mutation_issues lacked the disk-based referring-schedule
+    discovery the rewrite path already had (HI-2b) -- an un-ingested
+    (no DB row) spec already declared in an on-disk schedule could be moved
+    or deleted with no check at all. Now also calls
+    _disk_schedules_referencing for every affected spec path, symmetric
+    with the rewrite path.
+  - LO5-1: _read_vault_text had no vault-root containment check (unlike
+    vault.resolve_vault_path), so a crafted spec_path in a schedule entry
+    could read an arbitrary host file's bytes into the adapter's evaluation
+    payload. Now refuses (returns None) anything that resolves outside the
+    vault root.
+  - LO5-2: write_file_atomic's activation-boundary re-enforce() reused the
+    ORIGINAL write_ctx, whose old_content was captured at the first read --
+    defeating the point of re-checking this path's own old_content a second
+    time. Now rebuilt from the bytes re-read immediately before this second
+    check.
+  - LO5-3: v4-era untracked scratch probe scripts (item11.py, item67.py,
+    mover.py) removed from the live deployed checkout -- confirmed unused
+    (no references anywhere in src/, tests/, scripts/, or pyproject.toml)
+    before deletion.
+
+  Deliberately NOT changed in this build: BO_PATH_GUARD_MODE stays shadow
+  on all three live services; no bulk rewrite of historical schedule/spec
+  authority was performed to make MD5-2's real-corpus report look better
+  (see that report in this build's output log); no Build Orchestrator repo
+  file (authoring_contract.py/schedule_loader.py/build_generator.py) was
+  modified -- BL5-1's fix references contract.py by path, which already had
+  zero repo-internal imports by design, precisely so an external consumer
+  like this one could load it without duplicating its logic or waiting on a
+  BO-repo change.
 """
 
 from __future__ import annotations
@@ -170,6 +245,15 @@ class BOGuardError(ValueError):
 
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
+
+# Error codes produced only by validate_build_graph's existing_state_lookup
+# (live DB state), as opposed to pure graph-shape checks -- see HI5-3's use
+# in _revalidate_schedule_with_proposed_spec. When attributed to a sibling
+# node rather than the build actually being rewritten, these must never
+# block a write for that sibling merely appearing as graph context
+# (authoring_contract.whole_graph_errors_for_new_build treats the same
+# codes the same way, via its own existing_state_lookup=lambda _bid: None).
+_SIBLING_CONTEXT_ONLY_CODES = {"terminal_id_reuse", "duplicate_authority", "frozen_contract_mutation"}
 
 # The authoritative freely-mutable-status set is sourced from the adapter's
 # own op=version vocabulary (known_statuses - terminal_statuses -
@@ -276,25 +360,31 @@ def _errors_to_issues(rule_id: str, errors: list[dict]) -> list[ValidationIssue]
     ]
 
 
-def parse_schedule_builds(content: str) -> list[dict] | None:
-    """Extract the `builds:` list from a schedule file's body.
+def schedule_builds_from_content(content: str, source_name: str = "<schedule>") -> list[dict] | None:
+    """Extract the `builds:` list from a schedule file's body via
+    `bo_contract.parse_schedule_document` -- the one canonical schedule
+    parser (BL5-1, opus-review-bo-authoring-contract-v5). This module
+    previously re-implemented this parse locally
+    (``bo_guard.parse_schedule_builds``, a naive whole-body
+    ``yaml.safe_load``); that second implementation could not parse 67 of
+    120 real deployed schedule files (56%) because the real corpus's `>`
+    blockquote program-note line parses as a YAML block-scalar indicator
+    under a whole-body parse, and disagreed with the canonical parser on the
+    result -- exactly the "two schedule parsers that can drift" failure mode
+    this fix removes.
 
-    Schedule files are frontmatter + a markdown heading + a `builds:` YAML
-    list; the heading line is a harmless YAML comment (`#`), so the body
-    parses directly as YAML -- the same shape authoring_contract's own
-    render_schedule_document produces. Returns None if the body isn't
-    parseable or has no `builds:` list (callers treat that as "cannot
-    evaluate", not as "zero builds").
+    Returns None if the content is malformed (a per-content ValueError from
+    the canonical parser) or has no `builds:` list -- callers treat that as
+    "cannot evaluate", not as "zero builds". Raises BOContractError if the
+    canonical parser module itself is unavailable -- that is a systemic
+    adapter failure, not a per-content one, and callers must fail closed on
+    it rather than silently treating it the same as "no builds".
     """
-    import frontmatter
-    import yaml
-
     try:
-        post = frontmatter.loads(content)
-        body = yaml.safe_load(post.content) or {}
-    except Exception:
+        data = bo_contract.parse_schedule_document(content, source_name=source_name)
+    except ValueError:
         return None
-    builds = body.get("builds") if isinstance(body, dict) else None
+    builds = data.get("builds") if isinstance(data, dict) else None
     return builds if isinstance(builds, list) else None
 
 
@@ -313,11 +403,23 @@ def _read_vault_text(relative_path: str) -> str | None:
     returns None rather than raising for a missing/unreadable/binary file so
     a dangling spec_path reference degrades to "no content to check" instead
     of blowing up the guard.
+
+    Vault-root containment (LO5-1, opus-review-bo-authoring-contract-v5):
+    unlike vault.resolve_vault_path, this function previously had no check
+    that the resolved path stays inside the vault root -- a crafted
+    spec_path in a schedule entry (e.g. "../../../../etc/hostname") would
+    read an arbitrary host file's bytes into the adapter's evaluation
+    payload. Refuses (returns None, same as any other unreadable path) for
+    anything that resolves outside the vault root.
     """
     from . import config
 
     try:
         full = (config.VAULT_PATH / relative_path).resolve()
+        vault_root = config.VAULT_PATH.resolve()
+        if full != vault_root and not str(full).startswith(str(vault_root) + os.sep):
+            logger.warning("bo-guard refused to read out-of-vault path %r (resolved %s)", relative_path, full)
+            return None
         if not full.is_file():
             return None
         return full.read_text(encoding="utf-8")
@@ -399,7 +501,10 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     if ctx.old_content is not None and ctx.old_content == ctx.new_content:
         return []  # true no-op write
 
-    new_builds = parse_schedule_builds(ctx.new_content)
+    try:
+        new_builds = schedule_builds_from_content(ctx.new_content, source_name=ctx.path)
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     if new_builds is None:
         # Previously "advisory" -- an unparseable/malformed rewrite is a real,
         # reject-severity finding so a future enforce-mode build can actually
@@ -427,8 +532,12 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     #    not just the rows this particular write happens to touch. Closes the
     #    "mixed execution projects / duplicate un-ingested ID across the
     #    whole schedule not detected" gap (B2).
+    # The parser module is already proven loadable by the new_builds call
+    # above (cached for the process lifetime) -- only a malformed old_content
+    # can make this return None, which is the pre-existing "no prior builds
+    # to diff against" degradation.
     schedule_project = _schedule_project_from_content(ctx.new_content)
-    old_builds = parse_schedule_builds(ctx.old_content) if ctx.old_content else None
+    old_builds = schedule_builds_from_content(ctx.old_content, source_name=ctx.path) if ctx.old_content else None
     old_by_id = {b.get("id"): b for b in (old_builds or []) if isinstance(b, dict)}
     new_ids = sorted({
         entry.get("id") for entry in new_builds
@@ -512,7 +621,11 @@ def _disk_schedules_referencing(build_id: str) -> list[str]:
         content = _read_vault_text(schedule_path)
         if content is None:
             continue
-        builds = parse_schedule_builds(content)
+        # A malformed individual schedule is skipped here (discovery pass,
+        # per this function's own contract above); an unavailable parser
+        # module (BOContractError) is systemic and propagates to the caller,
+        # which fails closed rather than silently treating it as "no match".
+        builds = schedule_builds_from_content(content, source_name=schedule_path)
         if not builds:
             continue
         for entry in builds:
@@ -541,7 +654,10 @@ def _revalidate_schedule_with_proposed_spec(
             "unreadable -- failing closed rather than skipping graph revalidation",
         )]
 
-    builds = parse_schedule_builds(schedule_content)
+    try:
+        builds = schedule_builds_from_content(schedule_content, source_name=schedule_path)
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     if builds is None:
         return [ValidationIssue(
             "bo-guard-spec-rewrite-graph", "reject",
@@ -572,7 +688,29 @@ def _revalidate_schedule_with_proposed_spec(
         graph_result = bo_contract.validate_graph(nodes, mode="strict_new", new_ids=[build_id])
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-    return _errors_to_issues("bo-guard-spec-rewrite-graph", graph_result.get("errors", []))
+    # HI5-3 (opus-review-bo-authoring-contract-v5): the adapter's
+    # validate_graph always resolves live DB state for every node (there is
+    # no JSON-safe way to pass BO's own existing_state_lookup=lambda _bid:
+    # None over the CLI boundary the way authoring_contract's own
+    # whole_graph_errors_for_new_build does for exactly this call shape). A
+    # sibling elsewhere in the same schedule that happens to be
+    # terminal/dispatched, or already bound to a different schedule, is pure
+    # GRAPH CONTEXT for revalidating build_id's own proposed bytes -- it must
+    # never block this write merely for being present as context, matching
+    # BO's own documented semantics. Filter those DB-state-driven codes out
+    # when attributed to a different build_id than the one actually being
+    # rewritten; every other check (mixed_project_schedule, duplicate id,
+    # unknown dependency, cycles, unknown_project) still applies in full to
+    # the whole graph, including siblings.
+    filtered_errors = [
+        e for e in graph_result.get("errors", [])
+        if not (
+            e.get("code") in _SIBLING_CONTEXT_ONLY_CODES
+            and e.get("build_id") is not None
+            and e.get("build_id") != build_id
+        )
+    ]
+    return _errors_to_issues("bo-guard-spec-rewrite-graph", filtered_errors)
 
 
 def _spec_rewrite_schedule_graph_issues(build_id: str, ctx: WriteContext) -> list[ValidationIssue]:
@@ -586,9 +724,13 @@ def _spec_rewrite_schedule_graph_issues(build_id: str, ctx: WriteContext) -> lis
     # references this build id (HI-2b) -- an un-ingested build can be
     # declared in a schedule file before the orchestrator's next scan picks
     # it up, and that window must not be exempt from revalidation.
+    try:
+        disk_referenced = _disk_schedules_referencing(build_id)
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     candidate_schedules = sorted({
         *( [db_bound_schedule] if db_bound_schedule else [] ),
-        *_disk_schedules_referencing(build_id),
+        *disk_referenced,
     })
     if not candidate_schedules:
         return []  # genuinely not referenced anywhere -- nothing to revalidate
@@ -639,6 +781,26 @@ def _path_mutation_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
                     f"{build_id!r} has status {status!r} — {ctx.operation}ing its spec risks orphaning a "
                     "bound or closed build (schedule_unbound-style regression)",
                 ))
+                continue
+        # MD5-1 (opus-review-bo-authoring-contract-v5): the rewrite path
+        # already discovers referring schedules by scanning disk, not just
+        # the DB (_disk_schedules_referencing, HI-2b) -- the move/delete path
+        # did not, so a build with no DB row yet (status is None above, or
+        # simply never checked because it IS freely-mutable) could be moved
+        # or deleted out from under an on-disk schedule that already
+        # declares it, orphaning that reference before the orchestrator's
+        # next ingest scan ever saw it.
+        try:
+            referenced_by = _disk_schedules_referencing(build_id)
+        except bo_contract.BOContractError as e:
+            issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
+            continue
+        if referenced_by:
+            issues.append(ValidationIssue(
+                "bo-guard-spec-move", "reject",
+                f"{build_id!r} is referenced by on-disk schedule(s) {referenced_by!r} — "
+                f"{ctx.operation}ing its spec would orphan that reference",
+            ))
     return issues
 
 

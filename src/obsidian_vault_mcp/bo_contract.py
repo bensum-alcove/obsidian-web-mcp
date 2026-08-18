@@ -15,8 +15,10 @@ responsible for turning that into a fail-closed response.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import pathlib
 import subprocess
 from dataclasses import dataclass
 
@@ -97,6 +99,59 @@ def _invoke(payload: dict, timeout: float | None = None) -> dict:
         )
 
     return parsed
+
+
+_schedule_parser_module = None
+
+
+def _schedule_parser():
+    """Lazily load the BO repo's own `contract.py` module by file path,
+    resolved next to BO_AUTHORING_CONTRACT_PATH (both ship from the same BO
+    checkout). `contract.py` is deliberately dependency-free -- "Pure stdlib
+    + PyYAML, no dependency on db.py, vault_client.py, or any MCP tool" per
+    its own docstring, precisely so it can be loaded standalone by a second
+    consumer (it already is, by the signer) -- so this is a reference to the
+    one canonical implementation, not a vendored duplicate that could drift
+    from it (BL5-1, opus-review-bo-authoring-contract-v5: a second,
+    independently-written schedule parser previously disagreed with this one
+    on 56% of the real deployed schedule corpus). Raises BOContractError
+    (adapter_missing) if the module cannot be found/loaded; never silently
+    falls back to a local re-implementation.
+    """
+    global _schedule_parser_module
+    if _schedule_parser_module is not None:
+        return _schedule_parser_module
+    contract_path = pathlib.Path(config.BO_AUTHORING_CONTRACT_PATH).with_name("contract.py")
+    spec = importlib.util.spec_from_file_location("_bo_schedule_contract", contract_path)
+    if spec is None or spec.loader is None:
+        raise BOContractError("adapter_missing", f"BO schedule contract parser not found at {contract_path}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        raise BOContractError(
+            "adapter_missing", f"failed to load BO schedule contract parser at {contract_path}: {e}",
+        ) from e
+    _schedule_parser_module = module
+    return module
+
+
+def parse_schedule_document(content: str, source_name: str = "<string>") -> dict:
+    """Parse schedule-file content via the BO repo's own
+    `contract.parse_schedule_document` -- the single canonical schedule
+    parser also used by `schedule_loader.py`, `db.py`, `build_generator.py`
+    and `project_resolve.py`. This module must never re-implement schedule-
+    body parsing locally (BL5-1) -- there is exactly one parser, referenced
+    here, not two that can disagree.
+
+    Raises BOContractError (adapter_missing) if the parser module itself is
+    unavailable. Raises ValueError (propagated from `contract.py`, wrapping
+    yaml.YAMLError) if `content` is malformed -- callers distinguish "adapter
+    unavailable" (fail closed, systemic) from "this one document is
+    malformed" (per-content, handled locally) by catching these separately.
+    """
+    module = _schedule_parser()
+    return module.parse_schedule_document(content, source_name=source_name)
 
 
 def check_version(timeout: float | None = None) -> dict:

@@ -401,8 +401,28 @@ def write_file_atomic(
                     # that lands in the few remaining lines between this check
                     # and os.replace() is not caught. No stronger guarantee is
                     # claimed -- see bo_guard.py's module docstring.
+                    #
+                    # LO5-2 (opus-review-bo-authoring-contract-v5): this second
+                    # call used to reuse the ORIGINAL write_ctx, whose
+                    # old_content was captured at the very first read, above --
+                    # defeating the point of a second check for this path's own
+                    # old_content (though not for the referring-schedule bytes,
+                    # which _read_vault_text always re-reads fresh regardless).
+                    # Rebuilt here from revalidate_bytes, the bytes just re-read
+                    # immediately above, so both halves of the re-check see
+                    # current data.
                     if bo_guard.get_mode() != "off":
-                        bo_guard.enforce(write_ctx)
+                        revalidate_content_for_gate = None
+                        if revalidate_bytes is not None:
+                            try:
+                                revalidate_content_for_gate = revalidate_bytes.decode("utf-8")
+                            except UnicodeDecodeError:
+                                revalidate_content_for_gate = None
+                        fresh_write_ctx = WriteContext(
+                            path=canonical_path, old_content=revalidate_content_for_gate,
+                            new_content=content, tool=tool,
+                        )
+                        bo_guard.enforce(fresh_write_ctx)
 
                 os.replace(tmp_path, path)
             except BaseException:
@@ -553,6 +573,25 @@ def move_path(
             if dst.exists():
                 raise FileExistsError(f"Destination already exists: {destination}")
 
+            # Activation-boundary re-check (HI5-1, opus-review-bo-authoring-
+            # contract-v5): bo_guard's directory-move validation enumerates
+            # every nested file under `src` and reads each one to evaluate it
+            # -- seconds of work for a large directory -- but this function
+            # only ever called enforce_path_mutation ONCE, before that work,
+            # while holding no lock on the individual nested files (only on
+            # `src`/`dst` themselves). A concurrent write landing on a nested
+            # file mid-enumeration reproduced 12/12 under real cooperating
+            # processes: malformed, never-(re)validated bytes could still
+            # land under BO authority. Re-running the same check here,
+            # immediately before the filesystem mutation, re-enumerates and
+            # re-reads every nested file's THEN-current bytes (no caching in
+            # _files_under/_read_vault_text), closing the window down to the
+            # few remaining lines between this call and shutil.move -- the
+            # same pattern write_file_atomic already uses for its own
+            # activation-boundary re-check.
+            if bo_guard.get_mode() != "off":
+                bo_guard.enforce_path_mutation(move_ctx)
+
             shutil.move(str(src), str(dst))
 
             mutation_ledger.record(mutation_ledger.MutationEvent(
@@ -650,6 +689,13 @@ def delete_path(
             delete_ctx = PathMutationContext(path=canonical_path, operation="delete")
             if _write_contract_mode() != "off":
                 _enforce_path_mutation(delete_ctx)
+            if bo_guard.get_mode() != "off":
+                bo_guard.enforce_path_mutation(delete_ctx)
+
+            # Activation-boundary re-check (HI5-1), matching move_path's own
+            # fix and write_file_atomic's established pattern -- re-reads/
+            # re-enumerates fresh bytes immediately before the filesystem
+            # mutation rather than trusting the single check done above.
             if bo_guard.get_mode() != "off":
                 bo_guard.enforce_path_mutation(delete_ctx)
 

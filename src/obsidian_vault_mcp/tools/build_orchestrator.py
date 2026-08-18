@@ -29,7 +29,7 @@ import logging
 import frontmatter
 
 from .. import bo_contract
-from ..bo_guard import SPECS_PREFIX, parse_schedule_builds
+from ..bo_guard import SPECS_PREFIX, schedule_builds_from_content
 from ..vault import RevisionConflictError, conflict_payload, read_file, write_file_atomic
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,7 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
         pass
 
     nodes = []
-    for entry in parse_schedule_builds(content) or []:
+    for entry in schedule_builds_from_content(content, source_name=schedule_path) or []:
         if not isinstance(entry, dict) or entry.get("id") in new_build_ids:
             continue
         spec_path = entry.get("spec_path")
@@ -275,7 +275,10 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
     # half-written pair (spec written, schedule broken) is worse than writing
     # neither. Structural self-check only (parses, every new id present) --
     # not a second schema validator; BO semantics were already checked above.
-    parsed_builds = parse_schedule_builds(new_schedule_content)
+    try:
+        parsed_builds = schedule_builds_from_content(new_schedule_content, source_name=schedule_path)
+    except bo_contract.BOContractError as e:
+        return json.dumps({"ok": False, "error": str(e), "code": e.code, "activated": False})
     if parsed_builds is None:
         return json.dumps({
             "ok": False,
