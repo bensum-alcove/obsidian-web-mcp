@@ -78,6 +78,71 @@ vault-integrity-and-bo-authority-remediation-v2:
     closed rows could be renamed or deleted outright. It now rejects moving
     or deleting a schedule bound to ANY row, terminal or not; closed history
     remains authority and continuation requires a new schedule/new id.
+
+opus-review-bo-authoring-contract-v4 (2026-08-18) found a BLOCKER and two
+HIGHs against the REAL adapter (the repo's own tests monkeypatch
+bo_contract wholesale, which hid these), plus two lower-severity findings,
+all closed in vault-bo-authoring-guard-remediation-v5, still shadow-only:
+
+  - BL-1 (BLOCKER): vault.py used to construct WriteContext/
+    PathMutationContext from the caller's RAW path string, while the actual
+    filesystem target was resolve_vault_path(...)'s NORMALISED result --
+    aliases like `//`, `./`, `/./`, and a vault-internal symlinked
+    directory collapsed to the canonical path at the filesystem layer but
+    not at `_is_bo_path`'s literal-prefix check, so they skipped guard
+    evaluation entirely (zero adapter invocations) through vault_write,
+    vault_move, vault_delete and every tool that funnels through them.
+    vault.py now derives the WriteContext/PathMutationContext path (and
+    move destination) from resolve_vault_path's own resolved, symlink-
+    collapsed result via `canonical_vault_relative()`, not the caller's
+    string -- one normalisation point closes every alias witness.
+  - HI-1: no guard evaluation asserted the adapter's schema/contract
+    version before trusting its preflight/graph results -- only
+    _freely_mutable_statuses' internal fallback touched check_version, and
+    it silently substituted a hardcoded status set on ANY adapter failure
+    (including version drift), converting an untrustworthy adapter into
+    permission. evaluate_content/evaluate_path_mutation now call
+    check_version() fresh on every evaluation via _adapter_version_issues(),
+    short-circuiting to a reject issue on drift/unavailability; the
+    fallback allowlist is gone entirely -- an adapter failure anywhere in
+    this module is now always a reject issue, never a silent guess.
+  - HI-2: _spec_rewrite_schedule_graph_issues returned `[]` (no issue) for
+    an un-ingested build (no DB row yet), a DB-bound schedule missing on
+    disk, an unparseable bound schedule, or a bound schedule whose builds:
+    list doesn't actually contain the build's entry -- each is now a
+    reject-severity finding instead of a silent skip
+    (_revalidate_schedule_with_proposed_spec). Referring schedules are also
+    now discovered by scanning disk (_disk_schedules_referencing), not just
+    the DB, so a spec/schedule pair authored just ahead of the
+    orchestrator's next ingest scan is still covered.
+  - MD-1: an undecodable/binary file moved into a BO destination returned
+    `[]` from _inbound_move_issues (mis-handled as "directory branch found
+    nothing, therefore nothing to validate") instead of failing closed like
+    every other unevaluable-artifact case in this module. Now rejects.
+  - LO-1: _affected_paths looked up a SUBDIRECTORY of specs/ or schedules/
+    as one exact path (matching nothing) instead of enumerating the files
+    nested inside it, unlike its handling of the top-level directory
+    itself or an ancestor of it. Now recurses into a subdirectory the same
+    way.
+
+  Deliberately NOT changed in this build: BO_PATH_GUARD_MODE stays shadow
+  on all three live services; MD-2 (build_generator.generate_build()'s own
+  authoring path, which never went through this guard) is explicitly out
+  of scope, owned by bo-authoring-contract-runtime-remediation-v5 instead;
+  LO-2 (authoring_contract.py's own exception handling) is likewise BO-repo
+  scope, not this module's.
+
+  Race-window note (required review item 9): bo_guard reads a referring
+  schedule's bytes via _read_vault_text without holding a lock on that
+  file (it is a different resolved path from the one vault.py's caller
+  holds a lock on). vault.write_file_atomic now re-runs bo_guard.enforce()
+  a second time immediately before its filesystem commit, which re-reads
+  the referring schedule's then-current bytes and narrows this window
+  considerably. This is NOT a provable elimination of the race -- a writer
+  landing in the few remaining lines between that second check and the
+  commit is not caught. No stronger guarantee is claimed; the opus-v4
+  review itself could not reproduce a committing bypass of this exact
+  mechanism either (it required monkeypatching internals to force one).
 """
 
 from __future__ import annotations
@@ -106,14 +171,16 @@ class BOGuardError(ValueError):
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
 
-# Fallback only, used solely when the adapter itself is unavailable (see
-# _freely_mutable_statuses below) -- the authoritative set is now sourced
-# from the adapter's own op=version vocabulary
-# (known_statuses - terminal_statuses - dispatched_statuses), not hardcoded
-# here (codex-review-bo-authoring-contract-v1, B5: "the status classification
-# should be owned by and returned from the contract adapter").
-_SPEC_FREELY_MUTABLE_STATUSES_FALLBACK = {"proposed", "pending", "ready"}
-
+# The authoritative freely-mutable-status set is sourced from the adapter's
+# own op=version vocabulary (known_statuses - terminal_statuses -
+# dispatched_statuses), not hardcoded here (codex-review-bo-authoring-
+# contract-v1, B5: "the status classification should be owned by and
+# returned from the contract adapter"). There is deliberately no hardcoded
+# fallback: opus-review-bo-authoring-contract-v4 (HI-1) found the previous
+# fallback-on-adapter-failure behaviour could silently convert an adapter
+# version/availability failure into permission for a mutation that should
+# have been rejected. A failure here now propagates to the caller, which
+# must turn it into a reject-severity issue, never substitute a guess.
 _freely_mutable_statuses_cache: set | None = None
 
 
@@ -121,19 +188,34 @@ def _freely_mutable_statuses() -> set:
     """Cached (process-lifetime) lookup of the adapter's own
     freely-mutable-status vocabulary. A restart is required to pick up a
     change in the adapter's vocabulary, matching how EXPECTED_SCHEMA_VERSION/
-    EXPECTED_CONTRACT_VERSION drift already requires a restart. On adapter
-    failure, the fallback allowlist above is used for that one call without
-    poisoning the cache -- being shadow-only, a staleness here can only ever
-    produce a wrong log line, never a wrong block.
+    EXPECTED_CONTRACT_VERSION drift already requires a restart. Raises
+    bo_contract.BOContractError on adapter failure -- callers must catch it
+    and produce a reject issue (see _spec_rewrite_issues/_path_mutation_issues),
+    never silently proceed with a guessed status set.
     """
     global _freely_mutable_statuses_cache
     if _freely_mutable_statuses_cache is not None:
         return _freely_mutable_statuses_cache
-    try:
-        _freely_mutable_statuses_cache = bo_contract.freely_mutable_statuses()
-    except bo_contract.BOContractError:
-        return _SPEC_FREELY_MUTABLE_STATUSES_FALLBACK
+    _freely_mutable_statuses_cache = bo_contract.freely_mutable_statuses()
     return _freely_mutable_statuses_cache
+
+
+def _adapter_version_issues() -> list[ValidationIssue]:
+    """Assert the authoring-contract adapter's schema/contract version before
+    trusting any preflight/graph result from it (HI-1,
+    opus-review-bo-authoring-contract-v4, required review item 9). Unlike
+    _freely_mutable_statuses()'s process-lifetime cache, this runs fresh on
+    every guard evaluation -- version drift is a real, time-varying signal
+    (an adapter can be redeployed while this server keeps running), not
+    something safe to cache for a process's whole lifetime. A drifted or
+    unavailable adapter is a reject-severity finding, never a silently
+    substituted fallback.
+    """
+    try:
+        bo_contract.check_version()
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-version", "reject", str(e))]
+    return []
 
 
 def _is_bo_path(path: str) -> bool:
@@ -274,16 +356,25 @@ def _affected_paths(path: str, prefix: str) -> list[str]:
     """Vault-relative file paths that a move/delete of `path` would affect,
     given a protected directory `prefix` (SPECS_PREFIX or SCHEDULES_PREFIX).
 
-    Three cases: `path` is a file/subpath under `prefix` (returns that one
-    path); `path` IS `prefix`'s directory itself, or an ancestor of it
-    (returns every file currently under `prefix` on disk -- the bulk case);
-    otherwise empty.
+    Three cases: `path` is a file under `prefix` (returns that one path);
+    `path` is itself a SUBDIRECTORY of `prefix` (returns every file
+    currently under it on disk, recursively -- LO-1,
+    opus-review-bo-authoring-contract-v4: a subdirectory-shaped path used to
+    be looked up as one exact authority path, matching nothing, rather than
+    enumerating the schedule/spec files nested inside it); `path` IS
+    `prefix`'s directory itself, or an ancestor of it (returns every file
+    currently under `prefix` on disk -- the bulk case); otherwise empty.
     """
     normalized = path.replace("\\", "/").rstrip("/")
     prefix_no_slash = prefix.rstrip("/")
     if (prefix_no_slash + "/").startswith(normalized + "/"):
         return _files_under(prefix)
     if normalized.startswith(prefix):
+        from . import config
+
+        full = (config.VAULT_PATH / normalized).resolve()
+        if full.is_dir():
+            return _files_under(normalized)
         return [normalized]
     return []
 
@@ -365,12 +456,17 @@ def _spec_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     status = (result.get("results") or {}).get(build_id)
-    if status is not None and status not in _freely_mutable_statuses():
-        return [ValidationIssue(
-            "bo-guard-spec-rewrite", "reject",
-            f"{build_id!r} has status {status!r} — its spec content is bound to a dispatched-or-later "
-            "or closed build and cannot be rewritten by the normal authoring path",
-        )]
+    if status is not None:
+        try:
+            freely_mutable = _freely_mutable_statuses()
+        except bo_contract.BOContractError as e:
+            return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+        if status not in freely_mutable:
+            return [ValidationIssue(
+                "bo-guard-spec-rewrite", "reject",
+                f"{build_id!r} has status {status!r} — its spec content is bound to a dispatched-or-later "
+                "or closed build and cannot be rewritten by the normal authoring path",
+            )]
 
     # Content-shape check (frontmatter validity, identity, tier, risk fields)
     # so a pre-dispatch spec can't be rewritten to arbitrary invalid bytes
@@ -396,37 +492,111 @@ def _spec_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     return issues
 
 
-def _spec_rewrite_schedule_graph_issues(build_id: str, ctx: WriteContext) -> list[ValidationIssue]:
-    try:
-        sched_result = bo_contract.preflight_source_schedule([build_id])
-    except bo_contract.BOContractError as e:
-        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-    source_schedule = (sched_result.get("results") or {}).get(build_id)
-    if not source_schedule:
-        return []  # not bound to any schedule yet -- nothing to revalidate
+def _disk_schedules_referencing(build_id: str) -> list[str]:
+    """Vault-relative paths of every on-disk schedule file under
+    SCHEDULES_PREFIX whose builds: list contains an entry with this id,
+    discovered by reading and parsing the files directly rather than the BO
+    database.
 
-    schedule_content = _read_vault_text(source_schedule)
+    Covers the case where a build has not yet been ingested into the BO
+    database (so bo_contract.preflight_source_schedule finds nothing via its
+    DB lookup) but is already declared in a schedule file on disk (HI-2b,
+    opus-review-bo-authoring-contract-v4). A schedule file that cannot itself
+    be read/parsed is skipped here, not failed closed -- this is a discovery
+    pass over files not yet known to reference build_id at all, distinct
+    from _revalidate_schedule_with_proposed_spec's fail-closed handling of a
+    schedule ALREADY known (from the DB or this scan) to reference it.
+    """
+    matches: list[str] = []
+    for schedule_path in _files_under(SCHEDULES_PREFIX):
+        content = _read_vault_text(schedule_path)
+        if content is None:
+            continue
+        builds = parse_schedule_builds(content)
+        if not builds:
+            continue
+        for entry in builds:
+            if isinstance(entry, dict) and entry.get("id") == build_id:
+                matches.append(schedule_path)
+                break
+    return matches
+
+
+def _revalidate_schedule_with_proposed_spec(
+    schedule_path: str, build_id: str, new_spec_content: str
+) -> list[ValidationIssue]:
+    """Revalidate one schedule's complete graph with build_id's node
+    substituted for the PROPOSED spec bytes, failing closed (reject) at
+    every step that opus-review-bo-authoring-contract-v4's HI-2 found
+    returning `[]` (silently skipping revalidation) instead: an unreadable/
+    missing schedule file, an unparseable schedule body, or a schedule that
+    (despite being a known binding) does not actually list build_id in its
+    builds:.
+    """
+    schedule_content = _read_vault_text(schedule_path)
     if schedule_content is None:
-        return []  # schedule file unreadable/missing -- degrade quietly, matching other _read_vault_text call sites
+        return [ValidationIssue(
+            "bo-guard-spec-rewrite-graph", "reject",
+            f"{build_id!r} is referenced by schedule {schedule_path!r}, which is missing or "
+            "unreadable -- failing closed rather than skipping graph revalidation",
+        )]
 
     builds = parse_schedule_builds(schedule_content)
     if builds is None:
-        return []  # schedule itself unparseable -- its own rewrite path already guards this
+        return [ValidationIssue(
+            "bo-guard-spec-rewrite-graph", "reject",
+            f"{build_id!r} is referenced by schedule {schedule_path!r}, which does not parse as a "
+            "valid builds: list -- failing closed rather than skipping graph revalidation",
+        )]
 
     schedule_project = _schedule_project_from_content(schedule_content)
-    nodes = _nodes_for_schedule_builds(builds, source_schedule, schedule_project)
+    nodes = _nodes_for_schedule_builds(builds, schedule_path, schedule_project)
     # Substitute the proposed new spec content for this build_id's node so
     # the graph is validated against the bytes that WOULD exist after this
     # write commits, not what's currently on disk under specs/.
+    matched = False
     for node in nodes:
         if node["build_id"] == build_id:
-            node["spec_markdown"] = ctx.new_content
+            node["spec_markdown"] = new_spec_content
+            matched = True
+
+    if not matched:
+        return [ValidationIssue(
+            "bo-guard-spec-rewrite-graph", "reject",
+            f"{build_id!r} is referenced by schedule {schedule_path!r} but no entry with that id is "
+            "present in its builds: list -- failing closed rather than validating the graph without "
+            "the proposed bytes",
+        )]
 
     try:
         graph_result = bo_contract.validate_graph(nodes, mode="strict_new", new_ids=[build_id])
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     return _errors_to_issues("bo-guard-spec-rewrite-graph", graph_result.get("errors", []))
+
+
+def _spec_rewrite_schedule_graph_issues(build_id: str, ctx: WriteContext) -> list[ValidationIssue]:
+    try:
+        sched_result = bo_contract.preflight_source_schedule([build_id])
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+    db_bound_schedule = (sched_result.get("results") or {}).get(build_id)
+
+    # Combine the DB's own binding (if any) with every on-disk schedule that
+    # references this build id (HI-2b) -- an un-ingested build can be
+    # declared in a schedule file before the orchestrator's next scan picks
+    # it up, and that window must not be exempt from revalidation.
+    candidate_schedules = sorted({
+        *( [db_bound_schedule] if db_bound_schedule else [] ),
+        *_disk_schedules_referencing(build_id),
+    })
+    if not candidate_schedules:
+        return []  # genuinely not referenced anywhere -- nothing to revalidate
+
+    issues: list[ValidationIssue] = []
+    for schedule_path in candidate_schedules:
+        issues.extend(_revalidate_schedule_with_proposed_spec(schedule_path, build_id, ctx.new_content))
+    return issues
 
 
 def _content_issues(ctx: WriteContext) -> list[ValidationIssue]:
@@ -457,12 +627,18 @@ def _path_mutation_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
             issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
             continue
         status = (result.get("results") or {}).get(build_id)
-        if status is not None and status not in _freely_mutable_statuses():
-            issues.append(ValidationIssue(
-                "bo-guard-spec-move", "reject",
-                f"{build_id!r} has status {status!r} — {ctx.operation}ing its spec risks orphaning a "
-                "bound or closed build (schedule_unbound-style regression)",
-            ))
+        if status is not None:
+            try:
+                freely_mutable = _freely_mutable_statuses()
+            except bo_contract.BOContractError as e:
+                issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
+                continue
+            if status not in freely_mutable:
+                issues.append(ValidationIssue(
+                    "bo-guard-spec-move", "reject",
+                    f"{build_id!r} has status {status!r} — {ctx.operation}ing its spec risks orphaning a "
+                    "bound or closed build (schedule_unbound-style regression)",
+                ))
     return issues
 
 
@@ -496,7 +672,19 @@ def _inbound_move_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
 
     source_full = (config.VAULT_PATH / ctx.path).resolve()
     if not source_full.is_dir():
-        return []  # genuinely missing/unreadable source -- nothing to validate
+        if source_full.is_file():
+            # A binary/undecodable file moving into a BO destination (MD-1,
+            # opus-review-bo-authoring-contract-v4): _read_vault_text
+            # returned None because the bytes exist but aren't valid UTF-8
+            # text, not because the source is missing. The module's own
+            # policy is to fail closed for anything it cannot evaluate --
+            # this case was falling through that policy instead of hitting it.
+            return [ValidationIssue(
+                "bo-guard-inbound-move-undecodable", "reject",
+                f"{ctx.path!r} cannot be decoded as UTF-8 text, so its content cannot be validated "
+                f"before it lands at {destination!r} under BO authority -- failing closed",
+            )]
+        return []  # genuinely missing source -- nothing to validate
 
     issues: list[ValidationIssue] = []
     source_prefix = ctx.path.replace("\\", "/").rstrip("/")
@@ -520,7 +708,13 @@ def evaluate_content(ctx: WriteContext) -> BOGateResult:
     mode = get_mode()
     if mode == "off" or not _is_bo_path(ctx.path):
         return BOGateResult(mode=mode, issues=[])
-    issues = _content_issues(ctx)
+    # Assert the adapter's schema/contract version before trusting any of its
+    # preflight/graph results for this evaluation (HI-1). A drifted or
+    # unavailable adapter short-circuits straight to a reject issue rather
+    # than proceeding to call it further.
+    issues = _adapter_version_issues()
+    if not issues:
+        issues = _content_issues(ctx)
     _log_issues(mode, ctx.path, ctx.tool, issues)
     return BOGateResult(mode=mode, issues=issues)
 
@@ -535,14 +729,15 @@ def evaluate_path_mutation(ctx: PathMutationContext) -> BOGateResult:
     if not source_is_bo and not dest_is_bo:
         return BOGateResult(mode=mode, issues=[])
 
-    issues: list[ValidationIssue] = []
-    if source_is_bo:
-        issues.extend(_path_mutation_issues(ctx))
-    if dest_is_bo:
-        # Destination authority is evaluated independently of whether the
-        # source is also a BO path -- a BO-path source is not an exemption
-        # for the BO-path destination (B8).
-        issues.extend(_inbound_move_issues(ctx))
+    issues = _adapter_version_issues()
+    if not issues:
+        if source_is_bo:
+            issues.extend(_path_mutation_issues(ctx))
+        if dest_is_bo:
+            # Destination authority is evaluated independently of whether the
+            # source is also a BO path -- a BO-path source is not an exemption
+            # for the BO-path destination (B8).
+            issues.extend(_inbound_move_issues(ctx))
 
     _log_issues(mode, ctx.path, ctx.operation, issues)
     return BOGateResult(mode=mode, issues=issues)

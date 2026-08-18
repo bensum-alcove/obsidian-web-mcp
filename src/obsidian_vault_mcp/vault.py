@@ -205,6 +205,24 @@ def resolve_vault_path(relative_path: str) -> Path:
     return resolved
 
 
+def canonical_vault_relative(resolved: Path) -> str:
+    """Convert an already-resolved absolute path (from resolve_vault_path)
+    back to its canonical, vault-relative, forward-slash string form.
+
+    This is the value that must be handed to bo_guard/write_contract's
+    WriteContext/PathMutationContext -- never the caller's raw path string.
+    resolve_vault_path's ``.resolve()`` already collapsed `.`, `..`, `//` and
+    any existing symlinks (including a vault-internal symlinked directory);
+    reusing its output here means the guard evaluates the exact identity the
+    write actually lands at, so an alias like
+    'Personal/Build Orchestrator//schedules/x.yaml' or './Personal/...'
+    cannot present a different path to the guard than the one it mutates
+    (BL-1, opus-review-bo-authoring-contract-v4).
+    """
+    vault_root = config.VAULT_PATH.resolve()
+    return str(resolved.relative_to(vault_root)).replace(os.sep, "/")
+
+
 def _iso_timestamp(ts: float) -> str:
     """Convert a Unix timestamp to an ISO 8601 string in UTC."""
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
@@ -298,6 +316,7 @@ def write_file_atomic(
             )
 
         path = resolve_vault_path(relative_path)
+        canonical_path = canonical_vault_relative(path)
 
         with _lock_for_path(path), vault_lock.path_lock(path):
             try:
@@ -309,20 +328,21 @@ def write_file_atomic(
 
             _check_revision(relative_path, tool, expected_revision, current_bytes, encoded)
 
-            if _write_contract_mode() != "off" or bo_guard.get_mode() != "off":
-                old_content_for_gate = None
-                if current_bytes is not None:
-                    try:
-                        old_content_for_gate = current_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        old_content_for_gate = None
-                write_ctx = WriteContext(
-                    path=relative_path, old_content=old_content_for_gate, new_content=content, tool=tool
-                )
-                if _write_contract_mode() != "off":
-                    _enforce_write_contract(write_ctx)
-                if bo_guard.get_mode() != "off":
-                    bo_guard.enforce(write_ctx)
+            old_content_for_gate = None
+            if current_bytes is not None:
+                try:
+                    old_content_for_gate = current_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    old_content_for_gate = None
+            # canonical_path (not the caller's raw relative_path) is what the
+            # guard evaluates -- see canonical_vault_relative's docstring (BL-1).
+            write_ctx = WriteContext(
+                path=canonical_path, old_content=old_content_for_gate, new_content=content, tool=tool
+            )
+            if _write_contract_mode() != "off":
+                _enforce_write_contract(write_ctx)
+            if bo_guard.get_mode() != "off":
+                bo_guard.enforce(write_ctx)
 
             try:
                 original_mode = stat.S_IMODE(path.stat().st_mode)
@@ -367,6 +387,22 @@ def write_file_atomic(
                         revalidate_bytes = None
                     intended_operation = "create" if revalidate_bytes is None else "update"
                     _check_revision(relative_path, tool, expected_revision, revalidate_bytes, encoded)
+
+                    # BO guard re-evaluation at the activation boundary
+                    # (opus-review-bo-authoring-contract-v4, item 9). bo_guard's
+                    # spec-rewrite check reads a REFERRING SCHEDULE's bytes (a
+                    # different resolved path than `path`, so not covered by the
+                    # lock held above) to revalidate the whole graph. Re-running
+                    # the same enforce() call here, immediately before the
+                    # commit, re-reads that schedule's current bytes and closes
+                    # most of the window between the first check above and the
+                    # os.replace() below. This narrows, but does not provably
+                    # eliminate, the race: a writer to the referring schedule
+                    # that lands in the few remaining lines between this check
+                    # and os.replace() is not caught. No stronger guarantee is
+                    # claimed -- see bo_guard.py's module docstring.
+                    if bo_guard.get_mode() != "off":
+                        bo_guard.enforce(write_ctx)
 
                 os.replace(tmp_path, path)
             except BaseException:
@@ -465,6 +501,8 @@ def move_path(
     """
     src = resolve_vault_path(source)
     dst = resolve_vault_path(destination)
+    canonical_source = canonical_vault_relative(src)
+    canonical_destination = canonical_vault_relative(dst)
     old_hash_for_ledger: str | None = None
 
     # Deterministic lock ordering across the (up to) two distinct paths
@@ -492,7 +530,12 @@ def move_path(
             old_hash_for_ledger = compute_revision(current_bytes)
             _check_revision(source, "move", expected_revision, current_bytes)
 
-            move_ctx = PathMutationContext(path=source, operation="move", destination=destination)
+            # canonical_source/canonical_destination (not the caller's raw
+            # strings) are what the guard evaluates -- see
+            # canonical_vault_relative's docstring (BL-1).
+            move_ctx = PathMutationContext(
+                path=canonical_source, operation="move", destination=canonical_destination
+            )
             if _write_contract_mode() != "off":
                 _enforce_path_mutation(move_ctx)
             if bo_guard.get_mode() != "off":
@@ -584,6 +627,7 @@ def delete_path(
     Emits exactly one mutation-ledger event once the final result is known.
     """
     path = resolve_vault_path(relative_path)
+    canonical_path = canonical_vault_relative(path)
     old_hash_for_ledger: str | None = None
 
     try:
@@ -601,7 +645,9 @@ def delete_path(
             old_hash_for_ledger = compute_revision(current_bytes)
             _check_revision(relative_path, "delete", expected_revision, current_bytes)
 
-            delete_ctx = PathMutationContext(path=relative_path, operation="delete")
+            # canonical_path (not the caller's raw relative_path) is what the
+            # guard evaluates -- see canonical_vault_relative's docstring (BL-1).
+            delete_ctx = PathMutationContext(path=canonical_path, operation="delete")
             if _write_contract_mode() != "off":
                 _enforce_path_mutation(delete_ctx)
             if bo_guard.get_mode() != "off":

@@ -20,6 +20,11 @@ from obsidian_vault_mcp.write_contract import PathMutationContext, WriteContext
 SCHEDULE_PATH = "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
 SPEC_PATH = "Personal/Build Orchestrator/specs/scratch-build.md"
 
+# Captured at collection time, before any per-test monkeypatching -- lets a
+# test restore the REAL _freely_mutable_statuses over the autouse stub below
+# to exercise its own (no-fallback) fail-closed behaviour directly.
+_REAL_FREELY_MUTABLE_STATUSES = bo_guard._freely_mutable_statuses
+
 VALID_SCHEDULE_OLD = (
     "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# scratch\n\nbuilds:\n\n"
     "  - id: existing-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
@@ -45,6 +50,23 @@ def _stub_graph_validation_ok(monkeypatch):
         bo_contract, "validate_graph",
         lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None:
             {"ok": True, "errors": [], "warnings": []},
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_check_version_ok(monkeypatch):
+    """Every guard evaluation now asserts the adapter's version fresh (HI-1)
+    -- stub it to a matching version by default so tests that don't care
+    about version drift stay hermetic (never touch the real adapter
+    subprocess) and existing assertions are unaffected. Tests that DO care
+    override this."""
+    monkeypatch.setattr(
+        bo_contract, "check_version",
+        lambda timeout=None: {
+            "ok": True,
+            "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION,
+            "contract_version": bo_contract.EXPECTED_CONTRACT_VERSION,
+        },
     )
 
 
@@ -673,3 +695,262 @@ def test_inbound_directory_move_fails_closed_on_unevaluable_nested_file(vault_di
         )
     )
     assert any(i.rule_id == "bo-guard-inbound-directory-move" for i in result.issues)
+
+
+# --------------------------------------------------------------------------
+# HI-1 (opus-review-bo-authoring-contract-v4): every guard evaluation must
+# assert the adapter's schema/contract version before trusting any of its
+# preflight/graph results, and a failure must never be silently converted
+# into permission by a hardcoded fallback.
+# --------------------------------------------------------------------------
+
+
+def test_evaluate_content_rejects_on_adapter_version_drift(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("no further adapter call should run once the version check fails")
+
+    monkeypatch.setattr(
+        bo_contract, "check_version",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("version_mismatch", "drift")),
+    )
+    monkeypatch.setattr(bo_contract, "preflight_schedule_rewrite", boom)
+    monkeypatch.setattr(bo_contract, "validate_graph", boom)
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=VALID_SCHEDULE_NEW, tool="vault_write")
+    )
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "bo-guard-adapter-version"
+    assert result.issues[0].severity == "reject"
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    with pytest.raises(bo_guard.BOGuardError):
+        bo_guard.enforce(
+            WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=VALID_SCHEDULE_NEW, tool="vault_write")
+        )
+
+
+def test_evaluate_path_mutation_rejects_on_adapter_version_drift(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("no further adapter call should run once the version check fails")
+
+    monkeypatch.setattr(
+        bo_contract, "check_version",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("version_mismatch", "drift")),
+    )
+    monkeypatch.setattr(bo_contract, "preflight_schedule_move", boom)
+    monkeypatch.setattr(bo_contract, "preflight_ids", boom)
+
+    result = bo_guard.evaluate_path_mutation(PathMutationContext(path=SCHEDULE_PATH, operation="delete"))
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_id == "bo-guard-adapter-version"
+    assert result.issues[0].severity == "reject"
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    with pytest.raises(bo_guard.BOGuardError):
+        bo_guard.enforce_path_mutation(PathMutationContext(path=SCHEDULE_PATH, operation="delete"))
+
+
+def test_adapter_unavailable_for_version_check_is_also_reject(monkeypatch):
+    monkeypatch.setattr(
+        bo_contract, "check_version",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("adapter_missing", "not found")),
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert result.issues[0].rule_id == "bo-guard-adapter-version"
+
+
+def test_freely_mutable_statuses_propagates_adapter_failure_with_no_fallback(monkeypatch):
+    """HI-1: the old fallback silently substituted a hardcoded status set on
+    ANY adapter failure. There is no fallback now -- a failure propagates as
+    BOContractError for the caller to turn into a reject issue."""
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses", _REAL_FREELY_MUTABLE_STATUSES)
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses_cache", None)
+    monkeypatch.setattr(
+        bo_contract, "freely_mutable_statuses",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("adapter_missing", "gone")),
+    )
+    with pytest.raises(bo_contract.BOContractError):
+        bo_guard._freely_mutable_statuses()
+
+
+def test_spec_rewrite_status_check_failure_is_reject_not_silent_allow(monkeypatch):
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses", _REAL_FREELY_MUTABLE_STATUSES)
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses_cache", None)
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": "proposed"}})
+    monkeypatch.setattr(
+        bo_contract, "freely_mutable_statuses",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("adapter_missing", "gone")),
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-adapter-unavailable" and i.severity == "reject" for i in result.issues)
+
+
+def test_spec_move_status_check_failure_is_reject_not_silent_allow(monkeypatch):
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses", _REAL_FREELY_MUTABLE_STATUSES)
+    monkeypatch.setattr(bo_guard, "_freely_mutable_statuses_cache", None)
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": "proposed"}})
+    monkeypatch.setattr(
+        bo_contract, "freely_mutable_statuses",
+        lambda timeout=None: (_ for _ in ()).throw(bo_contract.BOContractError("adapter_missing", "gone")),
+    )
+    result = bo_guard.evaluate_path_mutation(PathMutationContext(path=SPEC_PATH, operation="delete"))
+    assert any(i.rule_id == "bo-guard-adapter-unavailable" and i.severity == "reject" for i in result.issues)
+
+
+# --------------------------------------------------------------------------
+# HI-2 (opus-review-bo-authoring-contract-v4): a spec rewrite's schedule-
+# graph revalidation must fail closed (not return []) when a known binding
+# can't be resolved, and must also discover referring schedules from disk
+# for a build not yet ingested into the DB.
+# --------------------------------------------------------------------------
+
+
+def test_spec_rewrite_discovers_referring_schedule_from_disk_when_not_in_db(monkeypatch, vault_dir):
+    """HI-2b: an un-ingested build (no DB row) can still be declared in an
+    on-disk schedule file. The DB lookup alone (preflight_source_schedule)
+    misses this; disk discovery must catch it."""
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# scratch\n\nbuilds:\n\n"
+        "  - id: scratch-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/scratch-build.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-scratch.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": None}})
+    # DB has no binding at all -- this is the un-ingested case.
+    monkeypatch.setattr(bo_contract, "preflight_source_schedule", lambda build_ids, timeout=None: {"results": {"scratch-build": None}})
+
+    seen_calls = []
+
+    def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        seen_calls.append((nodes, new_ids))
+        return {"ok": False, "errors": [{"code": "mixed_project_schedule", "message": "bad", "build_id": "scratch-build"}], "warnings": []}
+
+    monkeypatch.setattr(bo_contract, "validate_graph", fake_validate_graph)
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new spec body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite-graph" for i in result.issues)
+    assert seen_calls
+    nodes, new_ids = seen_calls[-1]
+    assert new_ids == ["scratch-build"]
+    assert nodes[0]["spec_markdown"] == "new spec body"
+
+
+def test_spec_rewrite_bound_schedule_missing_on_disk_fails_closed(monkeypatch):
+    """HI-2: previously returned [] (silently skipped revalidation) when the
+    DB-bound schedule file doesn't exist on disk. Must reject instead."""
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": "Personal/Build Orchestrator/schedules/does-not-exist.yaml"}},
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite-graph" and i.severity == "reject" for i in result.issues)
+
+
+def test_spec_rewrite_bound_schedule_unparseable_fails_closed(monkeypatch, vault_dir):
+    """HI-2: previously returned [] when the DB-bound schedule couldn't be
+    parsed. Must reject instead."""
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-scratch.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text("not: [valid, yaml:::")
+
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": SCHEDULE_PATH}},
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite-graph" and i.severity == "reject" for i in result.issues)
+
+
+def test_spec_rewrite_bound_schedule_missing_entry_fails_closed(monkeypatch, vault_dir):
+    """HI-2: the DB says this build is bound to a schedule, but that
+    schedule's builds: list doesn't actually contain the build's entry --
+    previously the graph validated vacuously (without the proposed bytes);
+    must reject instead."""
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# scratch\n\nbuilds:\n\n"
+        "  - id: some-other-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/some-other-build.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-scratch.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"scratch-build": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"scratch-build": SCHEDULE_PATH}},
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("validate_graph should not be called when the build's entry is absent from its bound schedule")
+
+    monkeypatch.setattr(bo_contract, "validate_graph", boom)
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SPEC_PATH, old_content="old body", new_content="new body", tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-spec-rewrite-graph" and i.severity == "reject" for i in result.issues)
+
+
+# --------------------------------------------------------------------------
+# MD-1 (opus-review-bo-authoring-contract-v4): an undecodable/binary inbound
+# move source must fail closed, not silently skip validation.
+# --------------------------------------------------------------------------
+
+
+def test_inbound_move_of_binary_file_fails_closed(vault_dir):
+    source = vault_dir / "Clients" / "blob.bin"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"\xff\xfe\x00\x01binary garbage, not a directory")
+
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(
+            path="Clients/blob.bin", operation="move",
+            destination="Personal/Build Orchestrator/schedules/blob.yaml",
+        )
+    )
+    assert any(i.rule_id == "bo-guard-inbound-move-undecodable" and i.severity == "reject" for i in result.issues)
+
+
+# --------------------------------------------------------------------------
+# LO-1 (opus-review-bo-authoring-contract-v4): moving/deleting a
+# SUBDIRECTORY of specs/ or schedules/ must enumerate the files nested
+# inside it, not look up the directory itself as one exact authority path.
+# --------------------------------------------------------------------------
+
+
+def test_moving_subdirectory_of_schedules_enumerates_nested_files(monkeypatch, vault_dir):
+    subdir = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "wk34"
+    subdir.mkdir(parents=True)
+    (subdir / "2026-w34.yaml").write_text(VALID_SCHEDULE_OLD)
+
+    seen_paths = []
+
+    def fake_preflight_schedule_move(schedule_path, timeout=None):
+        seen_paths.append(schedule_path)
+        return {"ok": False, "errors": [{"code": "schedule_move_would_remove_bound_authority", "message": "x", "build_id": "existing-build"}], "warnings": []}
+
+    monkeypatch.setattr(bo_contract, "preflight_schedule_move", fake_preflight_schedule_move)
+    result = bo_guard.evaluate_path_mutation(
+        PathMutationContext(
+            path="Personal/Build Orchestrator/schedules/wk34", operation="move",
+            destination="Personal/Build Orchestrator/schedules/wk34-renamed",
+        )
+    )
+    assert seen_paths == ["Personal/Build Orchestrator/schedules/wk34/2026-w34.yaml"]
+    assert any(i.rule_id == "bo-guard-schedule-move" for i in result.issues)
