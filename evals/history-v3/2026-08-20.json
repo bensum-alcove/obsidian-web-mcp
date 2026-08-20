@@ -1,0 +1,461 @@
+{
+  "vault_search": {
+    "current_vs_stale": {
+      "n": 5,
+      "r_at_5": 0.2,
+      "mrr": 0.2,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "canonical_contradiction_precedence": {
+      "n": 5,
+      "r_at_5": 0.2,
+      "mrr": 0.2,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "entities_aliases": {
+      "n": 5,
+      "r_at_5": 0.0,
+      "mrr": 0.0,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "exact_identifiers": {
+      "n": 5,
+      "r_at_5": 0.4,
+      "mrr": 0.4
+    },
+    "paraphrase": {
+      "n": 5,
+      "r_at_5": 0.2,
+      "mrr": 0.2
+    },
+    "cross_document": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.6,
+      "synthesis_hit_rate": 0.0,
+      "synthesis_hit_n": 5
+    },
+    "negative_unknown": {
+      "n": 5,
+      "source_correctness": 0.6,
+      "source_correctness_n": 5
+    },
+    "recent_update_freshness": {
+      "n": 5,
+      "r_at_5": 0.0,
+      "mrr": 0.0286
+    },
+    "archive_isolation": {
+      "n": 5,
+      "r_at_5": 0.0,
+      "mrr": 0.0,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "known_facts": {
+      "n": 5,
+      "r_at_5": 0.2,
+      "mrr": 0.2
+    },
+    "overall": {
+      "n": 50,
+      "r_at_5": 0.2,
+      "mrr": 0.2032,
+      "source_correctness": 0.5556,
+      "source_correctness_n": 9,
+      "synthesis_hit_rate": 0.0,
+      "synthesis_hit_n": 5
+    },
+    "_rubric_flagged": [
+      {
+        "category": "current_vs_stale",
+        "question": "Is the contradiction-lint weekly job's report-writing path currently migrated onto the shared vault_lock write authority?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current operational status of a specific component with its own canonical-state record \u2014 no separate prose document makes this claim at all, so the record is the only current-state source, not just the preferred one.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-integrity-and-bo-authority-remediation-v2-output.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "As of the most recent verification, has the write-integrity hardening review closed every BLOCKER and HIGH finding against the vault_lock module?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current-state verdict question (\"state: hardened\", 0 BLOCKER/HIGH) \u2014 canonical-state authority, distinct from the underlying review document itself (which is historical evidence, not the current-state summary).",
+        "top_result": "hot-archive/2026-08.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "What is the current verified git branch and HEAD commit of the dev/cron obsidian-web-mcp checkout?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This exact fact drifted twice in one week (main -> feature/vault-tools-v2 -> back to main) \u2014 only the canonical record's verified_at 2026-08-20 reflects the latest restoration; the underlying SYSTEM-FACTS.md section only covers events through 2026-08-09.",
+        "top_result": "Personal/Build Orchestrator/specs/vault-canonical-state-finalization-v1.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Per the Canonical State precedence rule, which source wins for a current-state question: a canonical-state record, or infrastructure-changelog.md?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the precedence RULE itself (the schema doc), not one of its applied instances \u2014 a meta-level question the other two contradiction-precedence entries don't cover.",
+        "top_result": "BS 2nd Brain/Alcove/Skills/vault-search-rules.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "If SYSTEM-FACTS.md is completely silent about a component that has its own canonical-state record, which of the two should be trusted for that component's current state?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests the \"consulted when canonical state is silent\" clause of the precedence rule specifically \u2014 the inverse direction from the previous entry (changelog vs canonical-state).",
+        "top_result": "Personal/Build Orchestrator/specs/vault-canonical-state-live-reality-remediation-v1.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Two canonical-state records exist for the same component_id and neither carries superseded_by \u2014 what is the schema's required behavior in that situation?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Duplicate-authority handling is an explicit, load-bearing precedence rule (raise, never silently pick a winner) documented only in the schema README.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the most recently confirmed status of the write-integrity hardening effort, and when was it actually last re-verified?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the record whose verified_at (2026-08-18) is the latest primary-evidence check for this specific component.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What was the last real behavior change made to hot-md-curate.py, and on what date did its budget increase to 5,000 characters?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. status_changed_at (2026-08-14) marks the real v3 behavior change, distinct from the record's own later verified_at bump \u2014 tests that retrieval finds the record carrying the actual change date, not merely the most recently-touched file.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "When was job-miss-check.py's monitored-job set last actually changed, and which job was added to it?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated (2026-08-15) reflects the real config change (bo-loop-heartbeat-canary added); status_changed_at (2026-08-09) is an older, different date (the component's creation) \u2014 tests retrieval lands on the record with the right freshness field, not just any date.",
+        "top_result": "Personal/Build Orchestrator/specs/scheduled-job-miss-detection.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the freshest verified fact about which interpreter the brain-dashboard backend currently uses?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated 2026-08-14 (the isolated-venv fix) plus verified_at 2026-08-18 \u2014 the only source with both a recent behavior-change date and a recent re-verification for this exact fact.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/brain-dashboard-fatal-diagnose-fix-output.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to its own review document rather than any live build-tracking state, what verdict, BLOCKER count, and HIGH count did opus-review-phase3-canonical-state-v1 record?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This review was later retired (rejected, terminal) via the audited command queue, but that retirement lives in Build Orchestrator's own state, not in this file. Its own recorded content remains a legitimate, correctly-retrievable historical document.",
+        "top_result": "Personal/Build Orchestrator/specs/opus-review-phase3-canonical-state-v1.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to the opus-review-phase3-canonical-state-v4 review specifically, what gap allowed the repo-checkouts-obsidian-web-mcp record to keep asserting a false claim undetected?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. v4 was deliberately left non-terminal (deferred, not retired \u2014 it still had a live tmux session) rather than archived like v1/v2/v3, so it must remain fully retrievable as still-relevant, not filed away as dead history.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "Per the Canonical State schema, does superseding a record (via superseded_by) delete or rewrite the old record, and where does its data continue to live afterward?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the general isolation RULE (superseded records stay on disk as history, excluded only from resolve_current_state) rather than one applied instance of it.",
+        "top_result": "Personal/Build Orchestrator/specs/vault-canonical-state-live-reality-remediation-v1.md"
+      }
+    ]
+  },
+  "vault_semantic_search": {
+    "current_vs_stale": {
+      "n": 5,
+      "r_at_5": 0.4,
+      "mrr": 0.3286,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "canonical_contradiction_precedence": {
+      "n": 5,
+      "r_at_5": 1.0,
+      "mrr": 1.0,
+      "source_correctness": 1.0,
+      "source_correctness_n": 2
+    },
+    "entities_aliases": {
+      "n": 5,
+      "r_at_5": 0.4,
+      "mrr": 0.2952,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "exact_identifiers": {
+      "n": 5,
+      "r_at_5": 0.8,
+      "mrr": 0.24
+    },
+    "paraphrase": {
+      "n": 5,
+      "r_at_5": 0.0,
+      "mrr": 0.0
+    },
+    "cross_document": {
+      "n": 5,
+      "r_at_5": 0.8,
+      "mrr": 0.5667,
+      "synthesis_hit_rate": 0.0,
+      "synthesis_hit_n": 5
+    },
+    "negative_unknown": {
+      "n": 5,
+      "source_correctness": 0.8,
+      "source_correctness_n": 5
+    },
+    "recent_update_freshness": {
+      "n": 5,
+      "r_at_5": 0.2,
+      "mrr": 0.0722,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "archive_isolation": {
+      "n": 5,
+      "r_at_5": 0.8,
+      "mrr": 0.6,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "known_facts": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.3
+    },
+    "overall": {
+      "n": 50,
+      "r_at_5": 0.5556,
+      "mrr": 0.3781,
+      "source_correctness": 0.8182,
+      "source_correctness_n": 11,
+      "synthesis_hit_rate": 0.0,
+      "synthesis_hit_n": 5
+    },
+    "_rubric_flagged": [
+      {
+        "category": "current_vs_stale",
+        "question": "Is the contradiction-lint weekly job's report-writing path currently migrated onto the shared vault_lock write authority?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current operational status of a specific component with its own canonical-state record \u2014 no separate prose document makes this claim at all, so the record is the only current-state source, not just the preferred one.",
+        "top_result": "Personal/Build Orchestrator/build-logs/vault-contradiction-lint-output.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "As of the most recent verification, has the write-integrity hardening review closed every BLOCKER and HIGH finding against the vault_lock module?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current-state verdict question (\"state: hardened\", 0 BLOCKER/HIGH) \u2014 canonical-state authority, distinct from the underlying review document itself (which is historical evidence, not the current-state summary).",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-bo-authoring-contract-v6.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "What is the current verified git branch and HEAD commit of the dev/cron obsidian-web-mcp checkout?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This exact fact drifted twice in one week (main -> feature/vault-tools-v2 -> back to main) \u2014 only the canonical record's verified_at 2026-08-20 reflects the latest restoration; the underlying SYSTEM-FACTS.md section only covers events through 2026-08-09.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-vault-canonical-state-live-reality-remediation-v1.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Per the Canonical State precedence rule, which source wins for a current-state question: a canonical-state record, or infrastructure-changelog.md?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the precedence RULE itself (the schema doc), not one of its applied instances \u2014 a meta-level question the other two contradiction-precedence entries don't cover.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "If SYSTEM-FACTS.md is completely silent about a component that has its own canonical-state record, which of the two should be trusted for that component's current state?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests the \"consulted when canonical state is silent\" clause of the precedence rule specifically \u2014 the inverse direction from the previous entry (changelog vs canonical-state).",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Two canonical-state records exist for the same component_id and neither carries superseded_by \u2014 what is the schema's required behavior in that situation?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Duplicate-authority handling is an explicit, load-bearing precedence rule (raise, never silently pick a winner) documented only in the schema README.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the most recently confirmed status of the write-integrity hardening effort, and when was it actually last re-verified?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the record whose verified_at (2026-08-18) is the latest primary-evidence check for this specific component.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What was the last real behavior change made to hot-md-curate.py, and on what date did its budget increase to 5,000 characters?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. status_changed_at (2026-08-14) marks the real v3 behavior change, distinct from the record's own later verified_at bump \u2014 tests that retrieval finds the record carrying the actual change date, not merely the most recently-touched file.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/hot-md-curate-v3-output.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "When was job-miss-check.py's monitored-job set last actually changed, and which job was added to it?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated (2026-08-15) reflects the real config change (bo-loop-heartbeat-canary added); status_changed_at (2026-08-09) is an older, different date (the component's creation) \u2014 tests retrieval lands on the record with the right freshness field, not just any date.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/hot-md-apply-and-monitor-gap-output.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the freshest verified fact about which interpreter the brain-dashboard backend currently uses?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated 2026-08-14 (the isolated-venv fix) plus verified_at 2026-08-18 \u2014 the only source with both a recent behavior-change date and a recent re-verification for this exact fact.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to its own review document rather than any live build-tracking state, what verdict, BLOCKER count, and HIGH count did opus-review-phase3-canonical-state-v1 record?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This review was later retired (rejected, terminal) via the audited command queue, but that retirement lives in Build Orchestrator's own state, not in this file. Its own recorded content remains a legitimate, correctly-retrievable historical document.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v4.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to the opus-review-phase3-canonical-state-v4 review specifically, what gap allowed the repo-checkouts-obsidian-web-mcp record to keep asserting a false claim undetected?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. v4 was deliberately left non-terminal (deferred, not retired \u2014 it still had a live tmux session) rather than archived like v1/v2/v3, so it must remain fully retrievable as still-relevant, not filed away as dead history.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Claude-Code-Prompts/bo-unblock-v5-remediation-and-blocked-recommendations-2026-08-18.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "Per the Canonical State schema, does superseding a record (via superseded_by) delete or rewrite the old record, and where does its data continue to live afterward?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the general isolation RULE (superseded records stay on disk as history, excluded only from resolve_current_state) rather than one applied instance of it.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+      }
+    ]
+  },
+  "vault_query": {
+    "current_vs_stale": {
+      "n": 5,
+      "r_at_5": 0.4,
+      "mrr": 0.4429,
+      "source_correctness": 0.5,
+      "source_correctness_n": 2
+    },
+    "canonical_contradiction_precedence": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.34,
+      "source_correctness": 0.5,
+      "source_correctness_n": 2
+    },
+    "entities_aliases": {
+      "n": 5,
+      "r_at_5": 0.4,
+      "mrr": 0.4404,
+      "source_correctness": 1.0,
+      "source_correctness_n": 1
+    },
+    "exact_identifiers": {
+      "n": 5,
+      "r_at_5": 0.8,
+      "mrr": 0.64
+    },
+    "paraphrase": {
+      "n": 5,
+      "r_at_5": 0.0,
+      "mrr": 0.045,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "cross_document": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.6333,
+      "synthesis_hit_rate": 0.6,
+      "synthesis_hit_n": 5
+    },
+    "negative_unknown": {
+      "n": 5,
+      "source_correctness": 1.0,
+      "source_correctness_n": 5
+    },
+    "recent_update_freshness": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.36,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "archive_isolation": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.32,
+      "source_correctness": 0.0,
+      "source_correctness_n": 1
+    },
+    "known_facts": {
+      "n": 5,
+      "r_at_5": 0.6,
+      "mrr": 0.4622
+    },
+    "overall": {
+      "n": 50,
+      "r_at_5": 0.5111,
+      "mrr": 0.4093,
+      "source_correctness": 0.6154,
+      "source_correctness_n": 13,
+      "synthesis_hit_rate": 0.6,
+      "synthesis_hit_n": 5
+    },
+    "_rubric_flagged": [
+      {
+        "category": "current_vs_stale",
+        "question": "Is the contradiction-lint weekly job's report-writing path currently migrated onto the shared vault_lock write authority?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current operational status of a specific component with its own canonical-state record \u2014 no separate prose document makes this claim at all, so the record is the only current-state source, not just the preferred one.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/contradiction-lint.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "As of the most recent verification, has the write-integrity hardening review closed every BLOCKER and HIGH finding against the vault_lock module?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Current-state verdict question (\"state: hardened\", 0 BLOCKER/HIGH) \u2014 canonical-state authority, distinct from the underlying review document itself (which is historical evidence, not the current-state summary).",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "current_vs_stale",
+        "question": "What is the current verified git branch and HEAD commit of the dev/cron obsidian-web-mcp checkout?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This exact fact drifted twice in one week (main -> feature/vault-tools-v2 -> back to main) \u2014 only the canonical record's verified_at 2026-08-20 reflects the latest restoration; the underlying SYSTEM-FACTS.md section only covers events through 2026-08-09.",
+        "top_result": "Personal/Build Orchestrator/specs/vault-canonical-state-live-reality-remediation-v1.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Per the Canonical State precedence rule, which source wins for a current-state question: a canonical-state record, or infrastructure-changelog.md?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the precedence RULE itself (the schema doc), not one of its applied instances \u2014 a meta-level question the other two contradiction-precedence entries don't cover.",
+        "top_result": "BS 2nd Brain/Alcove/Skills/vault-search-rules.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "If SYSTEM-FACTS.md is completely silent about a component that has its own canonical-state record, which of the two should be trusted for that component's current state?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests the \"consulted when canonical state is silent\" clause of the precedence rule specifically \u2014 the inverse direction from the previous entry (changelog vs canonical-state).",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-canonical-state-model-output.md"
+      },
+      {
+        "category": "canonical_contradiction_precedence",
+        "question": "Two canonical-state records exist for the same component_id and neither carries superseded_by \u2014 what is the schema's required behavior in that situation?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Duplicate-authority handling is an explicit, load-bearing precedence rule (raise, never silently pick a winner) documented only in the schema README.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/hot.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the most recently confirmed status of the write-integrity hardening effort, and when was it actually last re-verified?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the record whose verified_at (2026-08-18) is the latest primary-evidence check for this specific component.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What was the last real behavior change made to hot-md-curate.py, and on what date did its budget increase to 5,000 characters?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. status_changed_at (2026-08-14) marks the real v3 behavior change, distinct from the record's own later verified_at bump \u2014 tests that retrieval finds the record carrying the actual change date, not merely the most recently-touched file.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "When was job-miss-check.py's monitored-job set last actually changed, and which job was added to it?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated (2026-08-15) reflects the real config change (bo-loop-heartbeat-canary added); status_changed_at (2026-08-09) is an older, different date (the component's creation) \u2014 tests retrieval lands on the record with the right freshness field, not just any date.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/job-miss-check.md"
+      },
+      {
+        "category": "recent_update_freshness",
+        "question": "What is the freshest verified fact about which interpreter the brain-dashboard backend currently uses?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. content_updated 2026-08-14 (the isolated-venv fix) plus verified_at 2026-08-18 \u2014 the only source with both a recent behavior-change date and a recent re-verification for this exact fact.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to its own review document rather than any live build-tracking state, what verdict, BLOCKER count, and HIGH count did opus-review-phase3-canonical-state-v1 record?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. This review was later retired (rejected, terminal) via the audited command queue, but that retirement lives in Build Orchestrator's own state, not in this file. Its own recorded content remains a legitimate, correctly-retrievable historical document.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v4.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "According to the opus-review-phase3-canonical-state-v4 review specifically, what gap allowed the repo-checkouts-obsidian-web-mcp record to keep asserting a false claim undetected?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. v4 was deliberately left non-terminal (deferred, not retired \u2014 it still had a live tmux session) rather than archived like v1/v2/v3, so it must remain fully retrievable as still-relevant, not filed away as dead history.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+      },
+      {
+        "category": "archive_isolation",
+        "question": "Per the Canonical State schema, does superseding a record (via superseded_by) delete or rewrite the old record, and where does its data continue to live afterward?",
+        "rubric": "No decoy defined for deterministic source/freshness scoring on this question -- manually confirm the tool's top-ranked result actually satisfies the intent below, not just a keyword/topic match. Tests retrieval of the general isolation RULE (superseded records stay on disk as history, excluded only from resolve_current_state) rather than one applied instance of it.",
+        "top_result": "BS 2nd Brain/Alcove/Infrastructure/Build Logs/vault-canonical-state-model-output.md"
+      }
+    ]
+  }
+}

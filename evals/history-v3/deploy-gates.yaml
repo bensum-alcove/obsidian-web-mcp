@@ -1,0 +1,130 @@
+corpus_version: v3.0.0
+baseline_date: '2026-08-20'
+note: Pre-registered from the first v3 baseline run, before any ranking-code change.
+  Calibration floors, not yet tuned against multiple runs -- review before treating
+  as a hard CI gate. A future ranking change should not regress any category below
+  its floor_r_at_5/floor_mrr without an explicit, reviewed justification.
+gates:
+  vault_search:
+    current_vs_stale:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.2
+      n: 5
+    canonical_contradiction_precedence:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.2
+      n: 5
+    entities_aliases:
+      floor_r_at_5: 0.0
+      floor_mrr: 0.0
+      n: 5
+    exact_identifiers:
+      floor_r_at_5: 0.4
+      floor_mrr: 0.4
+      n: 5
+    paraphrase:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.2
+      n: 5
+    cross_document:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.6
+      n: 5
+    recent_update_freshness:
+      floor_r_at_5: 0.0
+      floor_mrr: 0.0286
+      n: 5
+    archive_isolation:
+      floor_r_at_5: 0.0
+      floor_mrr: 0.0
+      n: 5
+    known_facts:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.2
+      n: 5
+    overall:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.2032
+      n: 50
+  vault_semantic_search:
+    current_vs_stale:
+      floor_r_at_5: 0.4
+      floor_mrr: 0.3286
+      n: 5
+    canonical_contradiction_precedence:
+      floor_r_at_5: 1.0
+      floor_mrr: 1.0
+      n: 5
+    entities_aliases:
+      floor_r_at_5: 0.4
+      floor_mrr: 0.2952
+      n: 5
+    exact_identifiers:
+      floor_r_at_5: 0.8
+      floor_mrr: 0.24
+      n: 5
+    paraphrase:
+      floor_r_at_5: 0.0
+      floor_mrr: 0.0
+      n: 5
+    cross_document:
+      floor_r_at_5: 0.8
+      floor_mrr: 0.5667
+      n: 5
+    recent_update_freshness:
+      floor_r_at_5: 0.2
+      floor_mrr: 0.0722
+      n: 5
+    archive_isolation:
+      floor_r_at_5: 0.8
+      floor_mrr: 0.6
+      n: 5
+    known_facts:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.3
+      n: 5
+    overall:
+      floor_r_at_5: 0.5556
+      floor_mrr: 0.3781
+      n: 50
+  vault_query:
+    current_vs_stale:
+      floor_r_at_5: 0.4
+      floor_mrr: 0.4429
+      n: 5
+    canonical_contradiction_precedence:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.34
+      n: 5
+    entities_aliases:
+      floor_r_at_5: 0.4
+      floor_mrr: 0.4404
+      n: 5
+    exact_identifiers:
+      floor_r_at_5: 0.8
+      floor_mrr: 0.64
+      n: 5
+    paraphrase:
+      floor_r_at_5: 0.0
+      floor_mrr: 0.045
+      n: 5
+    cross_document:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.6333
+      n: 5
+    recent_update_freshness:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.36
+      n: 5
+    archive_isolation:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.32
+      n: 5
+    known_facts:
+      floor_r_at_5: 0.6
+      floor_mrr: 0.4622
+      n: 5
+    overall:
+      floor_r_at_5: 0.5111
+      floor_mrr: 0.4093
+      n: 50

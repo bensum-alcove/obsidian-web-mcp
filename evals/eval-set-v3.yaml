@@ -1,0 +1,528 @@
+# vault-retrieval-eval-v3 — frozen benchmark corpus, versioned independently of
+# evals/eval-set.yaml (v2). v2's corpus, runner (run_eval.py), and history/
+# directory are UNCHANGED and continue running on their own weekly cadence for
+# time-series continuity — this is a NEW, additive benchmark, not a migration.
+#
+# Where v2's categories were topic-domain buckets (clients/infrastructure/
+# skills/operations), v3's ten categories are retrieval-CAPABILITY buckets —
+# each one isolates a specific way retrieval can go right or wrong. All
+# expected_paths/decoy_paths below were verified against the live BS Brain
+# vault filesystem (/home/ben_sum/vaults/bs-brain) on 2026-08-20 by direct
+# read, not guessed or copied from an older report.
+#
+# Schema per entry:
+#   question       (required) natural-language query
+#   category       (required) one of the ten below
+#   expected_paths (required) vault-root-relative correct answer path(s).
+#                  Empty list ONLY when negative: true.
+#   category_note  (optional) why this question belongs to this category —
+#                  completion-criterion "expected paths / current-vs-history
+#                  intent justified".
+#   decoy_paths    (optional) known-wrong paths a naive keyword/semantic match
+#                  could surface instead — a stale duplicate, a superseded/
+#                  retired document, or a topically-adjacent-but-unrelated
+#                  file. Used for answer-level source-correctness scoring,
+#                  not for R@5/MRR.
+#   negative       (optional, default false) true for genuinely unanswerable
+#                  questions (category: negative_unknown) — no correct path
+#                  exists anywhere in the vault. Scored as source-correctness
+#                  only (did the tool avoid confidently returning a decoy),
+#                  never as a plain R@5/MRR hit since expected_paths is empty.
+#   require_all    (optional, default false) for cross_document questions:
+#                  true means a full "synthesis hit" requires ALL
+#                  expected_paths to appear somewhere in the top-N, not just
+#                  one (see run_eval_v3.py's synthesis_hit metric).
+#
+# Corpus hash/version freeze: see evals/history-v3/CORPUS_HASH (written by
+# run_eval_v3.py's --freeze-corpus step). Any edit to this file after the
+# freeze must bump the version comment below and re-run --freeze-corpus
+# deliberately — the runner's startup guard fails loudly on a silent
+# corpus-hash drift once frozen.
+#
+# corpus_version: v3.0.0
+
+- question: "Right now, which Windows Task Scheduler task actually starts WSL on boot?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/bsminipc-boot-chain.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
+  category_note: >
+    infrastructure.md line ~108 still literally reads "MCP Services (All) ...
+    Only Task Scheduler task still in use" even though a superseded-flag
+    callout sits right above it. The canonical-state record is the only
+    place the CURRENT answer (MCP WSL Wake) is stated without a stale claim
+    alongside it.
+
+- question: "Is the plain, non-CDP `playwright-mcp` supervisord program currently running on this box?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/playwright-mcp-status.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
+  category_note: >
+    infrastructure.md's Playwright MCP section literally still reads "legacy
+    — kept running, not primary" (pre-2026-08-09 decommission wording).
+    The canonical record is the only source stating the current truth
+    (fully decommissioned) without also asserting the outdated claim.
+
+- question: "Is the contradiction-lint weekly job's report-writing path currently migrated onto the shared vault_lock write authority?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/contradiction-lint.md"
+  category_note: >
+    Current operational status of a specific component with its own
+    canonical-state record — no separate prose document makes this claim at
+    all, so the record is the only current-state source, not just the
+    preferred one.
+
+- question: "As of the most recent verification, has the write-integrity hardening review closed every BLOCKER and HIGH finding against the vault_lock module?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-write-integrity.md"
+  category_note: >
+    Current-state verdict question ("state: hardened", 0 BLOCKER/HIGH) —
+    canonical-state authority, distinct from the underlying review document
+    itself (which is historical evidence, not the current-state summary).
+
+- question: "What is the current verified git branch and HEAD commit of the dev/cron obsidian-web-mcp checkout?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/repo-checkouts-obsidian-web-mcp.md"
+  category_note: >
+    This exact fact drifted twice in one week (main -> feature/vault-tools-v2
+    -> back to main) — only the canonical record's verified_at 2026-08-20
+    reflects the latest restoration; the underlying SYSTEM-FACTS.md section
+    only covers events through 2026-08-09.
+
+- question: "infrastructure.md's 'Scheduled tasks' line calls \"MCP Services (All)\" the task actually in use, while a canonical-state record says otherwise for the exact same fact — which source wins for a current-state question, and what does it actually say?"
+  category: canonical_contradiction_precedence
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/bsminipc-boot-chain.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
+  category_note: >
+    Directly tests the precedence rule (canonical-state > changelog >
+    SYSTEM-FACTS.md > hot.md) against a real, live pair of disagreeing
+    documents on the same fact.
+
+- question: "infrastructure.md's Playwright MCP section describes the plain playwright-mcp program as legacy-but-still-running — given the Canonical State precedence rule, which document should actually be trusted for whether that's still true?"
+  category: canonical_contradiction_precedence
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/playwright-mcp-status.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
+  category_note: >
+    Same precedence mechanism as the boot-chain pair above, over a
+    different, independently-verified contradicting fact — two instances
+    guard against a category that only "works" for one lucky example.
+
+- question: "Per the Canonical State precedence rule, which source wins for a current-state question: a canonical-state record, or infrastructure-changelog.md?"
+  category: canonical_contradiction_precedence
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+  category_note: >
+    Tests retrieval of the precedence RULE itself (the schema doc), not one
+    of its applied instances — a meta-level question the other two
+    contradiction-precedence entries don't cover.
+
+- question: "If SYSTEM-FACTS.md is completely silent about a component that has its own canonical-state record, which of the two should be trusted for that component's current state?"
+  category: canonical_contradiction_precedence
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+  category_note: >
+    Tests the "consulted when canonical state is silent" clause of the
+    precedence rule specifically — the inverse direction from the previous
+    entry (changelog vs canonical-state).
+
+- question: "Two canonical-state records exist for the same component_id and neither carries superseded_by — what is the schema's required behavior in that situation?"
+  category: canonical_contradiction_precedence
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+  category_note: >
+    Duplicate-authority handling is an explicit, load-bearing precedence
+    rule (raise, never silently pick a winner) documented only in the
+    schema README.
+
+- question: "The 'live' obsidian-web-mcp checkout goes by several descriptions in the vault (the MCP-serving copy, the /mnt/c copy, the feature/vault-tools-v2 checkout) — what is its actual filesystem path and current git branch?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/repo-checkouts-obsidian-web-mcp.md"
+  category_note: >
+    Tests resolving a component referred to by role ("live") rather than by
+    its filename-derived component_id or literal path.
+
+- question: "Sean Huang's client file is filed under his full legal first name rather than the short form he's referred to by — what is the on-file legal name, and what facility size and LVR are being sought against the Bellevue Hill property?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Huang, Xuan Yuan & Wang, Xinying.md"
+  category_note: >
+    Filename uses the legal given name "Xuan Yuan"; the question uses the
+    common short form "Sean" — tests alias resolution between a formal
+    record key and an informal name used in conversation.
+
+- question: "'BSMiniPC' is a nickname used throughout the infrastructure docs for which physical machine, and what operating system does it actually run?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Tests resolving an informal hostname/nickname to the underlying
+    hardware fact rather than treating it as an unresolvable proper noun.
+
+- question: "Which document covers the three scheduled Windows tasks making up ClawBot's gateway watchdog and how often the main one runs, as opposed to the document that only covers the original topology decision?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/ClawBot Gateway Stability Fix.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/ClawBot Topology Decision.md"
+  category_note: >
+    Two real documents share the "ClawBot" entity name but cover distinct
+    facts (topology decision vs. later stability/watchdog fix) — tests
+    disambiguating between same-entity, different-document facts.
+
+- question: "The Build Orchestrator's dashboard is referred to by name in some places and only by its localhost port in others — what port does it actually run on?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Tests resolving a named service ("BO dashboard") to its numeric
+    identifier fact within the same source document.
+
+- question: "What are the exact port numbers for the BS Brain, CB Brain, and Alcove Brain vault MCP servers, respectively?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-mcp-topology.md"
+  category_note: >
+    Exact-identifier retrieval (three distinct port numbers) must resolve to
+    the single record carrying all three, not a fragment of one from
+    scattered prose.
+
+- question: "What is the exact environment variable name for the vault MCP bearer token, spelled exactly?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    A near-miss identifier (VAULT_AUTH_TOKEN) exists in the same document as
+    a documented-wrong draft name — tests exact-string precision, not just
+    topical relevance.
+
+- question: "What is the exact filesystem path to the script that starts the SPI trading system?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Exact path-string retrieval (`scripts/start-trading.sh` under a specific
+    repo root), distinguishable from the near-identical HSI start script in
+    the same table.
+
+- question: "What is the exact IBKR paper trading account number used by the Edge Trading System?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    A single alphanumeric identifier (account number) buried in a fact
+    table — tests precision retrieval of one exact token, not a paraphrase-
+    tolerant fact.
+
+- question: "What exact port does the legacy Playwright MCP CDP fallback bind to?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/playwright-mcp-status.md"
+  category_note: >
+    The same port number (8429) appears in two different documents for two
+    different (confusable) programs — tests retrieving the record that
+    correctly attributes it to playwright-mcp-cdp, not the decommissioned
+    plain playwright-mcp.
+
+- question: "In plain terms, which of the two Task Scheduler jobs is the one that actually wakes WSL up when the machine boots, not just the one that sounds like the main one?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/bsminipc-boot-chain.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure.md"
+  category_note: >
+    Deliberate full-vocabulary rewrite of the current_vs_stale boot-chain
+    question above with zero shared distinctive keywords ("MCP WSL Wake",
+    "Task Scheduler") — tests semantic vs. literal-keyword retrieval on an
+    already-verified pair.
+
+- question: "For the trading system, what's the score floor below which a setup gets rejected outright, and what config knob controls that number?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Reworded restatement of the known_facts MIN_SCORE_TO_TRADE question
+    below, avoiding the literal term "minimum score" and the env var name
+    entirely.
+
+- question: "Which network port serves the public dashboard people reach at brain.bensum.org?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/brain-dashboard.md"
+  category_note: >
+    Reworded restatement of the known_facts brain-dashboard port question,
+    naming the public URL instead of the component_id or "backend port".
+
+- question: "Where does the Huang and Wang household's push for extra borrowing capacity stand, loan-to-value-wise, against their harbourside Sydney property?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Huang, Xuan Yuan & Wang, Xinying.md"
+  category_note: >
+    Full-vocabulary paraphrase of the entities_aliases Sean Huang question,
+    dropping "Sean", "Bellevue Hill", and "facility size" entirely in favor
+    of "harbourside" and "borrowing capacity".
+
+- question: "When someone on call is troubleshooting a vault MCP tunnel and it's returning errors, which specific HTTP status code means the underlying process died rather than just the tunnel dropping?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Reworded restatement of an exact_identifiers-adjacent fact (502 = process
+    down, not tunnel) using "troubleshooting" framing rather than a direct
+    "what does X mean" phrasing.
+
+- question: "Which checkout serves live vault MCP traffic, and on what port does the BS Brain vault server run from that checkout?"
+  category: cross_document
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/repo-checkouts-obsidian-web-mcp.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-mcp-topology.md"
+  require_all: true
+  category_note: >
+    No single record answers both halves: repo-checkouts identifies WHICH
+    checkout is live; vault-mcp-topology gives the PORT. A correct synthesis
+    answer needs both.
+
+- question: "What caused the 2026-08-13 WSL restart-loop incident, and which canonical-state record now documents the corrected boot-chain understanding that came out of it?"
+  category: cross_document
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/bsminipc-boot-chain.md"
+  require_all: true
+  category_note: >
+    The changelog holds the historical incident narrative; the canonical
+    record holds the resulting current-state correction — the question
+    explicitly asks for both halves.
+
+- question: "Which independent review approved the vault-write-integrity hardening work, and what residual MEDIUM findings does the canonical-state record still flag as unresolved?"
+  category: cross_document
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase2-write-integrity-v4.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-write-integrity.md"
+  require_all: true
+  category_note: >
+    Tests synthesis across a review artifact (verdict/evidence) and its
+    corresponding canonical-state summary (current residual status) —
+    genuinely different information lives in each.
+
+- question: "What decommissioned the legacy playwright-mcp program, and which infrastructure changelog entry records the exact date it happened?"
+  category: cross_document
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/playwright-mcp-status.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"
+  require_all: true
+  category_note: >
+    The canonical record explains WHY/WHAT; the changelog is the dated
+    historical record of WHEN — both are legitimately correct halves of one
+    question, not a stale-vs-current pair.
+
+- question: "Who is the broker of record on Westpac Private application packs, and separately, what voice and sign-off convention should a first-home-buyer lending strategy email follow?"
+  category: cross_document
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Skills/WBC-Private-Application-Pack-SOP.md"
+    - "BS 2nd Brain/Alcove/Skills/FHB-Lending-Strategy-Email.md"
+  require_all: true
+  category_note: >
+    Two genuinely unrelated skills documents stitched into one compound
+    question — tests pure multi-document retrieval with no shared topic
+    thread to lean on, unlike the other cross_document entries above.
+
+- question: "What is the SLA-guaranteed incident response time specified in Alcove's cyber-insurance policy renewal for October 2026?"
+  category: negative_unknown
+  expected_paths: []
+  negative: true
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-07-02 Efex Cyber Security Quote Review - Tisha.md"
+  category_note: >
+    No cyber-insurance policy (as distinct from the real Efex cyber-security
+    quote, which is a different product) or October 2026 renewal exists
+    anywhere in the vault — fabricated premise. The Efex quote doc is
+    topically the closest real document and is the likely false-positive.
+
+- question: "Which lender currently finances Chris Bates' own personal home loan?"
+  category: negative_unknown
+  expected_paths: []
+  negative: true
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-04-23 Broker Codes & RLM Transition - Tisha & Jon.md"
+  category_note: >
+    Chris Bates appears in the vault only as the principal/broker-code
+    holder, never as a client with his own recorded loan — no such fact
+    exists. The broker-codes operations doc is the closest real document
+    mentioning him by name.
+
+- question: "What was the total dollar loss recorded from the 2026-05-16 vault-mcp HTTP 524 incident?"
+  category: negative_unknown
+  expected_paths: []
+  negative: true
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/vault-mcp-524-incident-2026-05-16.md"
+  category_note: >
+    The real incident doc covers root cause and the initial wrong
+    suspicion, never a dollar-loss figure (there wasn't one to record) —
+    tests whether retrieval still confidently surfaces the topically
+    adjacent real document as if it answered a fact it doesn't contain.
+
+- question: "What GPU model is installed in BSMiniPC for local LLM inference?"
+  category: negative_unknown
+  expected_paths: []
+  negative: true
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    SYSTEM-FACTS.md's BSMiniPC Core Facts table documents RAM, OS, and
+    supervisord paths but no GPU — LLM inference on this box is remote
+    (Claude API), not local. No GPU fact exists to retrieve.
+
+- question: "Which vendor provides Alcove's professional indemnity insurance renewal quote for 2026?"
+  category: negative_unknown
+  expected_paths: []
+  negative: true
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Operations/2026-07-02 Efex Cyber Security Quote Review - Tisha.md"
+  category_note: >
+    Efex is recorded only for a cyber-security quote, not professional
+    indemnity insurance — a different, unrecorded product entirely.
+
+- question: "As of the most recent verification, what branch is the dev/cron obsidian-web-mcp checkout on, and when was that last actually confirmed against live git state?"
+  category: recent_update_freshness
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/repo-checkouts-obsidian-web-mcp.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Canonical record verified_at 2026-08-20 is the freshest evidence on this
+    exact fact anywhere in the vault; SYSTEM-FACTS.md's Repo Checkouts
+    section only narrates events through 2026-08-09 and is silent on the
+    two later drift/restore events — a real freshness gap, not a fabricated one.
+
+- question: "What is the most recently confirmed status of the write-integrity hardening effort, and when was it actually last re-verified?"
+  category: recent_update_freshness
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-write-integrity.md"
+  category_note: >
+    Tests retrieval of the record whose verified_at (2026-08-18) is the
+    latest primary-evidence check for this specific component.
+
+- question: "What was the last real behavior change made to hot-md-curate.py, and on what date did its budget increase to 5,000 characters?"
+  category: recent_update_freshness
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/hot-md-curation.md"
+  category_note: >
+    status_changed_at (2026-08-14) marks the real v3 behavior change,
+    distinct from the record's own later verified_at bump — tests that
+    retrieval finds the record carrying the actual change date, not merely
+    the most recently-touched file.
+
+- question: "When was job-miss-check.py's monitored-job set last actually changed, and which job was added to it?"
+  category: recent_update_freshness
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/job-miss-check.md"
+  category_note: >
+    content_updated (2026-08-15) reflects the real config change
+    (bo-loop-heartbeat-canary added); status_changed_at (2026-08-09) is an
+    older, different date (the component's creation) — tests retrieval
+    lands on the record with the right freshness field, not just any date.
+
+- question: "What is the freshest verified fact about which interpreter the brain-dashboard backend currently uses?"
+  category: recent_update_freshness
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/brain-dashboard.md"
+  category_note: >
+    content_updated 2026-08-14 (the isolated-venv fix) plus verified_at
+    2026-08-18 — the only source with both a recent behavior-change date and
+    a recent re-verification for this exact fact.
+
+- question: "According to its own review document rather than any live build-tracking state, what verdict, BLOCKER count, and HIGH count did opus-review-phase3-canonical-state-v1 record?"
+  category: archive_isolation
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v1.md"
+  category_note: >
+    This review was later retired (rejected, terminal) via the audited
+    command queue, but that retirement lives in Build Orchestrator's own
+    state, not in this file. Its own recorded content remains a legitimate,
+    correctly-retrievable historical document.
+
+- question: "According to the opus-review-phase3-canonical-state-v4 review specifically, what gap allowed the repo-checkouts-obsidian-web-mcp record to keep asserting a false claim undetected?"
+  category: archive_isolation
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v4.md"
+  category_note: >
+    v4 was deliberately left non-terminal (deferred, not retired — it still
+    had a live tmux session) rather than archived like v1/v2/v3, so it must
+    remain fully retrievable as still-relevant, not filed away as dead history.
+
+- question: "For a question about the CURRENT branch of the dev/cron obsidian-web-mcp checkout today, which single document is the authority — and why shouldn't the older opus-review-phase3-canonical-state-v1/v2/v3 review documents be treated as current evidence for that fact?"
+  category: archive_isolation
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/repo-checkouts-obsidian-web-mcp.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v1.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v2.md"
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase3-canonical-state-v4.md"
+  category_note: >
+    Isolation test: retired/superseded review documents about this exact
+    component are real, topically on-point, and retired-terminal — a
+    current-state question must not let them leak into the top results
+    ahead of the canonical-state record.
+
+- question: "Which document was the very first review pass examining write-integrity phase 2, before any -v2/-v3/-v4 revision existed?"
+  category: archive_isolation
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/codex-review-phase2-write-integrity.md"
+  decoy_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-phase2-write-integrity-v4.md"
+  category_note: >
+    Tests retrieval of the earliest artifact in a versioned review chain
+    specifically, not the latest/most-authoritative one that a recency-
+    biased ranker would otherwise prefer.
+
+- question: "Per the Canonical State schema, does superseding a record (via superseded_by) delete or rewrite the old record, and where does its data continue to live afterward?"
+  category: archive_isolation
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/README.md"
+  category_note: >
+    Tests retrieval of the general isolation RULE (superseded records stay
+    on disk as history, excluded only from resolve_current_state) rather
+    than one applied instance of it.
+
+- question: "What are the three IBKR client IDs used by the Edge Trading System, and which sub-system does each one belong to?"
+  category: known_facts
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: >
+    Plain, uncontested, single-document fact lookup — the control case
+    every other category is a variation on.
+
+- question: "What is the minimum score (out of 80) required for the Edge Trading System to place a trade, and what environment variable controls it?"
+  category: known_facts
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: "Plain, uncontested fact lookup with an exact numeric threshold."
+
+- question: "What port does the brain-dashboard backend run on, and what interpreter does it use?"
+  category: known_facts
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/brain-dashboard.md"
+  category_note: "Plain current-fact lookup, no contradiction or staleness involved."
+
+- question: "Which MCP tool call reliably indicates whether the Home Assistant MCP process itself is down, as opposed to just its tunnel?"
+  category: known_facts
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  category_note: "Plain, uncontested fact lookup outside the canonical-state folder entirely."
+
+- question: "Is the vault-safety-sweep script currently scheduled in crontab, and what is its default mode for content and permission repairs?"
+  category: known_facts
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-safety-sweep.md"
+  category_note: "Plain current-fact lookup with a deliberately unscheduled (not active) state, as a control against category bias toward 'active' components."
