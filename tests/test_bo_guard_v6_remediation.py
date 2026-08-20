@@ -353,14 +353,184 @@ def test_mixed_project_from_sibling_still_blocks(monkeypatch, vault_dir):
         bo_contract, "preflight_source_schedule",
         lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-mixed.yaml"}},
     )
-    monkeypatch.setattr(
-        bo_contract, "validate_graph",
-        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+    def _validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        # Baseline (compat_existing) is clean -- this edit is what
+        # introduces the mix, not a pre-existing legacy condition
+        # (vault-bo-authoring-enforcement-readiness-v1, Phase 1: only a
+        # BASELINE-IDENTICAL mixed_project_schedule message is compatible;
+        # a newly-introduced one must still reject).
+        if mode == "compat_existing":
+            return {"ok": True, "errors": [], "warnings": []}
+        return {
             "ok": False,
             "errors": [{"code": "mixed_project_schedule", "message": "mixed projects", "path": "Personal/Build Orchestrator/schedules/2026-W99-mixed.yaml"}],
             "warnings": [],
-        },
+        }
+
+    monkeypatch.setattr(bo_contract, "validate_graph", _validate_graph)
+
+    with pytest.raises(bo_guard.BOGuardError):
+        vault.write_file_atomic("Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write")
+    assert spec_file.read_text() == "old body"
+
+
+def test_unchanged_baseline_mixed_project_does_not_block_benign_edit(monkeypatch, vault_dir):
+    """vault-bo-authoring-enforcement-readiness-v1, Phase 1: a
+    mixed_project_schedule finding whose message is byte-identical between
+    the baseline (unedited) graph and the proposed graph describes a
+    pre-existing legacy condition this content-only edit does not touch --
+    it must not, by itself, make an otherwise-valid edit impossible."""
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# w\n\nbuilds:\n\n"
+        "  - id: other-project-sibling\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/other-project-sibling.md\n"
+        "  - id: rv6-target\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/rv6-target.md\n"
     )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-legacy-mixed.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    spec_file = vault_dir / "Personal" / "Build Orchestrator" / "specs" / "rv6-target.md"
+    spec_file.parent.mkdir(parents=True, exist_ok=True)
+    spec_file.write_text("old body")
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"rv6-target": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {"ok": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed.yaml"}},
+    )
+
+    same_message = (
+        "schedule 'Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed.yaml' would contain "
+        "builds resolving to ['edge-trading-system', 'other-project'] — one schedule file must be "
+        "single-project; use separate schedule files with cross-schedule dependencies"
+    )
+
+    def _validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        # Identical message regardless of mode -- the mix is unchanged by
+        # this edit (build_id's own project never changed), only its
+        # severity bucket differs (warning at baseline, would-be-error when
+        # proposed), which is exactly what Phase 1's compatibility rule must
+        # detect and drop.
+        return {
+            "ok": mode == "compat_existing",
+            "errors": [] if mode == "compat_existing" else [
+                {"code": "mixed_project_schedule", "message": same_message,
+                 "path": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed.yaml"},
+            ],
+            "warnings": [
+                {"code": "mixed_project_schedule", "message": same_message,
+                 "path": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed.yaml"},
+            ] if mode == "compat_existing" else [],
+        }
+
+    monkeypatch.setattr(bo_contract, "validate_graph", _validate_graph)
+
+    is_new, _ = vault.write_file_atomic(
+        "Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write",
+    )
+    assert not is_new
+    assert spec_file.read_text() == "new body"
+
+
+def test_changed_mixed_project_set_still_blocks(monkeypatch, vault_dir):
+    """Control for the above: if the proposed graph's mixed_project_schedule
+    message DIFFERS from the baseline's (e.g. build_id's own project edit
+    changed the resulting project set), the edit genuinely changed the
+    condition and must still reject."""
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# w\n\nbuilds:\n\n"
+        "  - id: other-project-sibling\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/other-project-sibling.md\n"
+        "  - id: rv6-target\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/rv6-target.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-legacy-mixed2.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    spec_file = vault_dir / "Personal" / "Build Orchestrator" / "specs" / "rv6-target.md"
+    spec_file.parent.mkdir(parents=True, exist_ok=True)
+    spec_file.write_text("old body")
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"rv6-target": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {"ok": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed2.yaml"}},
+    )
+
+    def _validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        if mode == "compat_existing":
+            return {
+                "ok": False,
+                "errors": [],
+                "warnings": [{"code": "mixed_project_schedule", "message": "resolving to ['edge-trading-system', 'other-project']",
+                              "path": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed2.yaml"}],
+            }
+        return {
+            "ok": False,
+            "errors": [{"code": "mixed_project_schedule", "message": "resolving to ['other-project', 'third-project']",
+                        "path": "Personal/Build Orchestrator/schedules/2026-W99-legacy-mixed2.yaml"}],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(bo_contract, "validate_graph", _validate_graph)
+
+    with pytest.raises(bo_guard.BOGuardError):
+        vault.write_file_atomic("Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write")
+    assert spec_file.read_text() == "old body"
+
+
+def test_dependency_cycle_always_blocks_regardless_of_baseline_match(monkeypatch, vault_dir):
+    """Control: Phase 1's baseline-vs-proposed compatibility carve-out is
+    scoped ONLY to mixed_project_schedule -- a dependency_cycle finding must
+    remain unconditionally blocking even when byte-identical between
+    baseline and proposed."""
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# w\n\nbuilds:\n\n"
+        "  - id: rv6-target\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/rv6-target.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / "2026-W99-cycle.yaml"
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    spec_file = vault_dir / "Personal" / "Build Orchestrator" / "specs" / "rv6-target.md"
+    spec_file.parent.mkdir(parents=True, exist_ok=True)
+    spec_file.write_text("old body")
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"rv6-target": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {"ok": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-cycle.yaml"}},
+    )
+
+    same_cycle_message = "dependency cycle: rv6-target -> rv6-target"
+
+    def _validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        return {
+            "ok": mode == "compat_existing",
+            "errors": [] if mode == "compat_existing" else [{"code": "dependency_cycle", "message": same_cycle_message}],
+            "warnings": [{"code": "dependency_cycle", "message": same_cycle_message}] if mode == "compat_existing" else [],
+        }
+
+    monkeypatch.setattr(bo_contract, "validate_graph", _validate_graph)
 
     with pytest.raises(bo_guard.BOGuardError):
         vault.write_file_atomic("Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write")

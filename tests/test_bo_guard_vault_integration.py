@@ -209,6 +209,15 @@ def test_second_activation_boundary_check_catches_a_change_and_blocks_commit(mon
     calls = {"n": 0}
 
     def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        # Only count the PROPOSED (strict_new) call in each guard evaluation
+        # -- Phase 1 (vault-bo-authoring-enforcement-readiness-v1) added an
+        # extra baseline (compat_existing) call per evaluation purely to
+        # detect pre-existing mixed_project_schedule conditions; it carries
+        # no enforcement decision of its own and must always read as clean
+        # here so it never confuses this test's "first vs. second real
+        # evaluation" counter.
+        if mode == "compat_existing":
+            return {"ok": True, "errors": [], "warnings": []}
         calls["n"] += 1
         if calls["n"] == 1:
             return {"ok": True, "errors": [], "warnings": []}
@@ -252,6 +261,11 @@ def test_activation_boundary_check_passes_through_when_nothing_changed(monkeypat
     calls = {"n": 0}
 
     def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
+        # See the sibling test above: only strict_new (proposed) calls are
+        # counted, since Phase 1's added compat_existing baseline call
+        # carries no enforcement decision of its own.
+        if mode == "compat_existing":
+            return {"ok": True, "errors": [], "warnings": []}
         calls["n"] += 1
         return {"ok": True, "errors": [], "warnings": []}
 

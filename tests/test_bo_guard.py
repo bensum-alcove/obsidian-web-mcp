@@ -573,7 +573,16 @@ def test_spec_rewrite_bound_to_schedule_revalidates_whole_graph_with_proposed_by
     seen_calls = []
 
     def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
-        seen_calls.append((nodes, new_ids))
+        seen_calls.append((nodes, new_ids, mode))
+        # Baseline (compat_existing) reflects the schedule as it exists on
+        # disk today -- clean, no mix. Only the PROPOSED graph (strict_new,
+        # built_id's node substituted with the new bytes) introduces the
+        # mixed_project_schedule finding, proving this specific edit is what
+        # invalidates the graph (vault-bo-authoring-enforcement-readiness-v1,
+        # Phase 1's baseline-vs-proposed comparison must not treat a
+        # genuinely NEW condition as pre-existing/compatible).
+        if mode == "compat_existing":
+            return {"ok": True, "errors": [], "warnings": []}
         return {
             "ok": False,
             "errors": [{"code": "mixed_project_schedule", "message": "project changed", "build_id": "scratch-build"}],
@@ -587,7 +596,8 @@ def test_spec_rewrite_bound_to_schedule_revalidates_whole_graph_with_proposed_by
     )
     assert any(i.rule_id == "bo-guard-spec-rewrite-graph" for i in result.issues)
     assert seen_calls
-    nodes, new_ids = seen_calls[-1]
+    nodes, new_ids, mode = seen_calls[-1]
+    assert mode == "strict_new"
     assert new_ids == ["scratch-build"]
     assert nodes[0]["build_id"] == "scratch-build"
     assert nodes[0]["spec_markdown"] == "new spec body"
@@ -831,7 +841,12 @@ def test_spec_rewrite_discovers_referring_schedule_from_disk_when_not_in_db(monk
 
     def fake_validate_graph(nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None):
         seen_calls.append((nodes, new_ids))
-        return {"ok": False, "errors": [{"code": "mixed_project_schedule", "message": "bad", "build_id": "scratch-build"}], "warnings": []}
+        # duplicate_id_in_graph, not mixed_project_schedule: this test is
+        # about disk-based schedule discovery (HI-2b), not mixed-project
+        # baseline-vs-proposed semantics (vault-bo-authoring-enforcement-
+        # readiness-v1, Phase 1) -- any reject-severity graph code proves the
+        # same thing here.
+        return {"ok": False, "errors": [{"code": "duplicate_id_in_graph", "message": "bad", "build_id": "scratch-build"}], "warnings": []}
 
     monkeypatch.setattr(bo_contract, "validate_graph", fake_validate_graph)
 

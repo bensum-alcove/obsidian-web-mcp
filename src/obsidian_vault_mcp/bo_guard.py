@@ -221,6 +221,44 @@ vault-bo-authoring-guard-remediation-v6, still shadow-only:
   zero repo-internal imports by design, precisely so an external consumer
   like this one could load it without duplicating its logic or waiting on a
   BO-repo change.
+
+vault-bo-authoring-enforce-v2 (2026-08-19) verified this module's guard
+implementation itself is sound and reviewed, then re-ran
+vault-bo-authoring-cache-remediation-v7's real-corpus readiness report and
+found every then-current pre-dispatch build was blocked by its own genuine
+missing_summary_instruction defect, and 10/13 also carried an unrelated,
+never-sole-blocking mixed_project_schedule finding from the legacy
+2026-W34-bs-brain-hardening-v1.yaml schedule (which mixes the
+mcp-infrastructure and obsidian-web-mcp projects) -- a real readiness gap,
+not a guard-correctness defect, so activation was deliberately stopped
+rather than freezing normal editing of every real pre-dispatch build.
+
+vault-bo-authoring-enforcement-readiness-v1 (2026-08-21) closes that
+readiness gap with a narrow, mechanically-derived compatibility rule in
+_revalidate_schedule_with_proposed_spec (the spec-rewrite graph-revalidation
+path only -- _schedule_rewrite_issues, which handles genuine schedule
+mutations, is untouched and remains fully strict): before substituting the
+proposed spec bytes, the function now also computes a BASELINE graph result
+(mode="compat_existing", no substitution -- exactly what's on disk today)
+and, when converting the PROPOSED graph result's errors to issues, drops any
+mixed_project_schedule finding whose message is byte-identical to one
+already present in that baseline. The message embeds the exact sorted() set
+of resolved projects, so this is a pure "unchanged legacy condition, not
+introduced or worsened by this edit" test -- any edit that changes the
+resulting project set (a genuinely new mix, a different project, one fewer
+conflicting project) produces a different message and is never dropped.
+Scoped to this single code only: dependency_cycle, unknown_project, and
+every per-node content-shape code remain unconditionally blocking, matching
+the existing HI5-3/cache-remediation-v7 sibling-attribution filter's own
+precedent of narrow, mechanically-justified scope. Verified against the live
+real corpus (not synthetic fixtures): the legacy schedule's mixed condition
+is confirmed unchanged before/after for every currently-affected build, and
+a real negative canary (mutating a real build's own resolved project) still
+rejects, with a NEW mixed_project_schedule message reflecting the changed
+project set. Still shadow-only; BO_PATH_GUARD_MODE activation is this same
+build's own later phase, gated on independent review of this exact change
+plus a hash-pinned summary-instruction backfill manifest for the remaining
+real defect.
 """
 
 from __future__ import annotations
@@ -661,22 +699,41 @@ def _revalidate_schedule_with_proposed_spec(
 
     schedule_project = _schedule_project_from_content(schedule_content)
     nodes = _nodes_for_schedule_builds(builds, schedule_path, schedule_project)
-    # Substitute the proposed new spec content for this build_id's node so
-    # the graph is validated against the bytes that WOULD exist after this
-    # write commits, not what's currently on disk under specs/.
-    matched = False
-    for node in nodes:
-        if node["build_id"] == build_id:
-            node["spec_markdown"] = new_spec_content
-            matched = True
 
-    if not matched:
+    if not any(node["build_id"] == build_id for node in nodes):
         return [ValidationIssue(
             "bo-guard-spec-rewrite-graph", "reject",
             f"{build_id!r} is referenced by schedule {schedule_path!r} but no entry with that id is "
             "present in its builds: list -- failing closed rather than validating the graph without "
             "the proposed bytes",
         )]
+
+    # Baseline (vault-bo-authoring-enforcement-readiness-v1, Phase 1): the
+    # graph exactly as it exists on disk today, build_id's spec bytes
+    # untouched -- read BEFORE the substitution below so it reflects the
+    # unedited corpus. Used only to detect whether a mixed_project_schedule
+    # finding already existed independent of this edit. mode="compat_existing"
+    # is the adapter's own "read-only auditing of the historical corpus" mode
+    # (authoring_contract.py's own module docstring) -- exactly the semantics
+    # needed for a baseline snapshot; new_ids is intentionally omitted so
+    # every mixed_project_schedule instance lands in `warnings`, not `errors`
+    # (this call is never used to block anything itself).
+    try:
+        baseline_result = bo_contract.validate_graph(nodes, mode="compat_existing")
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+    baseline_mixed_messages = {
+        e.get("message")
+        for e in (baseline_result.get("errors", []) + baseline_result.get("warnings", []))
+        if e.get("code") == "mixed_project_schedule"
+    }
+
+    # Substitute the proposed new spec content for this build_id's node so
+    # the graph is validated against the bytes that WOULD exist after this
+    # write commits, not what's currently on disk under specs/.
+    for node in nodes:
+        if node["build_id"] == build_id:
+            node["spec_markdown"] = new_spec_content
 
     try:
         graph_result = bo_contract.validate_graph(nodes, mode="strict_new", new_ids=[build_id])
@@ -727,6 +784,25 @@ def _revalidate_schedule_with_proposed_spec(
     filtered_errors = [
         e for e in graph_result.get("errors", [])
         if e.get("build_id") is None or e.get("build_id") == build_id
+    ]
+
+    # Phase 1 (vault-bo-authoring-enforcement-readiness-v1): a
+    # mixed_project_schedule finding whose message is BYTE-IDENTICAL to one
+    # already present in the baseline (unedited) graph describes a
+    # pre-existing legacy condition this content-only edit does not touch --
+    # it must not, by itself, make an otherwise-valid edit impossible.
+    # Scoped narrowly to this one code (dependency_cycle/unknown_project/
+    # every other graph-wide or per-node code is never touched by this
+    # filter and remains unconditionally blocking) and derived purely by
+    # diffing the adapter's own baseline-vs-proposed output -- never by
+    # name-matching a specific schedule file or hardcoding a project list.
+    # The message embeds the schedule path and the exact sorted() set of
+    # resolved projects, so ANY change this edit makes to that set (a new
+    # mix, a different project, one fewer conflicting project) produces a
+    # different message and is NOT filtered -- it stays blocking.
+    filtered_errors = [
+        e for e in filtered_errors
+        if not (e.get("code") == "mixed_project_schedule" and e.get("message") in baseline_mixed_messages)
     ]
     return _errors_to_issues("bo-guard-spec-rewrite-graph", filtered_errors)
 
