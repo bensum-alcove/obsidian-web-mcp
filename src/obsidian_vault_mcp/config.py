@@ -116,6 +116,30 @@ BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS = float(os.environ.get("BO_AUTHORING_CONTR
 # Fastest revert path: env var edit + supervisorctl restart, no git operation needed.
 BO_PATH_GUARD_MODE = os.environ.get("BO_PATH_GUARD_MODE", "shadow").strip().lower()
 
+# vault_query RRF fusion sharpness (kill switch: env var edit + supervisorctl restart,
+# no git operation needed). Default 60 is byte-identical to pre-calibration behaviour.
+# vault-query-calibration-v2 diagnosis: k=60 is flat enough, relative to the ~150-
+# candidate fetch depth, that a document appearing at a middling rank in BOTH legs
+# routinely out-scores a document ranked #1 in only ONE leg (their summed 1/(k+rank)
+# terms exceed the single leg's 1/(k+1)). This was the single highest-leverage,
+# most-repeating failure mode in the v3 baseline diagnosis -- see this build's output
+# doc for the per-question rank trace. Lowering k sharpens the top of the curve so a
+# confident single-leg #1 is harder to displace, without changing the behaviour for
+# genuine both-legs-agree consensus (which wins at any k>0 since it's always ~2x a
+# single leg's score at the same rank).
+VAULT_QUERY_RRF_K = float(os.environ.get("VAULT_QUERY_RRF_K", "60"))
+
+# vault_query canonical-state authority boost (kill switch: 1.0 = no-op, byte-identical
+# to pre-calibration behaviour). Multiplies the fused score of any result whose
+# frontmatter declares `type: canonical-state` before temporal decay is applied. The
+# vault's own documented precedence rule (infrastructure.md's "Current-state authority
+# note") says these records are the current-state authority over general prose --
+# this mechanism is a modest, multiplicative nudge toward that rule, not a hard
+# override, so a genuinely stronger match can still win. Inert (no matching files) in
+# any vault that has no Canonical State/records/ tree yet, e.g. CB/Alcove Brain at the
+# time of this build.
+VAULT_QUERY_CANONICAL_BOOST = float(os.environ.get("VAULT_QUERY_CANONICAL_BOOST", "1.0"))
+
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
 VAULT_QUERY_DEFAULT_HALF_LIFE_DAYS = float(os.environ.get("VAULT_QUERY_HALF_LIFE_DAYS", "90"))

@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 STALE_DAYS = 45
-RRF_K = 60
 _HOT_MD_MAX_BYTES = 3072
 _ANSWER_CONTEXT_MAX_HOT = 3
 _SUPERSEDED_STATUSES = {"superseded", "deprecated", "archived"}
@@ -100,14 +99,46 @@ def _decay_factor(path: str, age_days: float) -> float:
     return math.exp(-age_days * math.log(2) / half_life)
 
 
-def _rrf_fuse(keyword_paths: list[str], semantic_paths: list[str], k: int = RRF_K) -> dict[str, float]:
+def _rrf_fuse(keyword_paths: list[str], semantic_paths: list[str], k: float | None = None) -> dict[str, float]:
     """Reciprocal Rank Fusion: score = sum of 1/(k + rank) across legs, rank is 1-indexed."""
+    if k is None:
+        k = config.VAULT_QUERY_RRF_K
     scores: dict[str, float] = {}
     for rank, path in enumerate(keyword_paths, start=1):
         scores[path] = scores.get(path, 0.0) + 1.0 / (k + rank)
     for rank, path in enumerate(semantic_paths, start=1):
         scores[path] = scores.get(path, 0.0) + 1.0 / (k + rank)
     return scores
+
+
+def _frontmatter_type(full_path: Path) -> str:
+    try:
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+        post = fm_lib.loads(content)
+        return str((post.metadata or {}).get("type", "")).lower()
+    except Exception:
+        return ""
+
+
+_CANONICAL_STATE_DIR = "Canonical State/records/"
+
+
+def _canonical_boost_factor(path: str) -> float:
+    """See VAULT_QUERY_CANONICAL_BOOST in config.py for the rationale. Cheap path-
+    substring pre-check before the frontmatter parse -- canonical-state records live
+    under a known directory convention (verified against every `type: canonical-state`
+    file in this build's diagnosis), so this skips a disk read + YAML parse for the
+    large majority of fused candidates that obviously aren't canonical records. Falls
+    through to nothing (no boost, not a correctness issue) for a hypothetical
+    canonical-state file living outside that directory -- the frontmatter check
+    remains the authority, this is purely a latency shortcut."""
+    boost = config.VAULT_QUERY_CANONICAL_BOOST
+    if boost == 1.0 or _CANONICAL_STATE_DIR not in path:
+        return 1.0
+    full_path = config.VAULT_PATH / path
+    if _frontmatter_type(full_path) == "canonical-state":
+        return boost
+    return 1.0
 
 
 def _keyword_leg(query: str, file_pattern: str, fetch_n: int) -> list[tuple[str, int]]:
@@ -265,7 +296,8 @@ def vault_query(
             modified_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
             age_days = (now - modified_dt).total_seconds() / 86400.0
 
-            fused_score = score * _decay_factor(path, age_days) if decay else score
+            boosted_score = score * _canonical_boost_factor(path)
+            fused_score = boosted_score * _decay_factor(path, age_days) if decay else boosted_score
 
             heading = None
             chunk = None

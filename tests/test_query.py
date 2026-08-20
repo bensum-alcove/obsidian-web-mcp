@@ -310,3 +310,83 @@ def test_vault_answer_context_warns_on_superseded_frontmatter(vault_dir):
         w for w in result["warnings"] if w["path"] == "old-doc.md" and w["reason"] == "superseded"
     ]
     assert len(superseded_warnings) == 1
+
+
+# --- vault-query-calibration-v2: RRF_K / canonical-boost tests ----------------
+
+def test_rrf_fuse_default_k_reads_from_config(monkeypatch):
+    """No explicit k -> config.VAULT_QUERY_RRF_K, not the old hardcoded 60."""
+    monkeypatch.setattr(config, "VAULT_QUERY_RRF_K", 5.0)
+    scores = query_tool._rrf_fuse(["a.md"], [])
+    assert scores["a.md"] == pytest.approx(1 / 6)
+
+
+def test_rrf_fuse_kill_switch_default_matches_pre_calibration_k60():
+    """Kill switch: default config value (60) is byte-identical to the old
+    hardcoded RRF_K=60 behaviour."""
+    assert config.VAULT_QUERY_RRF_K == 60.0
+    scores = query_tool._rrf_fuse(["a.md"], [])
+    assert scores["a.md"] == pytest.approx(1 / 61)
+
+
+def test_canonical_boost_factor_kill_switch_off_is_noop(vault_dir):
+    """Default VAULT_QUERY_CANONICAL_BOOST=1.0 -> no-op regardless of frontmatter."""
+    canonical_dir = vault_dir / "Canonical State" / "records"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "widget.md").write_text("---\ntype: canonical-state\n---\n\nWidget.\n")
+
+    assert config.VAULT_QUERY_CANONICAL_BOOST == 1.0
+    factor = query_tool._canonical_boost_factor("Canonical State/records/widget.md")
+    assert factor == 1.0
+
+
+def test_canonical_boost_factor_boosts_canonical_state_frontmatter(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_QUERY_CANONICAL_BOOST", 1.3)
+    canonical_dir = vault_dir / "Canonical State" / "records"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "widget.md").write_text("---\ntype: canonical-state\n---\n\nWidget.\n")
+
+    factor = query_tool._canonical_boost_factor("Canonical State/records/widget.md")
+    assert factor == 1.3
+
+
+def test_canonical_boost_factor_ignores_non_canonical_frontmatter(vault_dir, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_QUERY_CANONICAL_BOOST", 1.3)
+    canonical_dir = vault_dir / "Canonical State" / "records"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "not-canonical.md").write_text("---\ntype: reference\n---\n\nJust a reference doc.\n")
+
+    factor = query_tool._canonical_boost_factor("Canonical State/records/not-canonical.md")
+    assert factor == 1.0
+
+
+def test_canonical_boost_factor_skips_frontmatter_parse_outside_canonical_dir(vault_dir, monkeypatch):
+    """Path-prefilter: a file outside Canonical State/records/ never reaches the
+    frontmatter parser, even if it happens to declare type: canonical-state --
+    this is the latency shortcut, not a correctness path."""
+    monkeypatch.setattr(config, "VAULT_QUERY_CANONICAL_BOOST", 1.3)
+    calls = []
+    monkeypatch.setattr(
+        query_tool, "_frontmatter_type", lambda p: (calls.append(p), "canonical-state")[1]
+    )
+    (vault_dir / "elsewhere.md").write_text("---\ntype: canonical-state\n---\n\nElsewhere.\n")
+
+    factor = query_tool._canonical_boost_factor("elsewhere.md")
+    assert factor == 1.0
+    assert calls == []
+
+
+def test_vault_query_canonical_boost_promotes_canonical_record(vault_dir, monkeypatch):
+    """Integration: with the boost enabled, a canonical-state record that ties on
+    keyword rank with a non-canonical file scores higher and sorts first."""
+    monkeypatch.setattr(config, "VAULT_QUERY_CANONICAL_BOOST", 1.3)
+    canonical_dir = vault_dir / "Canonical State" / "records"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "widget-state.md").write_text(
+        "---\ntype: canonical-state\n---\n\nboost-tie-marker widget status.\n"
+    )
+    (vault_dir / "widget-prose.md").write_text("boost-tie-marker widget status prose.\n")
+
+    result = json.loads(query_tool.vault_query("boost-tie-marker widget status"))
+    scores = {r["path"]: r["score"] for r in result["results"]}
+    assert scores["Canonical State/records/widget-state.md"] > scores["widget-prose.md"]
