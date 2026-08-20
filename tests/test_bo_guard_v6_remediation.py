@@ -368,6 +368,105 @@ def test_mixed_project_from_sibling_still_blocks(monkeypatch, vault_dir):
 
 
 # --------------------------------------------------------------------------
+# vault-bo-authoring-cache-remediation-v7: sibling content-shape bleed
+# (residual finding flagged, not fixed, by vault-bo-authoring-guard-
+# remediation-v6's real-corpus report -- HI5-3's filter only scoped the
+# three DB-state codes; any OTHER per-node error code, e.g.
+# missing_summary_instruction from preflight_spec_validate, still bled
+# through unfiltered when attributed to a sibling).
+# --------------------------------------------------------------------------
+
+
+def _mixed_schedule_and_target(vault_dir, schedule_name):
+    schedule_content = (
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# w\n\nbuilds:\n\n"
+        "  - id: dirty-sibling\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/dirty-sibling.md\n"
+        "  - id: rv6-target\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/rv6-target.md\n"
+    )
+    schedule_file = vault_dir / "Personal" / "Build Orchestrator" / "schedules" / schedule_name
+    schedule_file.parent.mkdir(parents=True, exist_ok=True)
+    schedule_file.write_text(schedule_content)
+
+    spec_file = vault_dir / "Personal" / "Build Orchestrator" / "specs" / "rv6-target.md"
+    spec_file.parent.mkdir(parents=True, exist_ok=True)
+    spec_file.write_text("old body")
+    return spec_file
+
+
+def test_sibling_own_content_shape_defect_does_not_block_benign_edit(monkeypatch, vault_dir):
+    """A clean target must not be blocked merely because a sibling elsewhere
+    in the same schedule has its own unrelated content-shape defect (e.g.
+    missing_summary_instruction) -- that is the sibling's own problem, not
+    the target's, matching the mixed_project/terminal_id_reuse precedent."""
+    spec_file = _mixed_schedule_and_target(vault_dir, "2026-W99-dirty-sibling.yaml")
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"rv6-target": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {"ok": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-dirty-sibling.yaml"}},
+    )
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{
+                "code": "missing_summary_instruction",
+                "message": "spec body has no /tmp/cc-summary-{build_id}.txt instruction",
+                "build_id": "dirty-sibling",
+            }],
+            "warnings": [],
+        },
+    )
+
+    is_new, _ = vault.write_file_atomic(
+        "Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write",
+    )
+    assert not is_new
+    assert spec_file.read_text() == "new body"
+
+
+def test_own_content_shape_defect_from_graph_check_still_blocks(monkeypatch, vault_dir):
+    """Control: the same code, attributed to the build actually being
+    rewritten rather than a sibling, must still reject -- the v7 fix drops
+    sibling-attributed noise, not build_id's own findings."""
+    spec_file = _mixed_schedule_and_target(vault_dir, "2026-W99-dirty-self.yaml")
+
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(bo_contract, "preflight_ids", lambda build_ids, timeout=None: {"results": {"rv6-target": "pending"}})
+    monkeypatch.setattr(
+        bo_contract, "preflight_spec_validate",
+        lambda build_id, spec_markdown, spec_path, mode="compat_existing", timeout=None: {"ok": True, "errors": []},
+    )
+    monkeypatch.setattr(
+        bo_contract, "preflight_source_schedule",
+        lambda build_ids, timeout=None: {"results": {"rv6-target": "Personal/Build Orchestrator/schedules/2026-W99-dirty-self.yaml"}},
+    )
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{
+                "code": "missing_summary_instruction",
+                "message": "spec body has no /tmp/cc-summary-{build_id}.txt instruction",
+                "build_id": "rv6-target",
+            }],
+            "warnings": [],
+        },
+    )
+
+    with pytest.raises(bo_guard.BOGuardError):
+        vault.write_file_atomic("Personal/Build Orchestrator/specs/rv6-target.md", "new body", tool="vault_write")
+    assert spec_file.read_text() == "old body"
+
+
+# --------------------------------------------------------------------------
 # MD5-1: move/delete of an un-ingested-but-referenced spec.
 # --------------------------------------------------------------------------
 

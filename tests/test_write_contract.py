@@ -328,6 +328,66 @@ def test_malformed_schema_rules_file_never_raises(vault_dir):
 
 
 # --------------------------------------------------------------------------
+# _load_schema_rules: no mtime-only cache aliasing
+# (vault-bo-authoring-cache-remediation-v7, opus-review-bo-authoring-
+# contract-v6's MEDIUM residual -- the previous cache keyed solely on mtime,
+# with no path/vault-root component, so two distinct _schema_rules.json
+# files sharing an mtime tick returned each other's stale parsed rules.
+# Fixed by removing the cache entirely; these tests pin that behaviour.)
+# --------------------------------------------------------------------------
+
+
+def test_schema_rules_no_aliasing_across_distinct_vault_roots(tmp_path, monkeypatch):
+    """Two different vault roots' _schema_rules.json files, forced to share
+    an identical mtime, must never return each other's parsed content."""
+    import json
+    import os
+    import time
+
+    from obsidian_vault_mcp import config
+
+    root_a = tmp_path / "vault-a"
+    root_b = tmp_path / "vault-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    rules_a = root_a / "_schema_rules.json"
+    rules_b = root_b / "_schema_rules.json"
+    rules_a.write_text(json.dumps({"type-a": ["field-a"]}))
+    rules_b.write_text(json.dumps({"type-b": ["field-b"]}))
+
+    common_mtime = time.time()
+    os.utime(rules_a, (common_mtime, common_mtime))
+    os.utime(rules_b, (common_mtime, common_mtime))
+
+    monkeypatch.setattr(config, "VAULT_PATH", root_a)
+    assert wc._load_schema_rules() == {"type-a": ["field-a"]}
+
+    monkeypatch.setattr(config, "VAULT_PATH", root_b)
+    assert wc._load_schema_rules() == {"type-b": ["field-b"]}
+
+
+def test_schema_rules_no_aliasing_on_same_tick_replacement(tmp_path, monkeypatch):
+    """A _schema_rules.json rewritten within the same mtime tick must be
+    re-read, not served from a stale cached value."""
+    import json
+    import os
+
+    from obsidian_vault_mcp import config
+
+    rules_path = tmp_path / "_schema_rules.json"
+    rules_path.write_text(json.dumps({"type-a": ["field-a"]}))
+    monkeypatch.setattr(config, "VAULT_PATH", tmp_path)
+
+    assert wc._load_schema_rules() == {"type-a": ["field-a"]}
+
+    same_mtime = rules_path.stat().st_mtime
+    rules_path.write_text(json.dumps({"type-a": ["field-a", "field-c"]}))
+    os.utime(rules_path, (same_mtime, same_mtime))
+
+    assert wc._load_schema_rules() == {"type-a": ["field-a", "field-c"]}
+
+
+# --------------------------------------------------------------------------
 # protected-structural-file (move / delete)
 # --------------------------------------------------------------------------
 

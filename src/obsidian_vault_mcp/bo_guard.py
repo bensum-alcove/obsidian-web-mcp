@@ -185,9 +185,12 @@ vault-bo-authoring-guard-remediation-v6, still shadow-only:
     Fixed by filtering the adapter's returned errors client-side: a
     terminal_id_reuse/duplicate_authority/frozen_contract_mutation finding
     attributed to a DIFFERENT build_id than the one actually being
-    rewritten is dropped (see _SIBLING_CONTEXT_ONLY_CODES); the same finding
-    attributed to build_id itself, and every other check (mixed-project,
-    duplicate id, unknown dependency, cycles), still applies in full.
+    rewritten is dropped; the same finding attributed to build_id itself
+    still applies in full. (vault-bo-authoring-cache-remediation-v7 later
+    generalized this filter -- see _revalidate_schedule_with_proposed_spec's
+    own docstring/comment -- to drop ANY error attributed to a different
+    build_id, closing the residual sibling-content-shape bleed the v6 build
+    flagged but did not fix.)
   - MD5-1: _path_mutation_issues lacked the disk-based referring-schedule
     discovery the rewrite path already had (HI-2b) -- an un-ingested
     (no DB row) spec already declared in an on-disk schedule could be moved
@@ -245,15 +248,6 @@ class BOGuardError(ValueError):
 
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
-
-# Error codes produced only by validate_build_graph's existing_state_lookup
-# (live DB state), as opposed to pure graph-shape checks -- see HI5-3's use
-# in _revalidate_schedule_with_proposed_spec. When attributed to a sibling
-# node rather than the build actually being rewritten, these must never
-# block a write for that sibling merely appearing as graph context
-# (authoring_contract.whole_graph_errors_for_new_build treats the same
-# codes the same way, via its own existing_state_lookup=lambda _bid: None).
-_SIBLING_CONTEXT_ONLY_CODES = {"terminal_id_reuse", "duplicate_authority", "frozen_contract_mutation"}
 
 # The authoritative freely-mutable-status set is sourced from the adapter's
 # own op=version vocabulary (known_statuses - terminal_statuses -
@@ -697,18 +691,42 @@ def _revalidate_schedule_with_proposed_spec(
     # terminal/dispatched, or already bound to a different schedule, is pure
     # GRAPH CONTEXT for revalidating build_id's own proposed bytes -- it must
     # never block this write merely for being present as context, matching
-    # BO's own documented semantics. Filter those DB-state-driven codes out
-    # when attributed to a different build_id than the one actually being
-    # rewritten; every other check (mixed_project_schedule, duplicate id,
-    # unknown dependency, cycles, unknown_project) still applies in full to
-    # the whole graph, including siblings.
+    # BO's own documented semantics. HI5-3 originally scoped this filter to
+    # just the three DB-state codes ({"terminal_id_reuse", "duplicate_
+    # authority", "frozen_contract_mutation"}).
+    #
+    # vault-bo-authoring-cache-remediation-v7 (residual finding flagged by
+    # vault-bo-authoring-guard-remediation-v6's real-corpus report): that
+    # narrow scoping left every OTHER per-node error code -- in particular
+    # missing_summary_instruction/summary_token_mismatch/unknown_tier/etc,
+    # produced by preflight_spec_validate's own content-shape checks for
+    # EVERY node in the schedule, not just build_id's -- unfiltered when
+    # attributed to a sibling, so a sibling's own unrelated authoring defect
+    # bled into build_id's own edit as a rejecting issue. Confirmed still
+    # reproducing against the real corpus (2026-08-20): a benign edit to any
+    # of several real pre-dispatch specs in a large shared schedule surfaced
+    # a dozen-plus sibling-attributed `missing_summary_instruction` findings
+    # that have nothing to do with the edit being made.
+    #
+    # Generalized the filter the same way authoring_contract._sound_sibling_
+    # nodes/whole_graph_errors_for_new_build already treat this exact
+    # "one build's own promotion/edit surrounded by sibling graph context"
+    # shape: drop ANY error attributed to a build_id other than the one
+    # actually being rewritten, regardless of code. This is safe specifically
+    # because this function only ever substitutes build_id's proposed SPEC
+    # CONTENT into an otherwise-unchanged schedule graph (it never adds,
+    # removes, or reorders schedule entries) -- so every error attributed to
+    # a different build_id necessarily describes a pre-existing condition of
+    # that sibling's own entry, not something build_id's edit introduced or
+    # worsened. Errors with no per-node build_id attribution at all --
+    # mixed_project_schedule (attributed via `path=schedule_path`) and
+    # dependency_cycle (attributed to neither) -- describe the WHOLE
+    # resulting graph and are never filtered by this rule, so a genuinely
+    # invalid graph (e.g. mixed-project) still rejects regardless of which
+    # node the adapter happened to name.
     filtered_errors = [
         e for e in graph_result.get("errors", [])
-        if not (
-            e.get("code") in _SIBLING_CONTEXT_ONLY_CODES
-            and e.get("build_id") is not None
-            and e.get("build_id") != build_id
-        )
+        if e.get("build_id") is None or e.get("build_id") == build_id
     ]
     return _errors_to_issues("bo-guard-spec-rewrite-graph", filtered_errors)
 

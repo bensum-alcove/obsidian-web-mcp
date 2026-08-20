@@ -465,43 +465,47 @@ def _validate_required_fields(ctx: WriteContext) -> list[ValidationIssue]:
     ]
 
 
-_schema_rules_cache: dict | None = None
-_schema_rules_cache_mtime: float | None = None
-
-
 def _load_schema_rules() -> dict:
     """Load {type: [required_field, ...]} from <vault_root>/_schema_rules.json.
 
     Returns {} if the file is absent or malformed (never raises -- this rule
     is opt-in and must never break writes because of a typo in the JSON).
+
+    Uncached by design (vault-bo-authoring-cache-remediation-v7): the
+    previous implementation cached the parsed result keyed on the file's
+    mtime alone, with no path/vault-root component in the cache key. Two
+    different `_schema_rules.json` files (different vault roots, or the same
+    path rewritten within the same mtime tick -- common on filesystems with
+    1s+ mtime resolution) sharing one mtime value would silently return each
+    other's stale parsed rules (opus-review-bo-authoring-contract-v6 caught
+    this via a flaky vault-mcp suite: `test_malformed_schema_rules_file_
+    never_raises` / `test_required_fields_rule_passes_when_all_present`
+    rotated between pass/fail depending on tmp-vault mtime collisions across
+    tests). This rule is advisory-only and, as of this build, opted into by
+    zero of the three real deployed vaults -- `_schema_rules.json` doesn't
+    exist in any of them, so the removed cache had no measured operational
+    benefit to begin with (every real call already hit the cheap `except
+    OSError` absent-file path). Re-reading and re-parsing the file on every
+    call removes the entire aliasing hazard rather than trying to design a
+    collision-safe cache key for a cache that was never earning its keep.
     """
-    global _schema_rules_cache, _schema_rules_cache_mtime
     from . import config
     import json as _json
 
     rules_path = config.VAULT_PATH / "_schema_rules.json"
     try:
-        mtime = rules_path.stat().st_mtime
+        raw = rules_path.read_text(encoding="utf-8")
     except OSError:
-        _schema_rules_cache = None
-        _schema_rules_cache_mtime = None
         return {}
 
-    if _schema_rules_cache is not None and _schema_rules_cache_mtime == mtime:
-        return _schema_rules_cache
-
     try:
-        data = _json.loads(rules_path.read_text(encoding="utf-8"))
+        data = _json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("_schema_rules.json must be a JSON object")
     except Exception:
         logger.exception("failed to load %s; frontmatter-required-fields rule disabled", rules_path)
-        _schema_rules_cache = {}
-        _schema_rules_cache_mtime = mtime
         return {}
 
-    _schema_rules_cache = data
-    _schema_rules_cache_mtime = mtime
     return data
 
 
