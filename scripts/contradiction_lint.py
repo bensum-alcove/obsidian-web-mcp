@@ -48,6 +48,16 @@ infrastructure.md/SYSTEM-FACTS.md against
 matching) and report-only — appended as its own dated subsection of
 `contradiction-lint-report.md`, independent of the SYSTEM-FACTS/changelog
 check above.
+
+Extended 2026-08-20 (vault-canonical-state-live-reality-remediation-v1) with a
+third, independent cross-check: `check_live_state_alignment()` (see
+`obsidian_vault_mcp.live_state_checks`) verifies a small, explicit registry of
+canonical-state records' *content* against live reality (currently: git
+branch + required-file presence for `repo-checkouts-obsidian-web-mcp`) —
+closing the gap that let that record assert a dev-checkout branch which had
+already drifted two days earlier, undetected by either check above
+(opus-review-phase3-canonical-state-v4, BLOCKER 2). Report-only, zero-LLM, no
+command ever built from vault content.
 """
 from __future__ import annotations
 
@@ -71,6 +81,9 @@ from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     parse_frontmatter,
     update_frontmatter_field,
+)
+from obsidian_vault_mcp.live_state_checks import (  # noqa: E402
+    check_live_state_alignment,
 )
 
 VAULT_PATH = config.VAULT_PATH
@@ -586,6 +599,37 @@ def render_canonical_state_section(findings: list[dict], now: datetime) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_live_state_section(findings: list[dict], now: datetime) -> str:
+    lines = [
+        "",
+        f"### Live-state alignment cross-check (generated {now.strftime('%Y-%m-%d')})",
+        "",
+        "Deterministic, zero-LLM check: a small, explicit registry of "
+        "canonical-state `component_id`s (see `obsidian_vault_mcp.live_state_checks`) "
+        "is verified against live reality (git branch, required-file presence), not "
+        "just against referential integrity/age. No command is ever built from vault "
+        "content; an inspection failure is reported as a finding, never treated as "
+        "a pass.",
+        "",
+    ]
+    if findings:
+        lines.append(
+            _md_table(
+                ["Component", "Checkout", "Issue", "Detail"],
+                [
+                    [f["component_id"], f.get("checkout", "-"), f["issue"], f["detail"]]
+                    for f in findings
+                ],
+            )
+        )
+    else:
+        lines.append(
+            "No findings -- every registered component's live-checked content "
+            "matches its canonical-state record."
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _md_table(headers: list[str], rows: list[list[str]]) -> str:
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
     for row in rows:
@@ -726,9 +770,12 @@ def run(dry_run: bool = False) -> dict:
         CANONICAL_STATE_RECORDS_DIR,
         now,
     )
-    system_facts_section = render_system_facts_section(
-        result, now
-    ) + render_canonical_state_section(canonical_findings, now)
+    live_state_findings = check_live_state_alignment(CANONICAL_STATE_RECORDS_DIR)
+    system_facts_section = (
+        render_system_facts_section(result, now)
+        + render_canonical_state_section(canonical_findings, now)
+        + render_live_state_section(live_state_findings, now)
+    )
 
     existing_report = REPORT_PATH.read_text(encoding="utf-8", errors="replace") if REPORT_PATH.exists() else ""
     new_report = build_report(existing_report, system_facts_section, now)
@@ -753,12 +800,14 @@ def run(dry_run: bool = False) -> dict:
         "stale": n_stale,
         "current": len(result["current"]),
         "canonical_state_findings": len(canonical_findings),
+        "live_state_findings": len(live_state_findings),
         "report_path": str(REPORT_PATH),
     }
     print(
         f"[contradiction_lint] {summary['generated']} — "
         f"{n_contra} contradicted, {n_stale} stale, {summary['current']} current, "
-        f"{len(canonical_findings)} canonical-state cross-check findings "
+        f"{len(canonical_findings)} canonical-state cross-check findings, "
+        f"{len(live_state_findings)} live-state alignment findings "
         f"→ {REPORT_PATH}"
         + (" (dry-run, nothing written)" if dry_run else ""),
         flush=True,
