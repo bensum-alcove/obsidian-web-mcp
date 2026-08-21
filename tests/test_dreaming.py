@@ -19,7 +19,7 @@ def dreaming():
 
 
 @pytest.fixture
-def vault(tmp_path):
+def vault(tmp_path, dreaming):
     """A vault with a broken link, a hot.md over budget, an archive candidate,
     and two same-titled notes."""
     (tmp_path / "good-note.md").write_text(
@@ -31,7 +31,7 @@ def vault(tmp_path):
     )
 
     hot = tmp_path / "hot.md"
-    hot.write_text("x" * 3000)
+    hot.write_text("x" * (dreaming.HOT_MD_BUDGET_CHARS + 500))
 
     old_prompt = tmp_path / "old-prompt.md"
     old_prompt.write_text("---\ntype: cc-prompt\nstatus: done\n---\n\n# Old Prompt\n\nDone.\n")
@@ -98,7 +98,7 @@ def test_hot_md_budget_flags_oversized_file(dreaming, vault):
     flagged = dreaming.pass_hot_md_budget(vault, md_files)
     assert len(flagged) == 1
     assert flagged[0]["path"] == "hot.md"
-    assert flagged[0]["chars"] == 3000
+    assert flagged[0]["chars"] == dreaming.HOT_MD_BUDGET_CHARS + 500
 
 
 def test_hot_md_budget_ignores_small_file(dreaming, tmp_path):

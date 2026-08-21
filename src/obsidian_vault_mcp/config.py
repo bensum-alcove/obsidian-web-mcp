@@ -25,6 +25,11 @@ EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index"}
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
 
+# hot.md ephemeral-cache budget in chars, frontmatter excluded. Single source of
+# truth shared by scripts/hot-md-curate.py (enforcement) and scripts/dreaming.py
+# (nightly report flag) -- see BS 2nd Brain/Alcove/Infrastructure/hot-md-structure.md.
+HOT_MD_BUDGET_CHARS = 5000
+
 # Rate limiting (requests per minute) -- track in-memory, enforce per-token
 RATE_LIMIT_READ = 100
 RATE_LIMIT_WRITE = 30

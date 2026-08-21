@@ -45,7 +45,7 @@ VAULT_NAME = VAULT_PATH.name
 # `[[...]]`-bracketed community labels that aren't real Obsidian wikilinks
 EXCLUDED_DIRS = config.EXCLUDED_DIRS | {"graphify-out"}
 
-HOT_MD_BUDGET_CHARS = 2500
+HOT_MD_BUDGET_CHARS = config.HOT_MD_BUDGET_CHARS  # single source of truth — see hot-md-curate.py
 STALE_DAYS = 30
 NEAR_DUP_SIMILARITY = 0.93
 NEAR_DUP_MAX_WORDS = 300

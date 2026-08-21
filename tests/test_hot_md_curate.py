@@ -117,3 +117,129 @@ def test_write_file_subprocess_serializes_against_mcp_lock_holder(curate, tmp_pa
         proc.wait(timeout=10)
 
     assert target.read_text() == "curated content"
+
+
+# --- hot-cache-v4: budget policy, non-canonical sections, resolved/stale
+# refs, canonical conflict, and freshness-preserving rotation. ---
+
+import obsidian_vault_mcp.config as _config  # noqa: E402
+
+
+def test_budget_chars_matches_single_source_of_truth(curate):
+    assert curate.BUDGET_CHARS == _config.HOT_MD_BUDGET_CHARS
+
+
+def test_check_a_reports_overage(curate):
+    text = "---\nfoo: bar\n---\n" + ("x" * (curate.BUDGET_CHARS + 137))
+    result = curate.check_a(text)
+    assert result["chars"] == curate.BUDGET_CHARS + 137
+    assert result["budget"] == curate.BUDGET_CHARS
+    assert result["overage"] == 137
+
+
+def test_check_a_under_budget_has_zero_overage(curate):
+    result = curate.check_a("---\nfoo: bar\n---\nshort body")
+    assert result["overage"] == 0
+
+
+def test_non_canonical_section_flagged(curate):
+    lines = ["## What's current", "- fine", "## Random Notes", "- stray content", ""]
+    sections = curate.parse_sections(lines)
+    report = curate.non_canonical_section_report(lines, sections, "hot.md")
+    assert any("Random Notes" in l for l in report)
+    assert not any("What's current" in l for l in report)
+
+
+def _write_spec_and_log(vault_root, candidate, status_text):
+    (vault_root / "Personal/Build Orchestrator/specs").mkdir(parents=True, exist_ok=True)
+    (vault_root / "Personal/Build Orchestrator/specs" / f"{candidate}.md").write_text("spec")
+    log_dir = vault_root / "Personal/Build Orchestrator/build-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{candidate}-output.md").write_text(status_text)
+
+
+def test_check_b_flags_resolved_reference(curate, tmp_path):
+    _write_spec_and_log(tmp_path, "some-finished-build", "## Status\npass\n")
+    lines = ["## In flight", "- shipped `some-finished-build` today", ""]
+    sections = curate.parse_sections(lines)
+    report, removal_specs = curate.check_b(str(tmp_path), lines, 0, sections)
+    assert any(l.startswith("RESOLVED: some-finished-build") for l in report)
+    assert len(removal_specs) == 1
+
+
+def test_check_b_flags_stale_blocker(curate, tmp_path):
+    _write_spec_and_log(tmp_path, "some-finished-build", "## Status\npass\n")
+    lines = ["## Blockers / watchpoints", "- blocked on `some-finished-build` shipping", ""]
+    sections = curate.parse_sections(lines)
+    report, removal_specs = curate.check_b(str(tmp_path), lines, 0, sections)
+    assert any(l.startswith("STALE-BLOCKER: some-finished-build") for l in report)
+    assert len(removal_specs) == 1
+
+
+def _write_canonical_record(curate, vault_root, component_id, state):
+    records_dir = vault_root / curate.CANONICAL_STATE_RECORDS_DIR
+    records_dir.mkdir(parents=True, exist_ok=True)
+    (records_dir / f"{component_id}.md").write_text(
+        "---\n"
+        "type: canonical-state\n"
+        f"component_id: {component_id}\n"
+        f"state: {state}\n"
+        "content_updated: '2026-08-01'\n"
+        "verified_at: '2026-08-01'\n"
+        "source: 'commit abc123'\n"
+        "---\n\nbody\n"
+    )
+
+
+def test_check_f_flags_canonical_conflict(curate, tmp_path):
+    _write_canonical_record(curate, tmp_path, "some-widget", "deprecated")
+    lines = ["## What's current", "- `some-widget` is the primary integration path", ""]
+    sections = curate.parse_sections(lines)
+    report, removal_specs = curate.check_f(str(tmp_path), lines, 0, sections)
+    assert any("CANONICAL-CONFLICT: some-widget" in l for l in report)
+    assert len(removal_specs) == 1
+
+
+def test_check_f_skips_when_hot_md_already_acknowledges_state(curate, tmp_path):
+    _write_canonical_record(curate, tmp_path, "some-widget", "deprecated")
+    lines = ["## What's current", "- `some-widget` is deprecated, do not use", ""]
+    sections = curate.parse_sections(lines)
+    report, removal_specs = curate.check_f(str(tmp_path), lines, 0, sections)
+    assert report == []
+    assert removal_specs == []
+
+
+def test_check_f_ignores_active_components(curate, tmp_path):
+    _write_canonical_record(curate, tmp_path, "some-widget", "active")
+    lines = ["## What's current", "- `some-widget` is live", ""]
+    sections = curate.parse_sections(lines)
+    report, removal_specs = curate.check_f(str(tmp_path), lines, 0, sections)
+    assert report == []
+    assert removal_specs == []
+
+
+def test_apply_mode_rotation_does_not_bump_frontmatter_updated(curate, tmp_path):
+    rel_path = "hot.md"
+    abs_path = tmp_path / rel_path
+
+    bullets = "\n".join(f"- shipped thing {i}" for i in range(8))
+    text = (
+        "---\n"
+        "updated: '2026-01-01'\n"
+        "---\n"
+        "## Last session shipped\n"
+        f"{bullets}\n"
+        "\n"
+        "## In flight\n"
+        "- ongoing work\n"
+    )
+    abs_path.write_text(text)
+    old_time = time.time() - curate.MTIME_GUARD_SECONDS - 3600
+    os.utime(abs_path, (old_time, old_time))
+
+    result = curate.process_target(str(tmp_path), rel_path, True, "2026-08-21", time.time())
+    assert result["changed"] is True
+
+    new_text = abs_path.read_text()
+    assert "updated: '2026-01-01'" in new_text
+    assert new_text.count("- shipped thing") == curate.SECTION_CAP

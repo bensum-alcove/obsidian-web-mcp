@@ -47,6 +47,21 @@ rotation-only run — previously every --apply rotation stamped `updated:` to
 today even though rotating stale content out is not a content update, which
 is exactly how BO's hot.md ended up claiming 2026-08-14 while its body was
 six weeks stale.
+
+v4 additions (build_id: hot-cache-v4): BUDGET_CHARS is now read from
+obsidian_vault_mcp.config.HOT_MD_BUDGET_CHARS instead of a hardcoded literal
+here -- that constant is the single source of truth also imported by
+scripts/dreaming.py's nightly budget flag, which previously carried its own
+stale 2,500 copy left over from before the v3 raise and would misreport any
+hot.md between 2,501 and 5,000 chars as over-budget. New Check F
+(check_f) cross-references component_id-shaped tokens in hot.md against
+canonical-state records (obsidian_vault_mcp.canonical_state, read-only): if a
+referenced component's current record carries a state in
+CANONICAL_CONFLICT_STATES and the hot.md bullet doesn't itself say so, that
+bullet is flagged CANONICAL-CONFLICT and rotated to hot-archive/ in apply
+mode -- same as every other rotation here, canonical-state is never written
+by this tool, and the conflicting hot.md claim always loses, never the other
+way around.
 """
 
 import argparse
@@ -64,7 +79,7 @@ from pathlib import Path
 _DEV_SRC = "/home/ben_sum/obsidian-web-mcp/src"
 if _DEV_SRC not in sys.path:
     sys.path.insert(0, _DEV_SRC)
-from obsidian_vault_mcp import vault_lock  # noqa: E402
+from obsidian_vault_mcp import canonical_state, config, vault_lock  # noqa: E402
 
 VAULT_ROOT_DEFAULT = "/home/ben_sum/vaults/bs-brain"
 
@@ -74,13 +89,17 @@ TARGETS = [
     "Personal/Build Orchestrator/hot.md",
 ]
 
-BUDGET_CHARS = 5000  # raised from 2500 in hot-md-curate-v3 — see docstring
+BUDGET_CHARS = config.HOT_MD_BUDGET_CHARS  # single source of truth — see docstring
 SECTION_CAP = 5
 BUDGET_FLOOR = 2
 LONG_BULLET_CHARS = 250
 MTIME_GUARD_SECONDS = 15 * 60
 ARCHIVE_DIR = "hot-archive"
 CONTENT_STALE_DAYS = 14
+
+# Read-only cross-reference target for Check F — canonical_state.py never writes here.
+CANONICAL_STATE_RECORDS_DIR = "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records"
+CANONICAL_CONFLICT_STATES = {"deprecated", "broken", "retired", "removed", "superseded"}
 
 # Canonical hot.md structure — see BS 2nd Brain/Alcove/Infrastructure/hot-md-structure.md.
 # Order matches document order and is the rotation order in budget_enforcement_pass.
@@ -257,6 +276,92 @@ def check_b(vault_root, all_lines, scan_start, sections):
             s, e = blk
             removal_specs.append(
                 (frozenset(range(s, e)), f"[{reason}: {candidate}]", "\n".join(all_lines[s:e]))
+            )
+
+    return report, removal_specs
+
+
+def load_current_canonical_states(records_dir):
+    """component_id -> current CanonicalStateRecord, for records with no
+    superseded_by. A component_id with more than one current record is a
+    duplicate-authority bug that canonical_state_scan.py exists to report —
+    this function silently excludes it rather than guessing a winner, since
+    picking one would be exactly the kind of authority collision Check F
+    must not create."""
+    records, _errors = canonical_state.load_all_records(records_dir)
+    by_id = {}
+    duplicated = set()
+    for r in records:
+        if not r.is_current:
+            continue
+        if r.component_id in by_id:
+            duplicated.add(r.component_id)
+        else:
+            by_id[r.component_id] = r
+    for cid in duplicated:
+        by_id.pop(cid, None)
+    return by_id
+
+
+def check_f(vault_root, all_lines, scan_start, sections):
+    """Returns (report_lines, removal_specs) — same shape as check_b.
+
+    Cross-references component_id-shaped tokens in hot.md against
+    canonical-state records (read-only; canonical_state.py records are never
+    written by this tool). If a referenced component's *current* record
+    carries a state in CANONICAL_CONFLICT_STATES and the hot.md bullet
+    doesn't itself say so, hot.md is asserting something canonical state has
+    already superseded — flag it and rotate the bullet to archive in apply
+    mode. On conflict hot.md always loses; canonical state is never rewritten
+    to match hot.md.
+    """
+    records_dir = os.path.join(vault_root, CANONICAL_STATE_RECORDS_DIR)
+    current_by_id = load_current_canonical_states(records_dir)
+    if not current_by_id:
+        return [], []
+
+    candidate_line_idxs = {}
+    for i in range(scan_start, len(all_lines)):
+        for cand in line_candidates(all_lines[i]):
+            candidate_line_idxs.setdefault(cand, []).append(i)
+
+    blocks = []
+    for sec in sections:
+        if sec["level"] != 2:
+            continue
+        sec_blocks, _ = parse_bullet_blocks(all_lines, sec["start"], sec["end"])
+        blocks.extend(sec_blocks)
+
+    def block_for_line(i):
+        for (s, e) in blocks:
+            if s <= i < e:
+                return (s, e)
+        return None
+
+    report = []
+    removal_specs = []
+    added_blocks = set()
+    for candidate in sorted(candidate_line_idxs):
+        record = current_by_id.get(candidate)
+        if record is None:
+            continue
+        state = record.state.strip().lower()
+        if state not in CANONICAL_CONFLICT_STATES:
+            continue
+        for i in candidate_line_idxs[candidate]:
+            blk = block_for_line(i)
+            if blk is None or blk in added_blocks:
+                continue
+            block_text = "\n".join(all_lines[blk[0]:blk[1]])
+            if state in block_text.lower():
+                continue  # hot.md already reflects the canonical state itself
+            added_blocks.add(blk)
+            report.append(
+                f"CANONICAL-CONFLICT: {candidate} — canonical state says "
+                f"{state!r} ({record.path}), but hot.md does not reflect it"
+            )
+            removal_specs.append(
+                (frozenset(range(blk[0], blk[1])), f"[canonical-conflict: {candidate} -> {state}]", block_text)
             )
 
     return report, removal_specs
@@ -495,8 +600,13 @@ def check_e(vault_root, today_str):
     return due, []
 
 
-def backup_targets(vault_root, ts):
-    backup_dir = os.path.join(BACKUP_ROOT, ts)
+def backup_targets(vault_root, ts, phase):
+    """File-level revert backup. Called with phase="before" pre-mutation and
+    phase="after" post-mutation, so an apply-mode run always leaves both the
+    pre-image and the post-image on disk under one timestamped run directory
+    — a before-only backup can restore, but can't show what a run actually
+    changed without diffing against the live (now-mutated) vault file."""
+    backup_dir = os.path.join(BACKUP_ROOT, ts, phase)
     for rel in TARGETS:
         src = os.path.join(vault_root, rel)
         if not os.path.isfile(src):
@@ -560,6 +670,10 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
     result["resolved_findings"] = b_report
     result["report_lines"].extend(b_report)
 
+    f_report, f_removal_specs = check_f(vault_root, all_lines, fm_lines_count, sections)
+    result["canonical_conflicts"] = f_report
+    result["report_lines"].extend(f_report)
+
     if apply_mode:
         mtime = os.path.getmtime(abs_path)
         if now_ts - mtime < MTIME_GUARD_SECONDS:
@@ -594,8 +708,17 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         b_remove |= rng
         b_archive.append((prefix, chunk))
 
-    remove = existing_remove | b_remove
-    archive_entries = [(None, chunk) for chunk in c_archive] + b_archive
+    existing_remove |= b_remove
+    f_remove = set()
+    f_archive = []
+    for rng, prefix, chunk in f_removal_specs:
+        if rng & existing_remove:
+            continue  # already being rotated by Check B/C/D — avoid double-archiving
+        f_remove |= rng
+        f_archive.append((prefix, chunk))
+
+    remove = existing_remove | f_remove
+    archive_entries = [(None, chunk) for chunk in c_archive] + b_archive + f_archive
 
     working_lines = render_with_removals(all_lines, remove, sections) if remove else list(all_lines)
     working_lines, budget_archive, over_budget = budget_enforcement_pass(working_lines)
@@ -670,27 +793,35 @@ def main():
 
     if apply_mode:
         ts = now.strftime("%Y-%m-%dT%H-%M-%SZ")
-        backup_dir = backup_targets(args.vault_root, ts)
+        backup_dir_before = backup_targets(args.vault_root, ts, "before")
     else:
-        backup_dir = None
+        backup_dir_before = None
 
     all_results = []
     for rel in TARGETS:
         res = process_target(args.vault_root, rel, apply_mode, today_str, now_ts)
         all_results.append(res)
 
+    if apply_mode:
+        backup_dir_after = backup_targets(args.vault_root, ts, "after")
+    else:
+        backup_dir_after = None
+
     report_lines = []
     report_lines.append(f"# Hot.md Curation Report — {today_str}")
     report_lines.append("")
     report_lines.append(f"Mode: {'apply' if apply_mode else 'report'}")
-    if backup_dir:
-        report_lines.append(f"Backup: {backup_dir}")
+    if backup_dir_before:
+        report_lines.append(f"Backup (before): {backup_dir_before}")
+    if backup_dir_after:
+        report_lines.append(f"Backup (after): {backup_dir_after}")
     report_lines.append("")
 
     total_resolved = 0
     total_stale = 0
     total_rotate = 0
     total_content_stale = 0
+    total_canonical_conflict = 0
     tg_lines = []
 
     for res in all_results:
@@ -707,21 +838,24 @@ def main():
         stale = sum(1 for f in res["resolved_findings"] if f.startswith("STALE-BLOCKER"))
         rotate = len(res["rotate_candidates"])
         content_stale = 1 if res.get("content_stale") else 0
+        canonical_conflict = len(res.get("canonical_conflicts") or [])
         total_resolved += resolved
         total_stale += stale
         total_rotate += rotate
         total_content_stale += content_stale
+        total_canonical_conflict += canonical_conflict
 
         a = res.get("check_a", {})
         tg_lines.append(
             f"{res['rel_path']}: {a.get('chars', '?')}/{BUDGET_CHARS} chars "
             f"(RESOLVED={resolved} STALE-BLOCKER={stale} ROTATE-CANDIDATE={rotate} "
-            f"CONTENT-STALE={content_stale})"
+            f"CONTENT-STALE={content_stale} CANONICAL-CONFLICT={canonical_conflict})"
         )
 
     totals_line = (
         f"Totals: RESOLVED={total_resolved} STALE-BLOCKER={total_stale} "
-        f"ROTATE-CANDIDATE={total_rotate} CONTENT-STALE={total_content_stale}"
+        f"ROTATE-CANDIDATE={total_rotate} CONTENT-STALE={total_content_stale} "
+        f"CANONICAL-CONFLICT={total_canonical_conflict}"
     )
     report_lines.append(f"## Totals")
     report_lines.append(f"- {totals_line}")
@@ -758,6 +892,7 @@ def main():
         any(res["changed"] for res in all_results)
         or total_resolved > 0
         or total_stale > 0
+        or total_canonical_conflict > 0
         or len(review_due) > 0
         or "OVER-BUDGET-AT-FLOOR" in report_text
         or "LONG-BULLET" in report_text
