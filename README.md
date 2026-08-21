@@ -195,6 +195,16 @@ The server coexists with Obsidian Sync (or any file-based sync mechanism) withou
 - If Sync and the MCP server write to the same file simultaneously, the last write wins (standard filesystem semantics) but neither write is corrupted
 - The frontmatter index watches for filesystem changes via `watchdog` and updates automatically when Sync brings in new files
 
+## Obsidian Bases Dashboards
+
+Vaults may contain Obsidian-native `.base` files (e.g. `Alcove Brain/Dashboards/Active Clients.base`) for human navigation. These are pure presentation artifacts built by Obsidian's Bases core plugin directly from existing note frontmatter — they are:
+
+- **Derived, never authoritative.** A `.base` file is a read-only query/view definition. It holds no client, infrastructure, or review data of its own, and this server does not read, write, or treat `.base` files specially (they are ordinary vault files with no extension allowlist).
+- **Not an agent retrieval path.** Agents continue to read and search vault content exclusively through this server's MCP tools (`vault_read`, `vault_search`, `vault_query`, etc.). Bases queries only run inside the Obsidian desktop app for a human viewing the vault.
+- **Portable.** Deleting a `.base` file removes only that view; the underlying notes and their frontmatter are unaffected.
+
+Requires Obsidian 1.9+ with the core `bases` plugin enabled (bundled with the app, no installation needed).
+
 ## Development
 
 ### Running tests
