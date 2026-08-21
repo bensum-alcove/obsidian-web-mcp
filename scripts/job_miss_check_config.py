@@ -123,4 +123,70 @@ JOBS = [
         "period_hours": 24,
         "enabled": True,
     },
+    # vault-observability-slo: vault_functional_canary.py and
+    # vault_observability_status.py are each intended to run every 15
+    # minutes per vault (see the crontab entries this build adds) --
+    # max_age_hours/period_hours mirror the existing mem-monitor-heartbeat
+    # entry's "every 5 minutes" pattern above, scaled to a 15-minute cadence.
+    # This is intentionally redundant with vault_observability_status.py's
+    # own functional_read_query SLI: job_miss_check is the EXTERNAL observer
+    # that catches "the canary process itself stopped running entirely" --
+    # a failure mode the canary's own JSON output can never report on itself.
+    {
+        "name": "vault-functional-canary-bs-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/canary-bs-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    {
+        "name": "vault-functional-canary-cb-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/canary-cb-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    {
+        "name": "vault-functional-canary-alcove-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/canary-alcove-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    {
+        "name": "vault-observability-status-bs-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/status-bs-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    {
+        "name": "vault-observability-status-cb-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/status-cb-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    {
+        "name": "vault-observability-status-alcove-brain",
+        "artifact": "/home/ben_sum/.local/state/vault-observability/status-alcove-brain.json",
+        "max_age_hours": 1,
+        "period_hours": 1,
+        "enabled": True,
+    },
+    # vault-observability-slo: no automatic recurring restore-drill exists
+    # (the only one on record is the manual 2026-08-17 clean-room proof --
+    # see slo.restore_drill_age_days's baseline_evidence). max_age_hours and
+    # period_hours are both set to 1440h (60 days) so the LATE/MISSED
+    # boundary lands at 2880h (120 days), matching slo.py's
+    # restore_drill_age_days warning=60/critical=120-day thresholds exactly
+    # -- this is a recurrence-cadence target this build is setting, not
+    # evidence of an already-established SLA.
+    {
+        "name": "vault-restore-drill",
+        "artifact": "/home/ben_sum/backups/vault-clean-room-restore-proof-*",
+        "max_age_hours": 1440,
+        "period_hours": 1440,
+        "enabled": True,
+    },
 ]

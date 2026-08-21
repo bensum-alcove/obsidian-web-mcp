@@ -157,7 +157,7 @@ def build_index() -> None:
             vault_files: dict[str, Path] = {}
             for md_file in vault_path.rglob("*.md"):
                 rel = str(md_file.relative_to(vault_path))
-                if any(part in config.EXCLUDED_DIRS for part in Path(rel).parts):
+                if any(part in config.RETRIEVAL_EXCLUDED_DIRS for part in Path(rel).parts):
                     continue
                 vault_files[rel] = md_file
 

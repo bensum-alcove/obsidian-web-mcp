@@ -15,6 +15,25 @@ from ..utils import sanitize_for_json, SafeJSONEncoder
 logger = logging.getLogger(__name__)
 
 
+def _excluded_dirs_for_scope(search_path: Path) -> set[str]:
+    """RETRIEVAL_EXCLUDED_DIRS, minus any directory that is itself part of
+    `search_path`'s own path under the vault root.
+
+    "Excluded from ordinary retrieval" means whole-vault/unscoped browsing
+    should never surface e.g. `_scratch/` -- but an explicit, scoped request
+    INTO that directory (path_prefix="_scratch/...") is not "ordinary"; it's
+    deliberate, and must actually be able to see what it asked for. Without
+    this, vault_functional_canary.py's own scoped query into `_scratch/`
+    would always return zero results by construction, since it is the one
+    caller with a legitimate reason to search inside the excluded namespace.
+    """
+    try:
+        scoped_parts = set(search_path.relative_to(config.VAULT_PATH).parts)
+    except ValueError:
+        scoped_parts = set()
+    return config.RETRIEVAL_EXCLUDED_DIRS - scoped_parts
+
+
 def _search_ripgrep(
     query: str,
     search_path: Path,
@@ -34,7 +53,7 @@ def _search_ripgrep(
         str(search_path),
     ]
 
-    for excluded in config.EXCLUDED_DIRS:
+    for excluded in _excluded_dirs_for_scope(search_path):
         cmd.insert(-2, f"--glob=!{excluded}/")
 
     try:
@@ -86,12 +105,13 @@ def _search_python(
 
     query_lower = query.lower()
     matches = []
+    excluded_dirs = _excluded_dirs_for_scope(search_path)
 
     for file_path in search_path.rglob("*"):
         if not file_path.is_file():
             continue
 
-        if any(part in config.EXCLUDED_DIRS for part in file_path.parts):
+        if any(part in excluded_dirs for part in file_path.relative_to(search_path).parts):
             continue
 
         if not fnmatch.fnmatch(file_path.name, file_pattern):
@@ -154,11 +174,12 @@ def _search_keyword_fallback(
 
     # Single pass: read each file once and record which keywords it contains
     file_data = []  # (file_path, rel_path, content, found_keywords)
+    excluded_dirs = _excluded_dirs_for_scope(search_path)
 
     for file_path in search_path.rglob("*"):
         if not file_path.is_file():
             continue
-        if any(part in config.EXCLUDED_DIRS for part in file_path.parts):
+        if any(part in excluded_dirs for part in file_path.relative_to(search_path).parts):
             continue
         if not fnmatch.fnmatch(file_path.name, file_pattern):
             continue

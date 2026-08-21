@@ -22,6 +22,19 @@ CONTEXT_LINES = 2             # Default lines of context in search results
 # Directories to never expose or modify
 EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index"}
 
+# Dedicated scratch namespace for synthetic monitoring (see
+# scripts/vault_functional_canary.py, vault-observability-slo build).
+# Deliberately NOT added to EXCLUDED_DIRS: the frontmatter-index parse path
+# and vault_list must still be able to see it -- the functional canary's
+# "verify index sees it" step needs the real frontmatter-parsing code path
+# to observe scratch writes, and an operator needs vault_list to inspect
+# canary state for debugging. Instead it is excluded only from *ordinary
+# retrieval* (full-text search, semantic search) via RETRIEVAL_EXCLUDED_DIRS
+# below, so synthetic canary writes never surface in real search results but
+# are not invisible to the tooling that needs to see them.
+SCRATCH_DIR_NAME = "_scratch"
+RETRIEVAL_EXCLUDED_DIRS = EXCLUDED_DIRS | {SCRATCH_DIR_NAME}
+
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
 

@@ -48,6 +48,30 @@ def test_vault_search_finds_text(vault_dir):
     assert result["results"][0]["path"] == "test-note.md"
 
 
+def test_vault_search_excludes_scratch_from_whole_vault_search(vault_dir):
+    """_scratch/ is excluded from ordinary (unscoped) retrieval -- synthetic
+    canary content must never surface in a normal search (vault-observability-slo)."""
+    (vault_dir / "_scratch" / "canary").mkdir(parents=True)
+    (vault_dir / "_scratch" / "canary" / "probe.md").write_text(
+        "---\ntype: canary-fixture\n---\n\nuniquescratchsentinel\n"
+    )
+    result = json.loads(vault_search("uniquescratchsentinel"))
+    assert result["total_matches"] == 0
+
+
+def test_vault_search_scoped_into_scratch_still_finds_it(vault_dir):
+    """A caller that explicitly scopes into _scratch/ (e.g. the functional
+    canary verifying its own fixture) must still be able to see it -- only
+    *unscoped* browsing treats it as excluded."""
+    (vault_dir / "_scratch" / "canary").mkdir(parents=True)
+    (vault_dir / "_scratch" / "canary" / "probe.md").write_text(
+        "---\ntype: canary-fixture\n---\n\nuniquescratchsentinel\n"
+    )
+    result = json.loads(vault_search("uniquescratchsentinel", path_prefix="_scratch/canary"))
+    assert result["total_matches"] == 1
+    assert result["results"][0]["path"] == "_scratch/canary/probe.md"
+
+
 def test_vault_batch_read_handles_missing(vault_dir):
     """vault_batch_read returns errors for missing files without failing."""
     result = json.loads(vault_batch_read(
