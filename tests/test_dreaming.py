@@ -434,3 +434,157 @@ def test_find_autofix_candidates_leaves_genuinely_dead_link(dreaming, autofix_va
     md_files = dreaming.list_md_files(autofix_vault)
     candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
     assert not any(c["old_target"] == "nonexistent-thing" for c in candidates)
+
+
+# --- Safe-remediation classification (dreaming-safe-remediation-v2) ---------
+
+def test_classification_values_are_known(dreaming):
+    known = {dreaming.Classification.AUTO_SAFE, dreaming.Classification.REPORT_ONLY, dreaming.Classification.FORBIDDEN}
+    assert set(dreaming.FINDING_CLASSIFICATION.values()) <= known
+
+
+def test_classification_forbidden_and_report_only_types_have_no_apply_function(dreaming):
+    """Regression guard: every finding type not AUTO_SAFE must have no
+    corresponding `apply_*` function in the module -- a future contributor
+    adding e.g. `apply_near_duplicates` without updating the allowlist
+    first should fail this test, not ship silently."""
+    apply_fn_names = {
+        name for name in dir(dreaming)
+        if name.startswith("apply_") and callable(getattr(dreaming, name))
+    }
+    assert apply_fn_names == {"apply_autofix"}
+    assert dreaming.FINDING_CLASSIFICATION["broken_wikilink_unambiguous"] == dreaming.Classification.AUTO_SAFE
+    for finding_type in ("near_duplicate_title", "near_duplicate_embedding", "contradiction", "broken_wikilink_ambiguous"):
+        assert dreaming.FINDING_CLASSIFICATION[finding_type] == dreaming.Classification.FORBIDDEN
+
+
+def test_classification_defaults_report_only_types_are_report_only(dreaming):
+    for finding_type in ("archive_candidate", "hot_md_budget"):
+        assert dreaming.FINDING_CLASSIFICATION[finding_type] == dreaming.Classification.REPORT_ONLY
+
+
+# --- Hash-guarded optimistic concurrency + mutation ledger ------------------
+
+def test_find_autofix_candidates_attaches_scan_hash(dreaming, autofix_vault):
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    assert len(candidates) == 1
+    assert candidates[0]["scan_hash"] == dreaming._sha256_hex(
+        (autofix_vault / "citing-note.md").read_bytes()
+    )
+
+
+def test_apply_autofix_skips_and_ledgers_conflict_when_file_changed_since_scan(
+    dreaming, autofix_vault, monkeypatch, tmp_path
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(dreaming, "MUTATION_LEDGER_PATH", ledger_path)
+
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    assert len(candidates) == 1
+
+    # Simulate a concurrent edit landing after the scan but before apply.
+    citing = autofix_vault / "citing-note.md"
+    citing.write_text(citing.read_text() + "\nAn extra line appended concurrently.\n")
+
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    fixed_lines, backup_dir = dreaming.apply_autofix(autofix_vault, candidates, now)
+
+    assert fixed_lines == []
+    assert backup_dir is None
+    assert "[[Real File]]" not in citing.read_text()  # never overwritten
+
+    records = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "conflict_skipped"
+    assert records[0]["path"] == "citing-note.md"
+    assert records[0]["old_hash"] != records[0]["new_hash"]
+
+
+def test_apply_autofix_emits_ledger_record_on_success(dreaming, autofix_vault, monkeypatch, tmp_path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(dreaming, "MUTATION_LEDGER_PATH", ledger_path)
+
+    md_files = dreaming.list_md_files(autofix_vault)
+    candidates = dreaming.find_autofix_candidates(autofix_vault, md_files)
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    fixed_lines, backup_dir = dreaming.apply_autofix(autofix_vault, candidates, now, vault_name="cb-brain")
+    assert len(fixed_lines) == 1
+
+    records = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "applied"
+    assert record["vault"] == "cb-brain"
+    assert record["action_class"] == "broken_wikilink_unambiguous"
+    assert record["path"] == "citing-note.md"
+    assert record["revert_path"] == str(backup_dir / "citing-note.md")
+    assert record["old_hash"] != record["new_hash"]
+
+
+def test_apply_autofix_emits_ledger_record_on_bad_frontmatter(dreaming, tmp_path, monkeypatch):
+    ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(dreaming, "MUTATION_LEDGER_PATH", ledger_path)
+
+    bad = tmp_path / "bad.md"
+    bad.write_text("---\nupdated: [broken\n---\nSee [[old-bad]].\n")
+    candidates = [{
+        "file": "bad.md", "line": 4, "col": 6, "old_target": "old-bad", "new_target": "new-bad",
+        "scan_hash": dreaming._sha256_hex(bad.read_bytes()),
+    }]
+
+    fixed, _ = dreaming.apply_autofix(tmp_path, candidates, datetime(2026, 8, 15, tzinfo=timezone.utc))
+    assert fixed == []
+
+    records = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "bad_frontmatter_skipped"
+
+
+def test_emit_mutation_ledger_record_is_best_effort_on_write_failure(dreaming, monkeypatch):
+    """A ledger write that can never succeed (parent path is a file, not a
+    directory) must not raise -- ledger availability is never a blocker
+    (dreaming-safe-remediation-v2 #9)."""
+    monkeypatch.setattr(dreaming, "MUTATION_LEDGER_PATH", Path("/dev/null/unwritable/ledger.jsonl"))
+    dreaming.emit_mutation_ledger_record(
+        now=datetime(2026, 8, 1, tzinfo=timezone.utc), vault_name="bs-brain", path="x.md",
+        action_class="broken_wikilink_unambiguous", old_hash="a", new_hash="b",
+        revert_path=None, status="applied", reason="test",
+    )  # must not raise
+
+
+# --- Shadow mode -------------------------------------------------------------
+
+def test_shadow_report_counts_and_is_read_only(dreaming, autofix_vault, monkeypatch):
+    monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+    before = {p: (p.stat().st_mtime, p.read_bytes()) for p in autofix_vault.rglob("*.md")}
+
+    result = dreaming.shadow_report(autofix_vault, "cb-brain")
+
+    assert result["counts"]["broken_wikilink_unambiguous"] == 1
+    assert result["auto_safe_would_apply_files"] == ["citing-note.md"]
+    assert result["auto_safe_would_fail_files"] == []
+    assert result["clean_for_scheduled_apply_safe"] is True
+    assert result["classification"] == dreaming.FINDING_CLASSIFICATION
+
+    for p in autofix_vault.rglob("*.md"):
+        assert (p.stat().st_mtime, p.read_bytes()) == before[p]
+    assert not (autofix_vault / "_entities.json").exists()
+
+
+def test_shadow_report_flags_unclean_on_bad_frontmatter(dreaming, tmp_path, monkeypatch):
+    monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+    (tmp_path / "Real File.md").write_text("# Real File\n")
+    (tmp_path / "citing-note.md").write_text(
+        "---\nupdated: [broken\n---\n\n# Citing Note\n\nSee [[real-file]] for details.\n"
+    )
+
+    result = dreaming.shadow_report(tmp_path, "cb-brain")
+
+    assert result["counts"]["broken_wikilink_unambiguous"] == 1
+    assert len(result["auto_safe_would_fail_files"]) == 1
+    assert result["auto_safe_would_fail_files"][0]["file"] == "citing-note.md"
+    assert "unparseable frontmatter" in result["auto_safe_would_fail_files"][0]["reason"]
+    assert result["clean_for_scheduled_apply_safe"] is False

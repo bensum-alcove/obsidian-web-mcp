@@ -15,13 +15,31 @@ file written per run. `_entities.json` is a second, machine-generated artifact
 idempotent, so an unchanged vault produces byte-identical output. It, the
 semantic index db under .semantic-index/, and the report output are all
 excluded from "content" scans.
+
+SAFE REMEDIATION (dreaming-safe-remediation-v2) -- default-deny automation.
+Every finding type is REPORT_ONLY unless explicitly listed in
+FINDING_CLASSIFICATION as AUTO_SAFE. AUTO_SAFE currently covers exactly one
+class: an unambiguous mechanical broken-wikilink repair (see
+find_autofix_candidates/apply_autofix). Several classes are marked FORBIDDEN
+rather than merely report-only -- these are never eligible for automation,
+even in a future build, because resolving them requires a judgment call this
+script cannot safely make (see FINDING_CLASSIFICATION docstring below).
+
+CLI: `--report` (explicit report-only run; the default with no flags),
+`--apply-safe` (also execute the AUTO_SAFE allowlist), `--shadow` (read-only:
+print classified action-class counts as JSON, mutate and write nothing --
+used to validate the enablement criterion for scheduled --apply-safe before
+turning it on in cron). `--autofix` is a deprecated alias for `--apply-safe`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,6 +73,87 @@ ARCHIVE_TYPE_HINTS = {"cc-prompt", "build-log", "cc-summary", "proposed-auto"}
 ARCHIVE_STATUS_DONE = {"done", "completed", "complete", "synced", "superseded", "archived"}
 ARCHIVE_NAME_HINTS = ("-output.md", "-log.md", "-prompt.md")
 ARCHIVE_PATH_HINTS = ("pending-logs", "synced-logs", "build-logs", "build-log")
+
+
+class Classification:
+    """The three action-classes a dreaming finding type can carry."""
+
+    AUTO_SAFE = "auto-safe"
+    REPORT_ONLY = "report-only"
+    FORBIDDEN = "forbidden"
+
+
+# Explicit default-deny allowlist (dreaming-safe-remediation-v2 #1-2). Every
+# finding type defaults to REPORT_ONLY; only a type listed here as AUTO_SAFE
+# may ever be passed to an `apply_*` function. FORBIDDEN types are not merely
+# "not yet automated" -- they require a judgment call (choosing among
+# ambiguous targets, resolving a substantive contradiction, merging content
+# an LLM/heuristic judged "similar") that this script must never make, per
+# the spec's item 5. See test_dreaming.py's classification-guard tests, which
+# fail the build if a future `apply_*` function is added without a matching
+# AUTO_SAFE entry here.
+FINDING_CLASSIFICATION: dict[str, str] = {
+    # Exactly one normalized-basename match for a broken wikilink target --
+    # deterministic and reversible (timestamped backup + hash-guarded
+    # optimistic concurrency); touches only the link text and the `updated`
+    # frontmatter field, never client/legal prose.
+    "broken_wikilink_unambiguous": Classification.AUTO_SAFE,
+    # Zero or multiple candidate targets for a broken wikilink -- choosing
+    # among them is a judgment call, never automated (spec item 5).
+    "broken_wikilink_ambiguous": Classification.FORBIDDEN,
+    "archive_candidate": Classification.REPORT_ONLY,
+    "hot_md_budget": Classification.REPORT_ONLY,  # curation lives in hot-md-curate.py --apply
+    "near_duplicate_title": Classification.FORBIDDEN,       # semantic-merge judgment call
+    "near_duplicate_embedding": Classification.FORBIDDEN,   # semantic-merge judgment call
+    "contradiction": Classification.FORBIDDEN,               # substantive fact resolution
+}
+
+# Passes that rebuild a machine-generated artifact (not a vault-content
+# finding) every run -- always executed, never gated by the classification
+# above: index_reconcile rebuilds the embedding DB, entity_index rebuilds
+# _entities.json. Neither ever touches an existing .md file.
+ARTIFACT_REBUILD_PASSES = {"index_reconcile", "entity_index"}
+
+MUTATION_LEDGER_PATH = Path.home() / ".build-orchestrator" / "ledgers" / "dreaming-mutations.jsonl"
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def emit_mutation_ledger_record(
+    *,
+    now: datetime,
+    vault_name: str,
+    path: str,
+    action_class: str,
+    old_hash: str | None,
+    new_hash: str | None,
+    revert_path: str | None,
+    status: str,
+    reason: str,
+) -> None:
+    """Best-effort append of one mutation record (dreaming-safe-remediation-v2
+    #3, #9). Ledger unavailability (missing parent, permissions, disk full)
+    never blocks or reverses an already-decided apply/skip outcome -- it is
+    purely an audit trail, appended after the outcome is final."""
+    record = {
+        "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "vault": vault_name,
+        "action_class": action_class,
+        "path": path,
+        "old_hash": old_hash,
+        "new_hash": new_hash,
+        "revert_path": revert_path,
+        "status": status,
+        "reason": reason,
+    }
+    try:
+        MUTATION_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MUTATION_LEDGER_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 WIKILINK_RE = re.compile(r"\[\[([^\]\|#]+)")
 
@@ -762,7 +861,9 @@ def find_autofix_candidates(vault_path: Path, md_files: list[str]) -> list[dict]
     for rel in md_files:
         if any(part in ARCHIVE_EXCLUDED_DIRS for part in Path(rel).parts):
             continue
-        stripped = _strip_non_prose(_read(vault_path, rel))
+        raw = _read(vault_path, rel)
+        stripped = _strip_non_prose(raw)
+        scan_hash = None  # lazily computed -- only needed if this file has >=1 candidate
         for m in WIKILINK_RE.finditer(stripped):
             target = m.group(1).strip()
             if not target or _is_suppressed_link_target(target):
@@ -777,6 +878,9 @@ def find_autofix_candidates(vault_path: Path, md_files: list[str]) -> list[dict]
             match_rel = matches[0]
             new_target = match_rel[:-3] if match_rel.lower().endswith(".md") else match_rel
 
+            if scan_hash is None:
+                scan_hash = _sha256_hex(raw.encode("utf-8"))
+
             line_start = stripped.rfind("\n", 0, m.start(1)) + 1
             candidates.append({
                 "file": rel,
@@ -784,6 +888,10 @@ def find_autofix_candidates(vault_path: Path, md_files: list[str]) -> list[dict]
                 "col": m.start(1) - line_start,
                 "old_target": m.group(1),
                 "new_target": new_target,
+                # Captured at scan time -- apply_autofix's optimistic-concurrency
+                # guard refuses to write if the file's hash has since changed
+                # (dreaming-safe-remediation-v2 #6).
+                "scan_hash": scan_hash,
             })
     return candidates
 
@@ -793,9 +901,57 @@ def _bump_frontmatter_updated(content: str, today: str) -> str:
     return update_frontmatter_field(content, "updated", today, require_existing=True)
 
 
-def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tuple[list[str], Path | None]:
+def _replace_locked(resolved_path: Path, data: bytes) -> None:
+    """Atomically replace `resolved_path`'s content via tempfile+fsync+os.replace.
+
+    Caller must already hold ``vault_lock.path_lock(resolved_path)`` -- this
+    performs only the write half of a check-then-write sequence, so the
+    hash-recheck in ``apply_autofix`` and the write it guards happen inside
+    one uninterrupted lock acquisition (mirrors
+    ``vault_safety_sweep._atomic_replace_if_unchanged``, which closes the
+    same gap for its own repair path)."""
+    try:
+        mode = stat.S_IMODE(resolved_path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o604
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=resolved_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        os.replace(tmp_path, resolved_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def apply_autofix(
+    vault_path: Path,
+    candidates: list[dict],
+    now: datetime,
+    *,
+    vault_name: str | None = None,
+) -> tuple[list[str], Path | None]:
     """Backs up and repairs every candidate. Idempotent: once fixed, a target
-    resolves via _build_stem_index and will never be a candidate again."""
+    resolves via _build_stem_index and will never be a candidate again.
+
+    Optimistic concurrency (dreaming-safe-remediation-v2 #6): each candidate
+    carries the sha256 hash of its file's content at scan time
+    (``scan_hash``, from ``find_autofix_candidates``). Before writing, this
+    re-reads the file and re-hashes it inside the same
+    ``vault_lock.path_lock`` acquisition that guards the write -- if the hash
+    has changed (a concurrent edit landed between scan and apply), the file
+    is skipped entirely, never overwritten. Every outcome -- applied,
+    conflict-skipped, or bad-frontmatter-skipped -- is recorded to the
+    mutation ledger (best-effort; see ``emit_mutation_ledger_record``)."""
+    action_class = "broken_wikilink_unambiguous"
+    vault_name = vault_name if vault_name is not None else VAULT_NAME
     if not candidates:
         return [], None
 
@@ -809,39 +965,70 @@ def apply_autofix(vault_path: Path, candidates: list[dict], now: datetime) -> tu
     fixed_lines = []
     for rel, cands in by_file.items():
         path = vault_path / rel
-        original_content = path.read_text(encoding="utf-8", errors="replace")
-        lines = original_content.split("\n")
-        file_fixed = []
-        for c in sorted(cands, key=lambda c: (c["line"], -c["col"])):
-            ln, col, old = c["line"] - 1, c["col"], c["old_target"]
-            line_text = lines[ln]
-            if line_text[col : col + len(old)] != old:
-                continue  # content shifted since scan -- skip rather than corrupt
-            lines[ln] = line_text[:col] + c["new_target"] + line_text[col + len(old) :]
-            file_fixed.append(f"FIXED: {rel}:{c['line']} [[{old}]] → [[{c['new_target']}]]")
+        resolved = path.resolve()
+        scan_hash = cands[0].get("scan_hash")
 
-        if not file_fixed:
-            continue
-        try:
-            new_content = _bump_frontmatter_updated("\n".join(lines), today)
-        except FrontmatterError as exc:
-            print(
-                f"[dreaming] SKIPPED {rel}: invalid frontmatter: {exc}",
-                file=sys.stderr,
-                flush=True,
+        with vault_lock.path_lock(resolved):
+            try:
+                original_content = path.read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                emit_mutation_ledger_record(
+                    now=now, vault_name=vault_name, path=rel, action_class=action_class,
+                    old_hash=scan_hash, new_hash=None, revert_path=None,
+                    status="conflict_skipped", reason="file removed since scan",
+                )
+                continue
+
+            current_hash = _sha256_hex(original_content.encode("utf-8"))
+            if scan_hash is not None and current_hash != scan_hash:
+                emit_mutation_ledger_record(
+                    now=now, vault_name=vault_name, path=rel, action_class=action_class,
+                    old_hash=scan_hash, new_hash=current_hash, revert_path=None,
+                    status="conflict_skipped", reason="file content changed since scan; never overwrite",
+                )
+                continue
+
+            lines = original_content.split("\n")
+            file_fixed = []
+            for c in sorted(cands, key=lambda c: (c["line"], -c["col"])):
+                ln, col, old = c["line"] - 1, c["col"], c["old_target"]
+                line_text = lines[ln]
+                if line_text[col : col + len(old)] != old:
+                    continue  # content shifted since scan -- skip rather than corrupt
+                lines[ln] = line_text[:col] + c["new_target"] + line_text[col + len(old) :]
+                file_fixed.append(f"FIXED: {rel}:{c['line']} [[{old}]] → [[{c['new_target']}]]")
+
+            if not file_fixed:
+                continue
+            try:
+                new_content = _bump_frontmatter_updated("\n".join(lines), today)
+            except FrontmatterError as exc:
+                print(
+                    f"[dreaming] SKIPPED {rel}: invalid frontmatter: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                emit_mutation_ledger_record(
+                    now=now, vault_name=vault_name, path=rel, action_class=action_class,
+                    old_hash=current_hash, new_hash=None, revert_path=None,
+                    status="bad_frontmatter_skipped", reason=str(exc),
+                )
+                continue
+
+            backup_path = backup_dir / rel
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_text(original_content, encoding="utf-8")
+
+            new_hash = _sha256_hex(new_content.encode("utf-8"))
+            # Write happens inside the same path_lock acquisition as the hash
+            # recheck above -- no gap for a concurrent writer to land in.
+            _replace_locked(resolved, new_content.encode("utf-8"))
+            emit_mutation_ledger_record(
+                now=now, vault_name=vault_name, path=rel, action_class=action_class,
+                old_hash=current_hash, new_hash=new_hash, revert_path=str(backup_path),
+                status="applied", reason="; ".join(file_fixed),
             )
-            continue
-
-        backup_path = backup_dir / rel
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        backup_path.write_text(original_content, encoding="utf-8")
-        # Shared cross-process mutation authority (vault-integrity-and-bo-
-        # authority-remediation-v2) -- serializes against a concurrent
-        # Vault MCP write to the same resolved path. Low risk as currently
-        # deployed (cron invocation never passes --autofix), migrated
-        # anyway rather than left ambiguous.
-        vault_lock.atomic_write(path.resolve(), new_content.encode("utf-8"))
-        fixed_lines.extend(file_fixed)
+            fixed_lines.extend(file_fixed)
 
     return fixed_lines, (backup_dir if fixed_lines else None)
 
@@ -853,6 +1040,67 @@ def report_path_for(vault_path: Path, vault_name: str, now: datetime) -> Path:
     else:
         report_dir = vault_path / "_Reports" / "dreaming"
     return report_dir / f"{date_str}.md"
+
+
+def shadow_report(vault_path: Path, vault_name: str) -> dict:
+    """Read-only pass (dreaming-safe-remediation-v2 #7-8): classify every
+    current finding by FINDING_CLASSIFICATION and count them, and -- for the
+    AUTO_SAFE class only -- simulate the frontmatter-bump step that
+    apply_autofix would perform, without writing anything, to surface any
+    file that would fail to apply cleanly (e.g. unparseable frontmatter).
+
+    Mutates and writes nothing: no report file, no _entities.json, no
+    backup, no ledger record. This is the tool for validating the
+    enablement criterion for scheduled --apply-safe -- run it against a
+    vault and check ``clean_for_scheduled_apply_safe`` before ever adding
+    --apply-safe to that vault's cron invocation."""
+    md_files = list_md_files(vault_path)
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    autosafe_candidates = find_autofix_candidates(vault_path, md_files)
+    by_file: dict[str, list[dict]] = {}
+    for c in autosafe_candidates:
+        by_file.setdefault(c["file"], []).append(c)
+
+    would_apply, would_fail = [], []
+    for rel in by_file:
+        content = _read(vault_path, rel)
+        try:
+            _bump_frontmatter_updated(content, today)
+            would_apply.append(rel)
+        except FrontmatterError as exc:
+            would_fail.append({"file": rel, "reason": str(exc)})
+
+    broken = pass_broken_wikilinks(vault_path, md_files)
+    archive = pass_archive_candidates(vault_path, md_files, now)
+    hot_md = pass_hot_md_budget(vault_path, md_files)
+    near_dups = pass_near_duplicates(vault_path, md_files)
+    contradiction = pass_contradiction_lint_sunday(vault_path, vault_name, now)
+
+    counts = {
+        "broken_wikilink_unambiguous": len(autosafe_candidates),
+        "broken_wikilink_ambiguous": max(len(broken["broken"]) - len(autosafe_candidates), 0),
+        "archive_candidate": len(archive),
+        "hot_md_budget": len(hot_md),
+        "near_duplicate_title": len(near_dups["title_matches"]),
+        "near_duplicate_embedding": len(near_dups["embedding_matches"]),
+        "contradiction": (
+            len(contradiction["candidate_contradictions"])
+            if contradiction and contradiction.get("status") == "ok"
+            else 0
+        ),
+    }
+
+    return {
+        "vault": vault_name,
+        "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "counts": counts,
+        "classification": dict(FINDING_CLASSIFICATION),
+        "auto_safe_would_apply_files": would_apply,
+        "auto_safe_would_fail_files": would_fail,
+        "clean_for_scheduled_apply_safe": len(would_fail) == 0,
+    }
 
 
 def run(autofix: bool = False) -> Path:
@@ -886,13 +1134,13 @@ def run(autofix: bool = False) -> Path:
 
     if autofix:
         candidates = find_autofix_candidates(VAULT_PATH, md_files)
-        fixed_lines, backup_dir = apply_autofix(VAULT_PATH, candidates, now)
+        fixed_lines, backup_dir = apply_autofix(VAULT_PATH, candidates, now, vault_name=VAULT_NAME)
         if fixed_lines:
-            print(f"[dreaming] --autofix: backed up originals to {backup_dir}", flush=True)
+            print(f"[dreaming] --apply-safe: backed up originals to {backup_dir}", flush=True)
             for line in fixed_lines:
                 print(line, flush=True)
         else:
-            print("[dreaming] --autofix: no unambiguous mechanical repairs found", flush=True)
+            print("[dreaming] --apply-safe: no unambiguous mechanical repairs found", flush=True)
 
     return out_path
 
@@ -902,9 +1150,34 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Explicit report-only run (default behavior with no flags at all)",
+    )
+    parser.add_argument(
+        "--apply-safe",
+        action="store_true",
+        help="After reporting, execute only the AUTO_SAFE allowlist "
+        "(currently: unambiguous broken-wikilink repair). See FINDING_CLASSIFICATION.",
+    )
+    parser.add_argument(
         "--autofix",
         action="store_true",
-        help="Repair broken wikilinks with exactly one unambiguous basename match",
+        help=argparse.SUPPRESS,  # deprecated alias for --apply-safe
+    )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help="Read-only: print classified action-class counts as JSON. "
+        "Mutates and writes nothing -- validates the enablement criterion "
+        "for scheduled --apply-safe. Ignores --report/--apply-safe.",
     )
     cli_args = parser.parse_args()
-    run(autofix=cli_args.autofix)
+
+    if cli_args.autofix:
+        print("[dreaming] --autofix is deprecated, use --apply-safe", file=sys.stderr, flush=True)
+
+    if cli_args.shadow:
+        print(json.dumps(shadow_report(VAULT_PATH, VAULT_NAME), indent=2, ensure_ascii=False))
+    else:
+        run(autofix=cli_args.apply_safe or cli_args.autofix)
