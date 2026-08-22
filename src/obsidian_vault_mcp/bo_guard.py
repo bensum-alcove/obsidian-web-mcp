@@ -303,7 +303,7 @@ _freely_mutable_statuses_cache: set | None = None
 def _freely_mutable_statuses() -> set:
     """Cached (process-lifetime) lookup of the adapter's own
     freely-mutable-status vocabulary. A restart is required to pick up a
-    change in the adapter's vocabulary, matching how EXPECTED_SCHEMA_VERSION/
+    change in the adapter's vocabulary, matching how CONSUMER_SCHEMA_VERSION/
     EXPECTED_CONTRACT_VERSION drift already requires a restart. Raises
     bo_contract.BOContractError on adapter failure -- callers must catch it
     and produce a reject issue (see _spec_rewrite_issues/_path_mutation_issues),

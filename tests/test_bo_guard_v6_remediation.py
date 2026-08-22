@@ -52,7 +52,7 @@ def _stub_check_version_ok(monkeypatch):
         bo_contract, "check_version",
         lambda timeout=None: {
             "ok": True,
-            "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION,
+            "schema_version": bo_contract.CONSUMER_SCHEMA_VERSION,
             "contract_version": bo_contract.EXPECTED_CONTRACT_VERSION,
             "known_statuses": ["proposed", "pending", "ready", "dispatched", "done"],
             "terminal_statuses": ["done"],

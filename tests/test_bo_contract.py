@@ -107,16 +107,55 @@ def test_invoke_nonzero_exit_unparseable(monkeypatch):
 def test_check_version_matches(monkeypatch):
     monkeypatch.setattr(
         bo_contract.subprocess, "run",
-        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({"ok": True, "schema_version": 6, "contract_version": "1.0.0"})),
+        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
+            "ok": True, "schema_version": 6, "min_supported_schema_version": 6, "contract_version": "1.0.0",
+        })),
     )
     result = bo_contract.check_version()
     assert result["schema_version"] == 6
 
 
-def test_check_version_mismatch_fails_closed(monkeypatch):
+def test_check_version_real_v8_accepted(monkeypatch):
+    """vault-bo-guard-schema-v8-sync-recovery-2026-08-22: the adapter having
+    moved on to schema_version 8 must be accepted as long as it still
+    declares compatibility back to CONSUMER_SCHEMA_VERSION (6) -- this is
+    the exact drift this recovery fixed (previously hard-failed with
+    'schema_version 8 != expected 6')."""
     monkeypatch.setattr(
         bo_contract.subprocess, "run",
-        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({"ok": True, "schema_version": 4, "contract_version": "0.1.0"})),
+        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
+            "ok": True, "schema_version": 8, "min_supported_schema_version": 6, "contract_version": "1.0.0",
+        })),
+    )
+    result = bo_contract.check_version()
+    assert result["schema_version"] == 8
+
+
+def test_check_version_out_of_range_fails_closed(monkeypatch):
+    """An adapter that has moved its own compatibility floor past what this
+    consumer was written for (a genuinely breaking change) must fail closed
+    even though it reports version fields in the expected shape."""
+    monkeypatch.setattr(
+        bo_contract.subprocess, "run",
+        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
+            "ok": True, "schema_version": 10, "min_supported_schema_version": 9, "contract_version": "1.0.0",
+        })),
+    )
+    with pytest.raises(bo_contract.BOContractError) as exc:
+        bo_contract.check_version()
+    assert exc.value.code == "version_mismatch"
+
+
+def test_check_version_old_shape_missing_min_supported_field_fails_closed(monkeypatch):
+    """An old-v6-era adapter response predates min_supported_schema_version
+    entirely -- it cannot prove its own compatibility bounds and must be
+    rejected exactly like a real mismatch, not silently treated as
+    compatible because the field is merely absent."""
+    monkeypatch.setattr(
+        bo_contract.subprocess, "run",
+        lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
+            "ok": True, "schema_version": 6, "contract_version": "1.0.0",
+        })),
     )
     with pytest.raises(bo_contract.BOContractError) as exc:
         bo_contract.check_version()
@@ -127,12 +166,18 @@ def test_check_version_contract_version_drift_fails_closed_even_with_matching_sc
     """codex-review-bo-authoring-contract-v1, B5: 'MCP defines
     EXPECTED_CONTRACT_VERSION = "1.0.0" but check_version() checks only
     schema_version, so a changed contract implementation under schema v6 is
-    accepted.' schema_version matches here; only contract_version drifted --
-    this must still fail closed."""
+    accepted.' schema_version is in range here; only contract_version
+    drifted -- this must still fail closed (a metadata-bumped but
+    semantically neutered adapter)."""
     monkeypatch.setattr(
         bo_contract.subprocess, "run",
         lambda *a, **k: FakeCompletedProcess(
-            stdout=json.dumps({"ok": True, "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION, "contract_version": "9.9.9"})
+            stdout=json.dumps({
+                "ok": True,
+                "schema_version": bo_contract.CONSUMER_SCHEMA_VERSION,
+                "min_supported_schema_version": bo_contract.CONSUMER_SCHEMA_VERSION,
+                "contract_version": "9.9.9",
+            })
         ),
     )
     with pytest.raises(bo_contract.BOContractError) as exc:
@@ -148,7 +193,8 @@ def test_freely_mutable_statuses_derived_from_adapter_vocabulary(monkeypatch):
         bo_contract.subprocess, "run",
         lambda *a, **k: FakeCompletedProcess(stdout=json.dumps({
             "ok": True,
-            "schema_version": bo_contract.EXPECTED_SCHEMA_VERSION,
+            "schema_version": bo_contract.CONSUMER_SCHEMA_VERSION,
+            "min_supported_schema_version": bo_contract.CONSUMER_SCHEMA_VERSION,
             "contract_version": bo_contract.EXPECTED_CONTRACT_VERSION,
             "known_statuses": ["proposed", "pending", "ready", "dispatched", "done"],
             "terminal_statuses": ["done"],
@@ -212,7 +258,7 @@ _ADAPTER_PRESENT = Path(config.BO_AUTHORING_CONTRACT_PATH).exists()
 @pytest.mark.skipif(not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host")
 def test_real_check_version():
     result = bo_contract.check_version()
-    assert result["schema_version"] == bo_contract.EXPECTED_SCHEMA_VERSION
+    assert result["min_supported_schema_version"] <= bo_contract.CONSUMER_SCHEMA_VERSION <= result["schema_version"]
 
 
 @pytest.mark.skipif(not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host")

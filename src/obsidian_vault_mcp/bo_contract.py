@@ -26,7 +26,21 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-EXPECTED_SCHEMA_VERSION = 6
+# The SCHEMA_VERSION this file's parsing/field assumptions were last verified
+# against -- NOT an exact-match target. authoring_contract.py's schema_version
+# increases on every additive change (new optional frontmatter block, new
+# vocabulary entry, etc); it only breaks an existing consumer when a field is
+# removed or an existing op's meaning changes, which is exactly what
+# MIN_SUPPORTED_SCHEMA_VERSION (reported by the adapter itself via op=version)
+# tracks. check_version() below accepts any adapter whose
+# [min_supported_schema_version, schema_version] range covers
+# CONSUMER_SCHEMA_VERSION, so routine schema bumps on the build-orchestrator
+# side (which lives in a different repo, on a branch this one doesn't watch)
+# never silently drift this file out of sync -- see
+# vault-bo-guard-schema-v8-sync-recovery-2026-08-22 (schema went 6->8 in one
+# evening without this file changing, wrongly fail-closing every real build).
+# Bump this only when deliberately adopting a newer schema's new fields.
+CONSUMER_SCHEMA_VERSION = 6
 EXPECTED_CONTRACT_VERSION = "1.0.0"
 
 
@@ -155,25 +169,52 @@ def parse_schedule_document(content: str, source_name: str = "<string>") -> dict
 
 
 def check_version(timeout: float | None = None) -> dict:
-    """Call op=version and assert BOTH schema_version and contract_version
-    match what this adapter was built against. Raises BOContractError
-    (version_mismatch) on drift -- this is the fail-closed check every BO
-    tool call must pass before doing anything else.
+    """Call op=version and assert the adapter is compatible with what this
+    file was written against. Raises BOContractError (version_mismatch) on
+    drift or an adapter too old to self-report compatibility bounds -- this
+    is the fail-closed check every BO tool call must pass before doing
+    anything else.
+
+    schema_version is checked as a compatibility RANGE, not exact equality:
+    the adapter self-declares [min_supported_schema_version, schema_version]
+    via op=version, and this file is accepted as long as
+    CONSUMER_SCHEMA_VERSION falls inside that range. This means a routine
+    additive schema bump on the build-orchestrator side (adds an optional
+    field/validation, never removes or changes existing meaning) never
+    requires an edit here -- only a genuinely breaking change does, at which
+    point the adapter raises its own min_supported_schema_version past
+    CONSUMER_SCHEMA_VERSION and this check starts failing closed again
+    without anyone touching this file. An adapter response missing either
+    version field (e.g. a pre-min_supported_schema_version build) cannot
+    prove it's compatible and is rejected the same as a real mismatch.
 
     Checking schema_version alone was insufficient
     (codex-review-bo-authoring-contract-v1, B5): a changed contract
     *implementation* under an unchanged schema_version -- e.g. a behavioural
     change to validate_build_graph -- would previously pass this check
     silently. contract_version is bumped independently of schema_version
-    specifically to catch that class of drift.
+    specifically to catch that class of drift, and stays an exact-match
+    check -- it does not have a compatible range because it is meant to
+    catch drift under an otherwise-unchanged schema_version.
     """
     result = _invoke({"op": "version"}, timeout=timeout)
     schema_version = result.get("schema_version")
-    if schema_version != EXPECTED_SCHEMA_VERSION:
+    min_supported = result.get("min_supported_schema_version")
+    if not isinstance(schema_version, int) or not isinstance(min_supported, int):
         raise BOContractError(
             "version_mismatch",
-            f"authoring contract schema_version {schema_version!r} != expected "
-            f"{EXPECTED_SCHEMA_VERSION!r} -- refusing to trust a drifted adapter",
+            f"authoring contract response missing/malformed schema_version "
+            f"({schema_version!r}) or min_supported_schema_version "
+            f"({min_supported!r}) -- refusing to trust an adapter that cannot "
+            f"prove its own compatibility bounds",
+        )
+    if not (min_supported <= CONSUMER_SCHEMA_VERSION <= schema_version):
+        raise BOContractError(
+            "version_mismatch",
+            f"authoring contract schema_version={schema_version!r} "
+            f"(min_supported_schema_version={min_supported!r}) is not "
+            f"compatible with this consumer's schema_version="
+            f"{CONSUMER_SCHEMA_VERSION!r} -- refusing to trust a drifted adapter",
         )
     contract_version = result.get("contract_version")
     if contract_version != EXPECTED_CONTRACT_VERSION:
