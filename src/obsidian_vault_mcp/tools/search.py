@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -157,18 +158,98 @@ _STOPWORDS = frozenset({
 })
 
 
-def _search_keyword_fallback(
-    query: str,
+_INTERROGATIVES = frozenset({
+    "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+})
+
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_QUERY_TOKEN_EDGE_CHARS = "?!,;:()[]{}<>\"'`"
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """Extract content tokens from a natural-language query for vault_query's
+    keyword leg: quoted phrases kept intact as single tokens, stopwords and
+    interrogatives (what/how/where/...) dropped -- vault_query is fed full
+    questions rather than the 2-4 bare nouns vault_search expects, so
+    interrogatives need stripping here on top of the existing stopword list.
+
+    Only whitespace is ever a delimiter (same principle as the fallback
+    tokenizer below), so identifiers, paths, env var names, ports, and error
+    codes (BS_BRAIN_API_KEY, ~/.config/supervisor/, 502, feature/vault-tools-v2)
+    survive as single atomic tokens -- underscores, slashes, dots, and hyphens
+    are never split points. Edge punctuation (trailing '?', ',', etc. left over
+    from sentence structure) is stripped so a token searches as the literal
+    word it names.
+    """
+    phrases = [p.strip() for p in _QUOTED_PHRASE_RE.findall(query) if p.strip()]
+    remainder = _QUOTED_PHRASE_RE.sub(" ", query)
+
+    tokens: list[str] = list(phrases)
+    for word in remainder.split():
+        stripped = word.strip(_QUERY_TOKEN_EDGE_CHARS)
+        if not stripped or len(stripped) <= 1:
+            continue
+        if stripped.lower() in _STOPWORDS or stripped.lower() in _INTERROGATIVES:
+            continue
+        tokens.append(stripped)
+
+    return tokens
+
+
+# vault-retrieval-candidate-recall-v1: minimum distinct-token overlap a file must
+# have to qualify as a "partial" candidate once the AND-gate below has failed to
+# find any full match. See _search_by_tokens' docstring -- this is the mechanism
+# that stops a single huge, topically-broad file (a changelog, an archive) from
+# being the ONLY candidate returned just because it accumulates every token
+# somewhere across its size, while the true (small, focused) answer document is
+# missing one or two of many tokens and gets excluded entirely under a strict
+# AND gate. Threshold of 2 (not 1) keeps single incidental-word matches out of
+# the partial-candidate pool -- diagnosed against the v3 paraphrase-category
+# candidate-absence failures (see this build's output doc), not tuned against
+# individual question strings.
+_PARTIAL_MATCH_MIN_OVERLAP = 2
+
+
+def _search_by_tokens(
+    keywords: list[str],
     search_path: Path,
     file_pattern: str,
     max_results: int,
     context_lines: int,
+    require_all: bool = True,
+    allow_partial: bool = False,
 ) -> list[dict]:
-    """Keyword-based fallback search when ripgrep returns 0 results."""
+    """Single-pass, per-token ranked search: reads each file once, ranks by how
+    many distinct tokens it contains, plus a filename boost. Shared by
+    _search_keyword_fallback (which supplies its own lowercased, split-on-
+    whitespace keyword list, require_all=True, its long-standing behaviour) and
+    vault_query's tokenized keyword leg (which supplies richer tokens from
+    _tokenize_query).
+
+    require_all=True prefers an AND match (every keyword present) over any
+    partial match, falling back to OR ranking only when no file satisfies all
+    keywords. This is fine for short queries with 2-4 nouns, but for long,
+    natural-language questions (many tokens) it becomes an all-or-nothing
+    cliff: a single large, topically broad file that happens to contain every
+    token *somewhere* in its body (an append-only changelog, say) wins
+    outright and excludes every partial-but-more-relevant match entirely.
+
+    allow_partial=True (vault-retrieval-candidate-recall-v1): when the AND
+    gate finds matches, the partial (non-AND) candidates are appended below
+    them instead of being discarded outright, filtered to files with at least
+    _PARTIAL_MATCH_MIN_OVERLAP distinct token hits, ranked by overlap count +
+    filename boost same as the AND set. This directly targets the diagnosed
+    failure mode: a small, correct document that's missing 1-2 of many query
+    tokens must still surface as a *candidate* (even if outranked by a full AND
+    match) rather than being invisible to the keyword leg entirely. Distinct
+    from bumping require_all to False outright, which was tried previously
+    (2026-08-08 diagnosis) and measured net-worse on the eval because it let
+    large files with high raw token counts but low relevance crowd out
+    genuinely narrow matches -- appending partials after the AND set preserves
+    the AND set's precedence while adding the missing recall path.
+    """
     import fnmatch
 
-    words = query.lower().split()
-    keywords = [w for w in words if w not in _STOPWORDS and len(w) > 1]
     if not keywords:
         return []
 
@@ -199,11 +280,26 @@ def _search_keyword_fallback(
     if not file_data:
         return []
 
-    # AND logic: files containing all keywords
-    and_matches = [(fp, rp, c, fk) for fp, rp, c, fk in file_data if len(fk) == len(keywords)]
-    candidates = and_matches if and_matches else file_data
+    if require_all:
+        # AND logic: files containing all keywords
+        and_matches = [(fp, rp, c, fk) for fp, rp, c, fk in file_data if len(fk) == len(keywords)]
+        if and_matches:
+            candidates = and_matches
+            if allow_partial and len(keywords) > 1:
+                and_paths = {rp for _, rp, _, _ in and_matches}
+                partials = [
+                    (fp, rp, c, fk) for fp, rp, c, fk in file_data
+                    if rp not in and_paths and len(fk) >= min(_PARTIAL_MATCH_MIN_OVERLAP, len(keywords))
+                ]
+                candidates = and_matches + partials
+        else:
+            candidates = file_data
+    else:
+        candidates = file_data
 
-    # Rank by keyword count + filename boost
+    # Rank by keyword count + filename boost. Preserves AND-set precedence
+    # (all-keyword matches keep their higher score) even when partials are
+    # appended, since len(fk) for an AND match is always len(keywords).
     def _score(item):
         fp, rp, c, fk = item
         name_lower = fp.stem.lower()
@@ -232,6 +328,75 @@ def _search_keyword_fallback(
                 return matches
 
     return matches
+
+
+def _search_keyword_fallback(
+    query: str,
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Keyword-based fallback search when ripgrep returns 0 results."""
+    words = query.lower().split()
+    keywords = [w for w in words if w not in _STOPWORDS and len(w) > 1]
+    return _search_by_tokens(keywords, search_path, file_pattern, max_results, context_lines)
+
+
+# vault_search tokenized-augmentation tuning. A query at or under this many extracted
+# content tokens is short enough that it's effectively the "2-4 nouns" case vault_search
+# already expects -- and, critically, the case a caller doing exact-string verification
+# before vault_str_replace is relying on. Leave it byte-identical to pre-change
+# behaviour. Same threshold as vault_query's keyword leg (query.py's
+# _SHORT_QUERY_TOKEN_THRESHOLD), kept as a separate constant per-module rather than a
+# shared import so the two kill switches (VAULT_SEARCH_TOKENIZE and
+# VAULT_QUERY_KEYWORD_TOKENIZE) stay fully decoupled.
+_VAULT_SEARCH_TOKEN_THRESHOLD = 4
+
+
+def _tag_match_type(matches: list[dict], match_type: str) -> list[dict]:
+    for match in matches:
+        match["match_type"] = match_type
+    return matches
+
+
+def _augment_with_tokenized_matches(
+    query: str,
+    literal_matches: list[dict],
+    search_path: Path,
+    file_pattern: str,
+    max_results: int,
+    context_lines: int,
+) -> list[dict]:
+    """Augments vault_search's literal (ripgrep/Python) results with tokenized
+    matches for long queries, without ever reordering, demoting, or dropping a
+    literal match.
+
+    `literal_matches` -- whatever the exact-string search phase found, including
+    empty -- always comes first, tagged match_type="literal". For queries with
+    more than _VAULT_SEARCH_TOKEN_THRESHOLD content tokens, tokenized matches
+    (reusing vault_query's _tokenize_query, not a second tokenizer) are appended
+    below them, tagged match_type="tokenized", with paths already present in the
+    literal set skipped so no file appears twice.
+
+    This tagging is the exact-string-verification contract: a caller checking
+    whether a string exists before vault_str_replace must filter to
+    match_type == "literal" and treat zero such matches as "does not exist",
+    even if tokenized matches are also present.
+    """
+    tagged_literal = _tag_match_type(literal_matches, "literal")
+    seen_paths = {m["path"] for m in tagged_literal}
+
+    tokens = [t.lower() for t in _tokenize_query(query)]
+    tokenized = _search_by_tokens(
+        tokens, search_path, file_pattern, max_results, context_lines,
+        require_all=True, allow_partial=True,
+    )
+    appended = _tag_match_type(
+        [m for m in tokenized if m["path"] not in seen_paths], "tokenized"
+    )
+
+    return (tagged_literal + appended)[:max_results]
 
 
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
@@ -269,7 +434,11 @@ def vault_search(
         else:
             matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
 
-        if not matches:
+        if config.VAULT_SEARCH_TOKENIZE and len(_tokenize_query(query)) > _VAULT_SEARCH_TOKEN_THRESHOLD:
+            matches = _augment_with_tokenized_matches(
+                query, matches, search_path, file_pattern, max_results, context_lines
+            )
+        elif not matches:
             matches = _search_keyword_fallback(query, search_path, file_pattern, max_results, context_lines)
 
         for match in matches:

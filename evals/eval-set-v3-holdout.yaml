@@ -1,0 +1,109 @@
+# eval-set-v3-holdout.yaml -- fresh, hashed holdout set for paraphrase/alias
+# retrieval, built for vault-retrieval-candidate-recall-v1.
+#
+# Purpose: eval-set-v3.yaml's 5 paraphrase questions were used throughout this
+# build's diagnosis (rank-tracing, chunking/tokenization root-cause analysis).
+# Any fix tuned by looking at those exact 5 questions risks overfitting to
+# their specific vocabulary gaps rather than fixing the general mechanism.
+# This file contains DIFFERENT questions, over DIFFERENT source documents/
+# facts than any of the 5 known v3 paraphrase entries or the 4 known
+# entities_aliases entries -- built and hashed BEFORE the final implementation
+# was evaluated against it, per this build's own governing instructions.
+#
+# Corpus: BS Brain vault, same live filesystem eval-set-v3.yaml scores against
+# (no separate corpus_version -- this file's own sha256 in
+# evals/history-v3/HOLDOUT_CORPUS_HASH is the freeze record, computed over
+# this YAML's raw bytes at freeze time, same mechanism as run_eval_v3.py's
+# CORPUS_HASH for eval-set-v3.yaml).
+#
+# Scoring: reuses run_eval_v3.py's score_entry/run_tool_eval_v3 (see
+# evals/run_holdout_eval.py), same R@5/MRR/source_correctness/synthesis_hit
+# definitions, same TOP_N/R_AT_K constants. Deliberately excludes categories
+# eval-set-v3.yaml already scores well and are not the diagnosed gap
+# (known_facts, cross_document, negative_unknown, etc.) -- this file targets
+# exactly the two categories (paraphrase, entities_aliases) where the fresh
+# candidate-recall mechanism needed real held-out proof, not a rerun of
+# already-seen questions.
+#
+# HARD RULE: never look at run results against this file and then edit a
+# question's wording or expected_paths to make it pass -- that defeats the
+# purpose of a holdout. If a question is later found to be ambiguous/broken,
+# it must be replaced with a NEW question over a NEW fact, re-hashed, and the
+# old result discarded and re-run in full, not patched in place.
+
+- question: "How much extra borrowing headroom does the Bradley household's refinance strategy free up, and what's the resulting loan-to-value ratio against their Willoughby-area property?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Bradley, Samuel & Bradley, Katrina.md"
+  decoy_paths: []
+  category_note: >
+    Full-vocabulary paraphrase of the Bradley file's own "equity release" /
+    "LVR 30.9%" facts -- avoids the literal terms "equity release" and "LVR"
+    in favor of "borrowing headroom" and "loan-to-value ratio", and names the
+    council area ("Willoughby") rather than a suburb name that appears
+    verbatim in the file. Independent of every known v3 paraphrase question
+    (different client, different document, different fact).
+
+- question: "On the machine everyone calls BSMiniPC, what's the actual amount of memory available inside the Linux side once the host-level cap is applied?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  decoy_paths: []
+  category_note: >
+    Reworded restatement of the "RAM | 64GB host / 23GiB usable inside WSL"
+    fact -- avoids "WSL", "RAM", and the literal figure's units framing,
+    using "Linux side" and "memory available" instead. Different SYSTEM-
+    FACTS.md fact/table row than any question already in eval-set-v3.yaml
+    (that file's SYSTEM-FACTS.md paraphrase questions target the trade-gate
+    and 502-status facts, not this one).
+
+- question: "According to the most recent confirmed check, has the daily watchdog that catches silently-skipped cron jobs actually caught a real miss before, or does it only ever report a clean run?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/job-miss-check.md"
+  decoy_paths: []
+  category_note: >
+    Reworded restatement of job-miss-check.md's own "not a check that only
+    ever reports green" disclosure -- avoids "job-miss-check", "cron", and
+    "missed=2/alert_sent=True" literally, using "silently-skipped" and
+    "clean run" instead. A genuinely new document/fact, not a rewrite of any
+    known v3 entry.
+
+- question: "Aside from the process that actually dispatches builds, what other background processes does the build-automation system keep running under its process supervisor, and which one pushes logs out?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/SYSTEM-FACTS.md"
+  decoy_paths: []
+  category_note: >
+    Reworded restatement of the "Supervisord programs | orchestrator,
+    orchestrator-dashboard, telegram-bot, log-syncer" table row -- avoids
+    "supervisord", "Build Orchestrator", and the literal program names,
+    using "process supervisor" and "build-automation system" instead, and
+    frames the question around the non-dispatch processes specifically.
+
+- question: "The three vault backends people just call 'BS', 'CB', and 'Alcove' Brain all trace back to one single codebase checkout on disk -- where does that checkout actually live, and which git branch is it on?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-mcp-topology.md"
+  decoy_paths: []
+  category_note: >
+    Tests resolving informal short-form nicknames ("BS"/"CB"/"Alcove" Brain)
+    to the canonical-state record describing the single shared checkout and
+    branch, without naming "vault-mcp-topology" or "feature/vault-tools-v2"
+    in the question itself. Different entity/document than the four
+    entities_aliases entries already in eval-set-v3.yaml.
+
+- question: "For the couple whose maternity-leave-affected household income is currently being serviced entirely by one partner's complex bonus-and-STI pay structure, who's actually managing that relationship day to day, and which bank holds their existing home loan?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Bradley, Samuel & Bradley, Katrina.md"
+  decoy_paths: []
+  category_note: >
+    Tests resolving a client by situational description (maternity leave,
+    single-income servicing, bonus/STI structure) rather than by name at
+    all -- no client surname appears in the question. Same underlying
+    document as the paraphrase entry above (deliberate: this file allows a
+    document to anchor more than one question, unlike eval-set-v3.yaml's
+    one-question-per-fact convention, since holdout size is small and the two
+    questions test genuinely different retrieval skills -- fact paraphrase
+    vs. situational-description entity resolution).
