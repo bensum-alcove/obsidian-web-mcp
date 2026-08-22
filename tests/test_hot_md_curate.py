@@ -5,6 +5,7 @@ appends now go through vault_lock instead of a bare open(..., 'w'/'a').
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -243,3 +244,36 @@ def test_apply_mode_rotation_does_not_bump_frontmatter_updated(curate, tmp_path)
     new_text = abs_path.read_text()
     assert "updated: '2026-01-01'" in new_text
     assert new_text.count("- shipped thing") == curate.SECTION_CAP
+
+
+def _load_curate_module(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_telegram_token_not_hardcoded_in_source(curate):
+    source = SCRIPT_PATH.read_text()
+    assert "TELEGRAM_BOT_TOKEN = os.environ.get" in source
+    assert "TELEGRAM_CHAT_ID = os.environ.get" in source
+    # regression guard: no literal Telegram bot-token-shaped constant in source
+    assert not re.search(r'TELEGRAM_BOT_TOKEN\s*=\s*"\d+:', source)
+
+
+def test_telegram_credentials_missing_from_environment(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    module = _load_curate_module("hot_md_curate_no_env")
+    assert module.TELEGRAM_BOT_TOKEN is None
+    assert module.TELEGRAM_CHAT_ID is None
+    with pytest.raises(RuntimeError):
+        module.send_telegram("test message")
+
+
+def test_telegram_credentials_loaded_from_environment(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token-for-test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "fake-chat-id-for-test")
+    module = _load_curate_module("hot_md_curate_with_env")
+    assert module.TELEGRAM_BOT_TOKEN == "fake-token-for-test"
+    assert module.TELEGRAM_CHAT_ID == "fake-chat-id-for-test"

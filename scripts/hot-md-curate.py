@@ -137,8 +137,8 @@ REVIEW_STATUS_RE = re.compile(r"^status:\s*(\S+)\s*$", re.IGNORECASE)
 BACKUP_ROOT = os.path.expanduser("~/backups/hot-md-curate")
 LOCK_FILE = "/tmp/hot-md-curate.lock"
 
-TELEGRAM_BOT_TOKEN = "8954494669:AAEQdrVGbRRmowTI1TZTsCUD5VBFmJL9dlM"
-TELEGRAM_CHAT_ID = "8558481275"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?\n)---\n", re.DOTALL)
 HEADING_RE = re.compile(r"^(#{1,2})\s+(.*?)\s*$")
@@ -618,6 +618,10 @@ def backup_targets(vault_root, ts, phase):
 
 
 def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set in environment — cannot send Telegram notification"
+        )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode()
     req = urllib.request.Request(url, data=data)
