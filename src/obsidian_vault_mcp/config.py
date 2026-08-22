@@ -45,7 +45,21 @@ EXCLUDED_DIRS = {".obsidian", ".trash", ".git", ".DS_Store", ".semantic-index", 
 # below, so synthetic canary writes never surface in real search results but
 # are not invisible to the tooling that needs to see them.
 SCRATCH_DIR_NAME = "_scratch"
-RETRIEVAL_EXCLUDED_DIRS = EXCLUDED_DIRS | {SCRATCH_DIR_NAME}
+
+# vault-retrieval-r5-085-v1: retrieval-eval report directories quote every
+# benchmark question verbatim as rubric/top_result text (see run_eval_v3.py's
+# "Manual rubric review needed" section) and accumulate one dated report per
+# run. Left in ordinary retrieval, these become the single strongest keyword
+# match for a large fraction of the very questions they document -- diagnosed
+# as the direct cause of 16/30 frozen-v3 misses in this build's miss trace
+# (candidate slots consumed by report noise, or the report itself winning the
+# match outright). This isn't benchmark-specific: any real user asking one of
+# these documented questions in production hits the exact same contamination.
+# Same treatment as _scratch above -- hidden from ordinary retrieval only,
+# still vault_list/frontmatter-index visible. No-op in vaults without these
+# directories (Alcove/CB Brain at the time of this build).
+EVAL_REPORT_DIR_NAMES = {"retrieval-eval", "retrieval-eval-v3"}
+RETRIEVAL_EXCLUDED_DIRS = EXCLUDED_DIRS | {SCRATCH_DIR_NAME} | EVAL_REPORT_DIR_NAMES
 
 # Frontmatter index refresh interval (seconds)
 FRONTMATTER_INDEX_DEBOUNCE = 5.0
@@ -143,17 +157,20 @@ BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS = float(os.environ.get("BO_AUTHORING_CONTR
 BO_PATH_GUARD_MODE = os.environ.get("BO_PATH_GUARD_MODE", "shadow").strip().lower()
 
 # vault_query RRF fusion sharpness (kill switch: env var edit + supervisorctl restart,
-# no git operation needed). Default 60 is byte-identical to pre-calibration behaviour.
-# vault-query-calibration-v2 diagnosis: k=60 is flat enough, relative to the ~150-
-# candidate fetch depth, that a document appearing at a middling rank in BOTH legs
-# routinely out-scores a document ranked #1 in only ONE leg (their summed 1/(k+rank)
-# terms exceed the single leg's 1/(k+1)). This was the single highest-leverage,
-# most-repeating failure mode in the v3 baseline diagnosis -- see this build's output
-# doc for the per-question rank trace. Lowering k sharpens the top of the curve so a
-# confident single-leg #1 is harder to displace, without changing the behaviour for
-# genuine both-legs-agree consensus (which wins at any k>0 since it's always ~2x a
-# single leg's score at the same rank).
-VAULT_QUERY_RRF_K = float(os.environ.get("VAULT_QUERY_RRF_K", "60"))
+# no git operation needed). vault-query-calibration-v2 diagnosed that k=60 is flat
+# enough, relative to the candidate fetch depth, that a document appearing at a
+# middling rank in BOTH legs routinely out-scores a document ranked #1 in only ONE
+# leg (their summed 1/(k+rank) terms exceed the single leg's 1/(k+1)) -- but that
+# diagnosis was never actually deployed (production still ran the default k=60; see
+# vault-retrieval-r5-085-v1's miss trace, which found 7 of 17 remaining frozen-v3
+# misses were this exact "confident single-leg #1 buried by consensus" pattern).
+# vault-retrieval-r5-085-v1 empirically swept k against the full frozen-v3 corpus
+# (not tuned per-question) and found a stable plateau at k=4..8 (34-35/45 scored
+# questions hit, vs 28/45 at k=60); k=6 is the plateau's midpoint. Lowering k
+# sharpens the top of the curve so a confident single-leg #1 is harder to displace,
+# without changing the behaviour for genuine both-legs-agree consensus (which wins
+# at any k>0 since it's always ~2x a single leg's score at the same rank).
+VAULT_QUERY_RRF_K = float(os.environ.get("VAULT_QUERY_RRF_K", "6"))
 
 # vault_query canonical-state authority boost (kill switch: 1.0 = no-op, byte-identical
 # to pre-calibration behaviour). Multiplies the fused score of any result whose
@@ -164,7 +181,17 @@ VAULT_QUERY_RRF_K = float(os.environ.get("VAULT_QUERY_RRF_K", "60"))
 # override, so a genuinely stronger match can still win. Inert (no matching files) in
 # any vault that has no Canonical State/records/ tree yet, e.g. CB/Alcove Brain at the
 # time of this build.
-VAULT_QUERY_CANONICAL_BOOST = float(os.environ.get("VAULT_QUERY_CANONICAL_BOOST", "1.0"))
+#
+# vault-retrieval-r5-085-v1: the previously-deployed live value (1.3, set only via
+# supervisord env, never promoted to this default) was empirically almost a no-op --
+# canonical-state records that were already ranked well outside a competing spec's/
+# changelog's/build-log's top-5 fused rank need a multiplier proportional to that
+# rank gap, not a small nudge. Swept boost against frozen-v3 (aggregate, not
+# per-question) at the now-corrected k=6: 1.0/1.3 -> 0.778 R@5, plateauing at
+# 3.0-5.0 -> 0.867, declining again by 15+ (confirms this is a real peak, not
+# "bigger is always better" — a canonical record can still lose to a much stronger
+# prose match at extreme boost, which is the intended non-absolute behaviour).
+VAULT_QUERY_CANONICAL_BOOST = float(os.environ.get("VAULT_QUERY_CANONICAL_BOOST", "3.0"))
 
 # vault_query temporal decay: half-life in days, env-overridable.
 # Longest matching path substring wins; unmatched paths use the default.
@@ -200,5 +227,15 @@ VAULT_SEMANTIC_TABLE_ROW_CHUNKING = os.environ.get("VAULT_SEMANTIC_TABLE_ROW_CHU
 # were absent from fusion entirely regardless of any rerank/boost tuning. Kill switch:
 # set back to the previous multiplier-derived value (unused when this constant is at
 # its default derivation, see tools/query.py/tools/semantic_search.py call sites).
+#
+# vault-retrieval-r5-085-v1 found 100 still insufficient for some genuinely hard
+# cases (e.g. an entity-alias question whose correct client file only reached
+# distinct-file semantic rank 5 at candidate depth 300, invisible at depth 100) and
+# for the keyword leg, where a large well-matching-filename document can consume the
+# AND-match candidate slots ahead of a correct canonical-state record with weaker
+# filename overlap. Raised to 200 -- empirically the full gain of raising all the
+# way to the hard cap of 300 (see this build's k/depth sweep), at measured-identical
+# per-query latency locally (SQLite KNN + the keyword leg's already-fixed full-vault
+# scan cost dominate either way; this constant only bounds the output slice).
 VAULT_SEMANTIC_FETCH_MULTIPLIER = int(os.environ.get("VAULT_SEMANTIC_FETCH_MULTIPLIER", "5"))
-VAULT_SEMANTIC_FETCH_MIN = int(os.environ.get("VAULT_SEMANTIC_FETCH_MIN", "100"))
+VAULT_SEMANTIC_FETCH_MIN = int(os.environ.get("VAULT_SEMANTIC_FETCH_MIN", "200"))

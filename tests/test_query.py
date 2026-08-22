@@ -321,23 +321,47 @@ def test_rrf_fuse_default_k_reads_from_config(monkeypatch):
     assert scores["a.md"] == pytest.approx(1 / 6)
 
 
-def test_rrf_fuse_kill_switch_default_matches_pre_calibration_k60():
-    """Kill switch: default config value (60) is byte-identical to the old
-    hardcoded RRF_K=60 behaviour."""
-    assert config.VAULT_QUERY_RRF_K == 60.0
-    scores = query_tool._rrf_fuse(["a.md"], [])
+def test_rrf_fuse_kill_switch_at_k60_matches_pre_calibration_behaviour(monkeypatch):
+    """Kill switch: explicitly setting k back to the old hardcoded RRF_K=60 is
+    byte-identical to pre-calibration behaviour."""
+    monkeypatch.setattr(config, "VAULT_QUERY_RRF_K", 60.0)
+    scores = query_tool._rrf_fuse(["a.md"], [], k=None)
     assert scores["a.md"] == pytest.approx(1 / 61)
 
 
-def test_canonical_boost_factor_kill_switch_off_is_noop(vault_dir):
-    """Default VAULT_QUERY_CANONICAL_BOOST=1.0 -> no-op regardless of frontmatter."""
+def test_rrf_fuse_default_matches_r5_085_v1_calibration():
+    """vault-retrieval-r5-085-v1: default k lowered from 60 to 6 -- empirically
+    swept against frozen-v3 (aggregate, not per-question), stable plateau at
+    k=4..8. Pins the new default so a future change is deliberate."""
+    assert config.VAULT_QUERY_RRF_K == 6.0
+    scores = query_tool._rrf_fuse(["a.md"], [], k=None)
+    assert scores["a.md"] == pytest.approx(1 / 7)
+
+
+def test_canonical_boost_factor_kill_switch_off_is_noop(vault_dir, monkeypatch):
+    """Explicitly setting VAULT_QUERY_CANONICAL_BOOST=1.0 -> no-op regardless of
+    frontmatter (the kill switch), independent of whatever the live default is."""
     canonical_dir = vault_dir / "Canonical State" / "records"
     canonical_dir.mkdir(parents=True)
     (canonical_dir / "widget.md").write_text("---\ntype: canonical-state\n---\n\nWidget.\n")
 
-    assert config.VAULT_QUERY_CANONICAL_BOOST == 1.0
+    monkeypatch.setattr(config, "VAULT_QUERY_CANONICAL_BOOST", 1.0)
     factor = query_tool._canonical_boost_factor("Canonical State/records/widget.md")
     assert factor == 1.0
+
+
+def test_canonical_boost_factor_default_matches_r5_085_v1_calibration(vault_dir):
+    """vault-retrieval-r5-085-v1: default boost raised from 1.0 (and the
+    previously live-only 1.3, which was never promoted to this default and was
+    empirically almost a no-op) to 3.0 -- empirically swept against frozen-v3,
+    plateau at 3.0-5.0. Pins the new default so a future change is deliberate."""
+    canonical_dir = vault_dir / "Canonical State" / "records"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "widget.md").write_text("---\ntype: canonical-state\n---\n\nWidget.\n")
+
+    assert config.VAULT_QUERY_CANONICAL_BOOST == 3.0
+    factor = query_tool._canonical_boost_factor("Canonical State/records/widget.md")
+    assert factor == 3.0
 
 
 def test_canonical_boost_factor_boosts_canonical_state_frontmatter(vault_dir, monkeypatch):
