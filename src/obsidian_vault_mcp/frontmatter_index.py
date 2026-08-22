@@ -25,28 +25,36 @@ class FrontmatterIndex:
         self._pending_paths: set[str] = set()
 
     def start(self) -> None:
-        """Walk all .md files, parse frontmatter, and start watching for changes."""
-        t0 = time.monotonic()
-        count = 0
+        """Walk all .md files, parse frontmatter, and start watching for changes.
 
-        for md_path in config.VAULT_PATH.rglob("*.md"):
-            if self._is_excluded(md_path):
-                continue
-            rel = str(md_path.relative_to(config.VAULT_PATH))
-            fm = self._parse_frontmatter(md_path)
-            if fm is not None:
-                self._index[rel] = fm
-                count += 1
+        Idempotent: returns immediately if the observer is already running.
+        Designed to be called once per process — the observer lives until stop().
+        """
+        with self._lock:
+            if self._observer is not None and self._observer.is_alive():
+                return
 
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "Frontmatter index built: %d files in %.2f seconds", count, elapsed
-        )
+            t0 = time.monotonic()
+            count = 0
 
-        self._observer = Observer()
-        handler = _VaultEventHandler(self)
-        self._observer.schedule(handler, str(config.VAULT_PATH), recursive=True)
-        self._observer.start()
+            for md_path in config.VAULT_PATH.rglob("*.md"):
+                if self._is_excluded(md_path):
+                    continue
+                rel = str(md_path.relative_to(config.VAULT_PATH))
+                fm = self._parse_frontmatter(md_path)
+                if fm is not None:
+                    self._index[rel] = fm
+                    count += 1
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "Frontmatter index built: %d files in %.2f seconds", count, elapsed
+            )
+
+            self._observer = Observer()
+            handler = _VaultEventHandler(self)
+            self._observer.schedule(handler, str(config.VAULT_PATH), recursive=True)
+            self._observer.start()
 
     def stop(self) -> None:
         """Stop the filesystem observer and cancel any pending debounce."""

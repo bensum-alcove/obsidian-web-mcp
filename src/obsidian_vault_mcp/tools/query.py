@@ -174,7 +174,9 @@ def _keyword_leg(query: str, file_pattern: str, fetch_n: int) -> list[tuple[str,
     # partial-match cases but let large, topically broad files accumulate a
     # high raw token count just from size and crowd out narrower, more
     # relevant files even more often than the AND gate does -- net worse on
-    # the eval. require_all=True is the better-measured tradeoff of the two.
+    # the eval. require_all=True is the better-measured tradeoff of the two,
+    # though neither eliminates the underlying single-file-flooding dynamic
+    # (see BASELINE_SCORES comparison in this build's output doc).
     #
     # allow_partial=True (vault-retrieval-candidate-recall-v1): on top of the
     # AND-preferred/OR-fallback behaviour above, files satisfying most-but-not-
