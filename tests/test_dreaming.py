@@ -337,6 +337,103 @@ def test_extract_descriptors_caps_clause_length(dreaming):
     assert dreaming._extract_descriptors(body, ["Yusuf Eqbal"]) == []
 
 
+def test_extract_descriptors_plain_prose_no_bullet(dreaming):
+    """The "Name - Role, ..." shape also occurs as a file's opening prose
+    sentence with no bullet at all (real text, "Cheruvu, Sarat.md")."""
+    body = (
+        "Sarat Cheruvu - cardiologist, HNW client. Wife/co-borrower: Parya "
+        "(paryae@gmail.com).\n"
+    )
+    descriptors = dreaming._extract_descriptors(body, ["Cheruvu, Sarat", "Sarat Cheruvu", "Sarat"])
+    assert descriptors == ["cardiologist, HNW client"]
+
+
+def test_extract_descriptors_field_label_employer_no_name(dreaming):
+    """"- **Employer:** ..." (real text, "Cacho, Carlos.md") records
+    occupation with no name on the line at all -- attributed to the file's
+    own entity since extraction is already client/person-type restricted."""
+    body = "- **Employer:** Macquarie Corp Holdings P/L - Macquarie Capital group\n"
+    descriptors = dreaming._extract_descriptors(body, ["Cacho, Carlos", "Carlos Cacho"])
+    assert descriptors == ["Macquarie Corp Holdings P/L - Macquarie Capital group"]
+
+
+def test_extract_descriptors_field_label_role_and_occupation_variants(dreaming):
+    assert dreaming._extract_descriptors(
+        "- **Role:** Canteen Casual\n", ["Taylor, Tess"]
+    ) == ["Canteen Casual"]
+    assert dreaming._extract_descriptors(
+        "- **Occupation:** Psychiatrist (Specialist Medical Services)\n", ["Singer, Joel"]
+    ) == ["Psychiatrist (Specialist Medical Services)"]
+
+
+def test_extract_descriptors_clause_survives_pa_abbreviation(dreaming):
+    """A naive first-". " split truncates the clause right after "p.a."
+    (real text, "Berchtold, Erica.md"), losing the occupation title that
+    follows it in the same clause."""
+    body = (
+        "  - Erica Berchtold: $1,167,500 p.a. gross (per payslip - Salary "
+        "Package / CEO classification; annualised ordinary pay reconciles "
+        "to this figure)\n"
+    )
+    descriptors = dreaming._extract_descriptors(body, ["Berchtold, Erica", "Erica Berchtold"])
+    assert len(descriptors) == 1
+    assert "CEO classification" in descriptors[0]
+
+
+def test_extract_descriptors_ignores_midword_hyphen_in_prose(dreaming):
+    """A lone given-name alias ("Joel") is a token-subset of any sentence
+    containing that word -- with non-bulleted lines now in scope, a plain
+    prose sentence mentioning the client by first name must not be mistaken
+    for a "Name - value" descriptor line just because it contains an
+    unrelated mid-word hyphen (real text, "Cheruvu, Sarat.md":
+    "cold-called")."""
+    body = (
+        "Sarat was cold-called by ANZ's home loan team (via an old ANZ "
+        "credit card relationship) offering:\n"
+    )
+    assert dreaming._extract_descriptors(body, ["Cheruvu, Sarat", "Sarat Cheruvu", "Sarat"]) == []
+
+
+def test_extract_descriptors_ignores_long_sentence_starting_with_given_name(dreaming):
+    """Same false-positive family as above, via the colon branch instead of
+    the hyphen branch -- a long unrelated sentence that happens to start
+    with the client's first name and end in a colon must not become the
+    "label" (real text, "Singer, Joel.md")."""
+    body = (
+        "Joel emailed requesting to convert existing loan to IO as an "
+        "interim step (following call with Chris Bates):\n"
+    )
+    assert dreaming._extract_descriptors(body, ["Singer, Joel", "Joel Singer", "Joel"]) == []
+
+
+def test_extract_descriptors_rejects_top_level_semicolon_status_note(dreaming):
+    """A top-level semicolon marks a compound administrative/status
+    sentence, not an occupation noun phrase (real text, "Buttigieg,
+    Will.md" / "Pearson, Ben.md") -- must not be extracted as a
+    descriptor."""
+    body = (
+        "  - Will Buttigieg: salary and bonus income; current payslips and "
+        "tax returns requested for assessment.\n"
+        "  - Ben Pearson: current salary; expected to increase to circa "
+        "$180-190k\n"
+    )
+    assert dreaming._extract_descriptors(body, ["Buttigieg, Will", "Will Buttigieg"]) == []
+    assert dreaming._extract_descriptors(body, ["Pearson, Ben", "Ben Pearson"]) == []
+
+
+def test_extract_descriptors_allows_semicolon_nested_in_parenthetical(dreaming):
+    """A semicolon nested inside an explanatory parenthetical is fine (real
+    text, "Berchtold, Erica.md") -- only a *top-level* semicolon is
+    rejected."""
+    body = (
+        "  - Erica Berchtold: $1,167,500 p.a. gross (per payslip - Salary "
+        "Package / CEO classification; annualised ordinary pay reconciles "
+        "to this figure)\n"
+    )
+    descriptors = dreaming._extract_descriptors(body, ["Berchtold, Erica", "Erica Berchtold"])
+    assert len(descriptors) == 1
+
+
 def test_pass_entity_index_descriptors_wired_end_to_end(dreaming, tmp_path):
     clients = tmp_path / "Clients"
     clients.mkdir()

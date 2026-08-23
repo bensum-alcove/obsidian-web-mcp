@@ -503,9 +503,59 @@ def _find_backlinks(vault_path: Path, md_files: list[str], entity_rel: str, name
     return backlinks
 
 
-_DESCRIPTOR_LINE_RE = re.compile(r"^\s*-\s*\*{0,2}([A-Za-z][^*:\n]*?)\*{0,2}\s*[:-]\s*(.+)$")
+# The hyphen branch requires a preceding whitespace char (not "\s*") so a
+# mid-word hyphen (e.g. "cold-called" in ordinary prose) can't be mistaken
+# for a "Name - value" separator now that non-bulleted lines are in scope;
+# the colon branch has no such requirement since "**Employer:**" attaches
+# the colon directly, with no space before it. The label capture is bounded
+# to a plausible name/field-label length (60 chars comfortably covers real
+# names and labels here) so a lone single-token given-name alias -- itself
+# always a name-token subset of any longer clause containing that word --
+# can't turn an entire unrelated sentence starting with that first name
+# into a spurious "label"; a line without a short name/label near its start
+# now simply fails to match, rather than matching a run-on substring.
+_DESCRIPTOR_LINE_RE = re.compile(
+    r"^\s*(?:-\s*)?\*{0,2}([A-Za-z][^*:\n]{0,59}?)\*{0,2}"
+    r"(?:\s*:\s*\*{0,2}\s*|\s-\s*\*{0,2}\s*)(.+)$"
+)
 _DESCRIPTOR_PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
 _DESCRIPTOR_MAX_LEN = 140
+# A short lowercase abbreviation ("p.a.", "e.g.") right before a "-  " split
+# point isn't a real sentence boundary -- see _descriptor_clause.
+_DESCRIPTOR_ABBREVIATION_TAIL_RE = re.compile(r"\b[a-z]{1,3}\.[a-z]{1,3}\.$")
+# Recurring field-label bullets that record an applicant's occupation
+# without naming them on the same line -- "- **Employer:** ...", "- **Role:**
+# ...", "- **Occupation:** ...", "- **Employment type:** ..." all observed
+# verbatim across real client files (e.g. "Cacho, Carlos.md", "Taylor,
+# Nathan & Tess.md", "Singer, Joel.md", "Goodall, Laura & Dylan.md").
+# Extraction is already restricted to client/person-typed files, so no name
+# match is needed to attribute these to the file's own entity.
+_OCCUPATION_FIELD_LABELS = {"employer", "role", "occupation", "employment type"}
+
+
+def _has_top_level_semicolon(text: str) -> bool:
+    """True if `text` contains a ";" outside any parenthetical nesting.
+
+    A real occupation/employer descriptor is a noun phrase, not a sentence
+    -- every legitimate example in this corpus is "Role, Employer" or
+    "Employer - detail" shaped (e.g. "Nephrologist, QLD Health"), never two
+    clauses joined by a semicolon. A *top-level* semicolon is the generic
+    grammatical mark of a compound administrative/status note instead (real
+    text, "Buttigieg, Will.md": "salary and bonus income; current payslips
+    and tax returns requested for assessment." -- an income-document
+    request, not an occupation). A semicolon nested inside an explanatory
+    parenthetical is fine and common in real occupation descriptors (real
+    text, "Berchtold, Erica.md": "... (per payslip - Salary Package / CEO
+    classification; annualised ordinary pay reconciles to this figure)")."""
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            return True
+    return False
 
 
 def _name_tokens(s: str) -> set[str]:
@@ -527,22 +577,46 @@ def _names_match(bold_name: str, names: list[str]) -> bool:
     return False
 
 
+def _descriptor_clause(text: str) -> str:
+    """First sentence-like clause of a descriptor's value text, cut at the
+    first ". " -- except a short lowercase abbreviation's period ("p.a.",
+    "e.g.") isn't a real sentence boundary and is skipped in favor of the
+    next one (or the full text, if none remain). A naive first-". " split
+    truncates a clause like "$1,167,500 p.a. gross (... CEO classification
+    ...)" (real text, "Berchtold, Erica.md") right after "p.a.", losing the
+    occupation title that follows."""
+    for m in re.finditer(r"\.\s+", text):
+        head = text[: m.start()]
+        if _DESCRIPTOR_ABBREVIATION_TAIL_RE.search(head + "."):
+            continue
+        return head.strip()
+    return text.strip()
+
+
 def _extract_descriptors(body: str, names: list[str]) -> list[str]:
     """Generic, corpus-derived occupation/role descriptor extraction
-    (vault-retrieval-entity-resolution-r5-v2).
+    (vault-retrieval-entity-resolution-r5-v2, extended by
+    vault-retrieval-entity-alias-resolution-v1).
 
     Many client files record each applicant's occupation with a recurring
     bullet convention -- "- **Full Name** - Role, Employer. <more prose>" or
     "- Full Name: Role, Employer. <more prose>" (both forms occur; see any
-    client file's "Applicants"/"Income" section). When the bulleted name
-    matches one of this entity's own name/alias strings (a trailing
-    parenthetical like "(contractor)" is stripped before comparing), the
-    clause up to the first ". " is captured as a searchable descriptor.
+    client file's "Applicants"/"Income" section). The same "Name - Role,
+    ..." shape also occurs as a file's opening prose sentence with no bullet
+    at all (e.g. "Sarat Cheruvu - cardiologist, HNW client." in "Cheruvu,
+    Sarat.md"'s Overview). When the leading name matches one of this
+    entity's own name/alias strings (a trailing parenthetical like
+    "(contractor)" is stripped before comparing), the clause up to the
+    first real sentence boundary is captured as a searchable descriptor.
+
+    Separately, some files record occupation via a field-labelled bullet
+    with no name at all -- see _OCCUPATION_FIELD_LABELS. Since extraction is
+    already restricted to client/person-typed files, these are attributed
+    to the file's own entity without a name match.
 
     This is a deterministic string extraction keyed only on "does this file
-    use a convention already present in real vault content, for a name
-    already in this entity's own index record" -- it fires or doesn't based
-    on corpus shape, never on benchmark question text.
+    use a convention already present in real vault content" -- it fires or
+    doesn't based on corpus shape, never on benchmark question text.
     """
     names = [n for n in names if n]
     descriptors: list[str] = []
@@ -550,11 +624,15 @@ def _extract_descriptors(body: str, names: list[str]) -> list[str]:
         m = _DESCRIPTOR_LINE_RE.match(line)
         if not m:
             continue
-        bold_name = _DESCRIPTOR_PAREN_SUFFIX_RE.sub("", m.group(1).strip()).strip()
-        if not _names_match(bold_name, names):
+        label = _DESCRIPTOR_PAREN_SUFFIX_RE.sub("", m.group(1).strip()).strip()
+        if not (_names_match(label, names) or label.lower() in _OCCUPATION_FIELD_LABELS):
             continue
-        clause = m.group(2).split(". ", 1)[0].strip()
-        if clause and len(clause) <= _DESCRIPTOR_MAX_LEN:
+        clause = _descriptor_clause(m.group(2).strip())
+        if (
+            clause
+            and len(clause) <= _DESCRIPTOR_MAX_LEN
+            and not _has_top_level_semicolon(clause)
+        ):
             descriptors.append(clause)
     return list(dict.fromkeys(descriptors))
 
