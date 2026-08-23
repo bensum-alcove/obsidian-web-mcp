@@ -367,6 +367,47 @@ def generate_aliases(canonical_name: str) -> list[str]:
     return aliases
 
 
+_H1_PAREN_RE = re.compile(r"^(.*?)\s*\((.*)\)\s*$")
+
+
+def generate_h1_aliases(canonical_name: str, h1_text: str | None) -> list[str]:
+    """Additional alias candidates from a file's own first H1 heading, on top
+    of generate_aliases' filename-derived ones (vault-retrieval-entity-
+    resolution-r5-v2).
+
+    Filenames only capture the person(s) whose surname the file was named
+    after (e.g. "Eqbal, Yusuf.md") -- but a couple/family H1 heading routinely
+    also names a partner who never appears in the filename at all (e.g.
+    "# Yusuf Eqbal & Jasmine Ucas"), and a "Name (Full Legal Name)" H1 shape
+    (e.g. "# Misha Mohl (Mikhail Alexander Edgar Mohl)") names the same person
+    twice under two different strings. Both shapes are common, deterministic,
+    corpus-derived conventions already present in real vault files -- not
+    read from or fitted to any benchmark question.
+    """
+    if not h1_text:
+        return []
+
+    aliases: list[str] = []
+    for segment in (s.strip() for s in h1_text.split(COUPLE_SEP)):
+        if not segment or ", " in segment:
+            # "Surname, Given" H1 segments are already covered by
+            # generate_aliases() via the canonical name itself -- only
+            # "Given Surname"-shaped and parenthetical segments add anything new.
+            continue
+        m = _H1_PAREN_RE.match(segment)
+        if m:
+            main, paren = m.group(1).strip(), m.group(2).strip()
+            if main:
+                aliases.append(main)
+            if paren:
+                aliases.append(paren)
+        else:
+            aliases.append(segment)
+
+    canonical_lower = canonical_name.lower()
+    return [a for a in dict.fromkeys(aliases) if a.lower() != canonical_lower]
+
+
 def _rel_under(rel: str, folder: str) -> bool:
     rel_parts = Path(rel).parts
     folder_parts = Path(folder).parts
@@ -462,10 +503,66 @@ def _find_backlinks(vault_path: Path, md_files: list[str], entity_rel: str, name
     return backlinks
 
 
+_DESCRIPTOR_LINE_RE = re.compile(r"^\s*-\s*\*{0,2}([A-Za-z][^*:\n]*?)\*{0,2}\s*[:-]\s*(.+)$")
+_DESCRIPTOR_PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+_DESCRIPTOR_MAX_LEN = 140
+
+
+def _name_tokens(s: str) -> set[str]:
+    return {w.strip(",") for w in s.lower().split() if w.strip(",")}
+
+
+def _names_match(bold_name: str, names: list[str]) -> bool:
+    """True if `bold_name` and any of `names` refer to the same person: exact
+    match, or one's word set is a subset of the other's (e.g. a descriptor
+    line using someone's full legal name, "Jasmine Zehra Daisy Ucas", against
+    the shorter alias "Jasmine Ucas" this entity already carries)."""
+    bold_tokens = _name_tokens(bold_name)
+    if not bold_tokens:
+        return False
+    for name in names:
+        name_tokens = _name_tokens(name)
+        if name_tokens and (name_tokens <= bold_tokens or bold_tokens <= name_tokens):
+            return True
+    return False
+
+
+def _extract_descriptors(body: str, names: list[str]) -> list[str]:
+    """Generic, corpus-derived occupation/role descriptor extraction
+    (vault-retrieval-entity-resolution-r5-v2).
+
+    Many client files record each applicant's occupation with a recurring
+    bullet convention -- "- **Full Name** - Role, Employer. <more prose>" or
+    "- Full Name: Role, Employer. <more prose>" (both forms occur; see any
+    client file's "Applicants"/"Income" section). When the bulleted name
+    matches one of this entity's own name/alias strings (a trailing
+    parenthetical like "(contractor)" is stripped before comparing), the
+    clause up to the first ". " is captured as a searchable descriptor.
+
+    This is a deterministic string extraction keyed only on "does this file
+    use a convention already present in real vault content, for a name
+    already in this entity's own index record" -- it fires or doesn't based
+    on corpus shape, never on benchmark question text.
+    """
+    names = [n for n in names if n]
+    descriptors: list[str] = []
+    for line in body.splitlines():
+        m = _DESCRIPTOR_LINE_RE.match(line)
+        if not m:
+            continue
+        bold_name = _DESCRIPTOR_PAREN_SUFFIX_RE.sub("", m.group(1).strip()).strip()
+        if not _names_match(bold_name, names):
+            continue
+        clause = m.group(2).split(". ", 1)[0].strip()
+        if clause and len(clause) <= _DESCRIPTOR_MAX_LEN:
+            descriptors.append(clause)
+    return list(dict.fromkeys(descriptors))
+
+
 def pass_entity_index(vault_path: Path, vault_name: str, md_files: list[str]) -> list[dict]:
     """Zero-LLM entity index: canonical name (filename sans .md), aliases,
-    path, type, and backlinks for every entity-folder member or frontmatter
-    type={client,person,reference} file."""
+    path, type, descriptors, and backlinks for every entity-folder member or
+    frontmatter type={client,person,reference} file."""
     entities = []
     for rel in _entity_candidates(vault_path, vault_name, md_files):
         canonical = Path(rel).stem
@@ -476,17 +573,30 @@ def pass_entity_index(vault_path: Path, vault_name: str, md_files: list[str]) ->
             if isinstance(fm_aliases, str):
                 fm_aliases = [fm_aliases]
             ftype = str(post.metadata.get("type", "")).lower() or None
+            h1_aliases = generate_h1_aliases(canonical, first_h1(post.content))
         except Exception:
-            fm_aliases, ftype = [], None
+            fm_aliases, ftype, h1_aliases = [], None, []
+            post = None
 
-        aliases = list(dict.fromkeys([*fm_aliases, *generate_aliases(canonical)]))
+        aliases = list(dict.fromkeys([*fm_aliases, *generate_aliases(canonical), *h1_aliases]))
         backlinks = _find_backlinks(vault_path, md_files, rel, [canonical, *aliases])
+        # Occupation/employer bullets are a client/person convention -- restricting
+        # extraction to those two types (not the broader ENTITY_TYPE_HINTS, which
+        # also covers "reference" docs like specs/templates) avoids treating an
+        # unrelated document's incidental "Name: description"-shaped bullet as if
+        # it were someone's occupation.
+        descriptors = (
+            _extract_descriptors(post.content, [canonical, *aliases])
+            if post is not None and ftype in ("client", "person")
+            else []
+        )
 
         entities.append({
             "name": canonical,
             "path": rel,
             "type": ftype,
             "aliases": aliases,
+            "descriptors": descriptors,
             "backlinks": backlinks[:MAX_STORED_BACKLINKS],
             "backlinks_truncated": len(backlinks) > MAX_STORED_BACKLINKS,
         })

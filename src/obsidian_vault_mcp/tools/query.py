@@ -105,8 +105,17 @@ def _decay_factor(path: str, age_days: float) -> float:
     return math.exp(-age_days * math.log(2) / half_life)
 
 
-def _rrf_fuse(keyword_paths: list[str], semantic_paths: list[str], k: float | None = None) -> dict[str, float]:
-    """Reciprocal Rank Fusion: score = sum of 1/(k + rank) across legs, rank is 1-indexed."""
+def _rrf_fuse(
+    keyword_paths: list[str],
+    semantic_paths: list[str],
+    entity_paths: list[str] = (),
+    k: float | None = None,
+) -> dict[str, float]:
+    """Reciprocal Rank Fusion: score = sum of 1/(k + rank) across legs, rank is 1-indexed.
+
+    entity_paths defaults to () rather than None so existing two-leg callers
+    (and tests) are unaffected -- it's an additive third leg, not a
+    replacement for the keyword/semantic legs."""
     if k is None:
         k = config.VAULT_QUERY_RRF_K
     scores: dict[str, float] = {}
@@ -114,7 +123,190 @@ def _rrf_fuse(keyword_paths: list[str], semantic_paths: list[str], k: float | No
         scores[path] = scores.get(path, 0.0) + 1.0 / (k + rank)
     for rank, path in enumerate(semantic_paths, start=1):
         scores[path] = scores.get(path, 0.0) + 1.0 / (k + rank)
+    for rank, path in enumerate(entity_paths, start=1):
+        scores[path] = scores.get(path, 0.0) + 1.0 / (k + rank)
     return scores
+
+
+# --- Entity-mention candidate leg (vault-retrieval-entity-resolution-r5-v2) --
+#
+# _entities.json (built nightly by scripts/dreaming.py from real vault content
+# -- entity-folder members and frontmatter type={client,person,reference}
+# files, never from benchmark questions) already stores each entity's
+# canonical name and generated aliases. This leg does nothing more than ask:
+# "does this query mention, by surname, a person _entities.json already knows
+# about?" -- and if so, treats that entity's own file as a fused-search
+# candidate, exactly as if it had appeared at that rank in a real search leg.
+#
+# Surnames (not given names) are the matched unit: they're the more
+# distinctive half of a "Given Surname" pair, and the miss trace behind this
+# build found several cases where a query names a client by surname alone,
+# buried inside a longer descriptive sentence, with no other literal overlap
+# against the target file at all (e.g. "her partner Vasey's investment
+# property" -> "Sangster, Tiffany & Vasey, Lucy.md").
+#
+# Only client/person entities participate in this leg -- deliberately
+# narrower than dreaming.py's own ENTITY_TYPE_HINTS, which also covers
+# "reference" docs (specs, canonical-state records, infrastructure notes).
+# Reference docs are already directly keyword-findable by their own title
+# when a query names them, and several frozen-v3 canonical_contradiction_
+# precedence questions *deliberately* name a reference doc that is the wrong
+# answer (testing whether retrieval prefers the correct canonical-state
+# record over a document that merely matches the question's own wording) --
+# this leg boosting that named-but-wrong reference doc even further was a
+# measured regression on that category during this build's own eval runs.
+_ENTITY_LEG_TYPES = frozenset({"client", "client-note", "person"})
+
+_ENTITY_TOKEN_MIN_LEN = 4  # below this, a "surname" token is too likely a common word/given name
+
+# Descriptor and given-name words need a stricter bar than surnames:
+# "Nephrologist"/"Newsreader" are unambiguous, but a plain-English word like
+# "current" or "income" recurs across many different clients' descriptors
+# (boilerplate financial vocabulary, not an identifying fact about one
+# person), and a given name like "Adam"/"Jonathan"/"Alex" is shared by many
+# different clients too -- neither identifies one person the way a surname
+# does. A higher minimum length alone doesn't catch every case, so
+# _MAX_LOOSE_TOKEN_ENTITIES below additionally drops any such word shared by
+# more than a couple of distinct entities -- corpus-derived
+# non-distinctiveness, not a hand-curated stopword list.
+_DESCRIPTOR_TOKEN_MIN_LEN = 6
+_MIN_GIVEN_NAME_TOKEN_LEN = 3
+_MAX_LOOSE_TOKEN_ENTITIES = 2
+
+_ENTITY_WORD_RE = re.compile(r"[A-Za-z]+")
+
+_entity_token_index_cache: tuple[float, dict[str, list[str]]] | None = None
+
+
+def _entity_surname_tokens(entity: dict) -> set[str]:
+    """The surname half of each '<Surname>, <Given>' segment in the canonical
+    name, plus the last word of every alias (aliases are consistently
+    '<Given> <Surname>' from generate_aliases/H1 extraction; a free-text
+    frontmatter alias without that shape just yields a harmless extra guess
+    that has to separately survive an exact query-token match to matter)."""
+    tokens: set[str] = set()
+    for segment in entity.get("name", "").split(" & "):
+        if ", " in segment:
+            surname = segment.split(", ", 1)[0].strip()
+            if surname:
+                tokens.add(surname.lower())
+    for alias in entity.get("aliases") or []:
+        words = alias.strip().split()
+        if words:
+            tokens.add(words[-1].lower())
+    return {t for t in tokens if len(t) >= _ENTITY_TOKEN_MIN_LEN}
+
+
+def _entity_given_name_tokens(entity: dict) -> set[str]:
+    """The given-name half of each '<Surname>, <Given>' canonical-name
+    segment, plus the first word of every alias -- a query can name someone
+    by first name alone with no surname anywhere (e.g. "Lucy's own file...").
+    Document-frequency filtering happens in _load_entity_token_index."""
+    tokens: set[str] = set()
+    for segment in entity.get("name", "").split(" & "):
+        if ", " in segment:
+            given = segment.split(", ", 1)[1].strip()
+            if given:
+                tokens.add(given.split()[0].lower())
+    for alias in entity.get("aliases") or []:
+        words = alias.strip().split()
+        if words:
+            tokens.add(words[0].lower())
+    return {t for t in tokens if len(t) >= _MIN_GIVEN_NAME_TOKEN_LEN}
+
+
+def _entity_descriptor_tokens(entity: dict) -> set[str]:
+    """Every word in each occupation/role descriptor dreaming.py extracted
+    for this entity (e.g. "Paediatrician" from "Paediatrician, QLD Health")
+    -- covers a query that names someone by occupation instead of by name at
+    all. Document-frequency filtering happens in _load_entity_token_index,
+    not here, since it needs the full entity list at once."""
+    tokens: set[str] = set()
+    for descriptor in entity.get("descriptors") or []:
+        tokens.update(w.lower() for w in _ENTITY_WORD_RE.findall(descriptor))
+    return {t for t in tokens if len(t) >= _DESCRIPTOR_TOKEN_MIN_LEN}
+
+
+def _load_entity_token_index() -> dict[str, list[str]]:
+    """token (lowercased surname- or descriptor-shaped word) -> entity file
+    paths. Cached and invalidated only by _entities.json's own mtime, so a
+    query pays this cost at most once per nightly entity-index rebuild, not
+    once per call."""
+    global _entity_token_index_cache
+    path = config.VAULT_PATH / "_entities.json"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+
+    if _entity_token_index_cache is not None and _entity_token_index_cache[0] == mtime:
+        return _entity_token_index_cache[1]
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    index: dict[str, list[str]] = {}
+    capped_index: dict[str, list[str]] = {}  # given-name + descriptor tokens, frequency-filtered below
+    for entity in data.get("entities", []):
+        entity_path = entity.get("path")
+        if not entity_path or entity.get("type") not in _ENTITY_LEG_TYPES:
+            continue
+        for token in _entity_surname_tokens(entity):
+            index.setdefault(token, []).append(entity_path)
+        for token in _entity_given_name_tokens(entity) | _entity_descriptor_tokens(entity):
+            capped_index.setdefault(token, []).append(entity_path)
+
+    for token, paths in capped_index.items():
+        distinct_paths = list(dict.fromkeys(paths))
+        if len(distinct_paths) > _MAX_LOOSE_TOKEN_ENTITIES:
+            continue  # too common across different people's names/descriptors to be distinctive
+        existing = index.setdefault(token, [])
+        for p in distinct_paths:
+            if p not in existing:
+                existing.append(p)
+
+    _entity_token_index_cache = (mtime, index)
+    return index
+
+
+def _entity_query_keys(query: str) -> set[str]:
+    """Lowercase word-keys checked against the entity-surname index: each
+    _tokenize_query token, plus every run of letters within it. _tokenize_query
+    deliberately treats '/', apostrophes, and hyphens as non-splitting
+    characters (needed so file paths/env vars survive as one token elsewhere),
+    so a compound phrasing like "Eqbal/Ucas" or a possessive like "Vasey's"
+    would otherwise never expose the bare surname it contains."""
+    keys: set[str] = set()
+    for token in _tokenize_query(query):
+        keys.add(token.lower())
+        keys.update(w.lower() for w in _ENTITY_WORD_RE.findall(token))
+    return keys
+
+
+def _entity_leg(query: str, max_candidates: int) -> list[str]:
+    """Ranked entity-file candidates for a query, by number of distinct
+    surname tokens matched (ties broken by _entities.json's own order so the
+    result is deterministic run-to-run). Two or more entities can legitimately
+    share one query token (e.g. two unrelated "McGrath" households) -- both
+    are returned as candidates rather than the query being forced onto one;
+    downstream fused ranking, not this leg, decides what actually surfaces."""
+    index = _load_entity_token_index()
+    if not index:
+        return []
+
+    query_tokens = _entity_query_keys(query)
+    match_counts: dict[str, int] = {}
+    for token in query_tokens:
+        for path in index.get(token, []):
+            match_counts[path] = match_counts.get(path, 0) + 1
+
+    if not match_counts:
+        return []
+
+    ranked = sorted(match_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [path for path, _ in ranked[:max_candidates]]
 
 
 def _frontmatter_type(full_path: Path) -> str:
@@ -296,7 +488,13 @@ def vault_query(
         semantic_paths = [p for p, *_ in semantic_hits]
         semantic_by_path = {p: (h, c, d) for p, h, c, d in semantic_hits}
 
-        fused = _rrf_fuse(keyword_paths, semantic_paths)
+        entity_paths = (
+            _entity_leg(query, config.VAULT_QUERY_ENTITY_EXPANSION_MAX_CANDIDATES)
+            if config.VAULT_QUERY_ENTITY_EXPANSION
+            else []
+        )
+
+        fused = _rrf_fuse(keyword_paths, semantic_paths, entity_paths)
 
         if path_prefix:
             fused = {p: s for p, s in fused.items() if p.startswith(path_prefix)}

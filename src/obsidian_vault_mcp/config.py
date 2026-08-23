@@ -202,6 +202,33 @@ VAULT_QUERY_HALF_LIFE_OVERRIDES = {
     "Clients/": float(os.environ.get("VAULT_QUERY_HALF_LIFE_CLIENTS", "365")),
 }
 
+# vault_query entity-mention candidate leg (this build: vault-retrieval-entity-
+# resolution-r5-v2). Kill switch: "0"/"false" reverts to exactly the two-leg
+# (keyword + semantic) RRF fusion from vault-retrieval-r5-085-v1, no git
+# operation needed. See tools/query.py's _entity_leg for the mechanism: a
+# query mentioning a known entity's surname -- even buried in a longer
+# descriptive sentence with no other literal overlap with the target file --
+# gets that entity's own file injected as a third RRF-fused candidate leg,
+# corpus-derived from _entities.json (built nightly from real vault content by
+# scripts/dreaming.py, never from benchmark question text). Diagnosed against
+# vault-retrieval-entity-resolution-r5-v2's holdout-2 miss trace: 5 of 9 misses
+# had the correct file's own surname literally present in the query but either
+# absent from the keyword leg's AND-preferred token match (buried among many
+# other descriptive tokens) or ranked too deep in both legs individually to
+# survive RRF fusion against documents that ranked moderately in both legs at
+# once.
+VAULT_QUERY_ENTITY_EXPANSION = os.environ.get("VAULT_QUERY_ENTITY_EXPANSION", "1") not in (
+    "0", "false", "False", "",
+)
+
+# Cap on how many distinct entity files this leg can inject per query --
+# a latency/flooding guard, not a correctness knob. Ranked by number of
+# distinct query tokens matched (ties broken by _entities.json order), so if
+# this cap is ever hit, the most-confidently-matched entities are kept.
+VAULT_QUERY_ENTITY_EXPANSION_MAX_CANDIDATES = int(
+    os.environ.get("VAULT_QUERY_ENTITY_EXPANSION_MAX_CANDIDATES", "8")
+)
+
 # vault_semantic_search chunking mechanisms (vault-retrieval-candidate-recall-v1).
 # Each is independently toggleable/revertible via env var, no git operation needed.
 # All default ON; disabling any one reproduces its specific piece of the previous

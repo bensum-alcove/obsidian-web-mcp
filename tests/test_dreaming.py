@@ -270,6 +270,108 @@ def test_write_entities_json_schema(dreaming, entity_vault):
     assert payload["entity_count"] >= 4
 
 
+# --- generate_h1_aliases (vault-retrieval-entity-resolution-r5-v2) ----------
+
+def test_generate_h1_aliases_couple_extracts_partner_not_in_filename(dreaming):
+    """A couple's H1 heading routinely names a partner the filename never
+    does (e.g. "Eqbal, Yusuf.md" filed under one surname only)."""
+    aliases = dreaming.generate_h1_aliases("Eqbal, Yusuf", "Yusuf Eqbal & Jasmine Ucas")
+    assert aliases == ["Yusuf Eqbal", "Jasmine Ucas"]
+
+
+def test_generate_h1_aliases_parenthetical_full_legal_name(dreaming):
+    aliases = dreaming.generate_h1_aliases("Mohl, Misha", "Misha Mohl (Mikhail Alexander Edgar Mohl)")
+    assert aliases == ["Misha Mohl", "Mikhail Alexander Edgar Mohl"]
+
+
+def test_generate_h1_aliases_surname_given_segment_skipped_as_redundant(dreaming):
+    """A "Surname, Given" H1 segment duplicates generate_aliases' own output
+    via the canonical name -- it must not be re-added as a spurious extra."""
+    aliases = dreaming.generate_h1_aliases(
+        "Machado, Gustavo & Pinheiro, Marina", "Machado, Gustavo & Pinheiro, Marina",
+    )
+    assert aliases == []
+
+
+def test_generate_h1_aliases_none_h1_returns_empty(dreaming):
+    assert dreaming.generate_h1_aliases("Asimus, Angie", None) == []
+
+
+# --- _extract_descriptors (vault-retrieval-entity-resolution-r5-v2) ---------
+
+def test_extract_descriptors_bold_name_dash_form(dreaming):
+    body = (
+        "- **Applicants:**\n"
+        "  - **Yusuf Eqbal** - Nephrologist, QLD Health (Medical SMO). PAYG $9,121 p/fn.\n"
+    )
+    descriptors = dreaming._extract_descriptors(body, ["Eqbal, Yusuf", "Yusuf Eqbal"])
+    assert descriptors == ["Nephrologist, QLD Health (Medical SMO)"]
+
+
+def test_extract_descriptors_plain_name_colon_form(dreaming):
+    body = "  - Angie Asimus: Weekend Co-Host & Newsreader, Seven Network. Base salary.\n"
+    descriptors = dreaming._extract_descriptors(body, ["Asimus, Angie", "Angie Asimus"])
+    assert descriptors == ["Weekend Co-Host & Newsreader, Seven Network"]
+
+
+def test_extract_descriptors_full_legal_name_subset_matches_shorter_alias(dreaming):
+    body = "  - **Jasmine Zehra Daisy Ucas** - Paediatrician, QLD Health (Medical RMO). PAYG.\n"
+    descriptors = dreaming._extract_descriptors(body, ["Eqbal, Yusuf", "Jasmine Ucas"])
+    assert descriptors == ["Paediatrician, QLD Health (Medical RMO)"]
+
+
+def test_extract_descriptors_ignores_unrelated_bullet(dreaming):
+    body = "- **FLAG: something urgent** - needs follow up this week.\n"
+    assert dreaming._extract_descriptors(body, ["Eqbal, Yusuf", "Yusuf Eqbal"]) == []
+
+
+def test_extract_descriptors_strips_trailing_parenthetical_role_suffix(dreaming):
+    body = "  - Angie Asimus (contractor): National Farmers Federation - 4 years. Regular income.\n"
+    descriptors = dreaming._extract_descriptors(body, ["Asimus, Angie", "Angie Asimus"])
+    assert descriptors == ["National Farmers Federation - 4 years"]
+
+
+def test_extract_descriptors_caps_clause_length(dreaming):
+    long_desc = "X" * 200
+    body = f"  - **Yusuf Eqbal** - {long_desc}. more text.\n"
+    assert dreaming._extract_descriptors(body, ["Yusuf Eqbal"]) == []
+
+
+def test_pass_entity_index_descriptors_wired_end_to_end(dreaming, tmp_path):
+    clients = tmp_path / "Clients"
+    clients.mkdir()
+    (clients / "Eqbal, Yusuf.md").write_text(
+        "---\ntype: client\n---\n\n"
+        "# Yusuf Eqbal & Jasmine Ucas\n\n"
+        "## Income\n"
+        "- **Applicants:**\n"
+        "  - **Yusuf Eqbal** - Nephrologist, QLD Health (Medical SMO). PAYG.\n"
+        "  - **Jasmine Zehra Daisy Ucas** - Paediatrician, QLD Health (Medical RMO). PAYG.\n"
+    )
+    md_files = dreaming.list_md_files(tmp_path)
+    entities = dreaming.pass_entity_index(tmp_path, "bs-brain", md_files)
+    eqbal = next(e for e in entities if e["name"] == "Eqbal, Yusuf")
+    assert "Jasmine Ucas" in eqbal["aliases"]
+    assert "Nephrologist, QLD Health (Medical SMO)" in eqbal["descriptors"]
+    assert "Paediatrician, QLD Health (Medical RMO)" in eqbal["descriptors"]
+
+
+def test_pass_entity_index_descriptors_restricted_to_client_person_type(dreaming, tmp_path):
+    """Occupation-descriptor extraction is a client/person convention -- a
+    "reference" entity with a coincidentally similar bullet must not get
+    descriptors, even though it's still a valid ENTITY_TYPE_HINTS candidate
+    for aliases/backlinks (unaffected by this restriction)."""
+    (tmp_path / "spec.md").write_text(
+        "---\ntype: reference\n---\n\n"
+        "# Spec Doc\n\n"
+        "- **Spec Doc** - Format description, not an occupation.\n"
+    )
+    md_files = dreaming.list_md_files(tmp_path)
+    entities = dreaming.pass_entity_index(tmp_path, "bs-brain", md_files)
+    spec = next(e for e in entities if e["name"] == "spec")
+    assert spec["descriptors"] == []
+
+
 # --- Denoise: code-fence-aware extraction + placeholder allowlist -----------
 
 def test_broken_wikilinks_ignores_bash_test_syntax_in_fence(dreaming, tmp_path):
