@@ -287,8 +287,9 @@ def _entity_query_keys(query: str) -> set[str]:
 
 def _entity_leg(query: str, max_candidates: int) -> list[str]:
     """Ranked entity-file candidates for a query, by number of distinct
-    surname tokens matched (ties broken by _entities.json's own order so the
-    result is deterministic run-to-run). Two or more entities can legitimately
+    tokens matched -- surname, given-name, or descriptor alike (ties broken
+    by _entities.json's own order so the result is deterministic
+    run-to-run). Two or more entities can legitimately
     share one query token (e.g. two unrelated "McGrath" households) -- both
     are returned as candidates rather than the query being forced onto one;
     downstream fused ranking, not this leg, decides what actually surfaces."""
