@@ -1,0 +1,272 @@
+# eval-set-v3-holdout-2.yaml -- fresh, hashed, POST-IMPLEMENTATION holdout for
+# vault-retrieval-r5-085-v1.
+#
+# Purpose: this build's diagnosis and calibration (RRF_K, canonical-boost,
+# eval-report exclusion, semantic candidate-pool depth) all used
+# eval-set-v3.yaml and eval-set-v3-holdout.yaml. This file contains 22
+# NEW questions, over NEW documents/facts than any of those two files
+# (verified below), weighted toward paraphrase / entities_aliases /
+# specific-fact / current_vs_stale per this build's spec. Built and hashed
+# BEFORE this build's final implementation was scored against it. No code or
+# weight change may occur after this file is scored -- if it fails, the
+# build fails honestly rather than tuning to it (see spec step 6).
+#
+# Corpus: same live BS Brain vault filesystem as eval-set-v3.yaml.
+# Scoring: reuses run_eval_v3.py's score_entry/run_tool_eval_v3, same
+# R@5/MRR/source_correctness definitions, via evals/run_holdout2_eval.py.
+#
+# Non-overlap check performed before writing this file: none of the 20
+# expected_paths below appear in eval-set-v3.yaml's or eval-set-v3-
+# holdout.yaml's expected_paths/decoy_paths lists (checked by direct diff
+# against both files' full path lists).
+#
+# HARD RULE: never look at run results against this file and then edit a
+# question's wording or expected_paths to make it pass. If a question is
+# later found to be ambiguous/broken, it must be replaced with a NEW question
+# over a NEW fact, re-hashed, and the old result discarded and re-run in
+# full, not patched in place.
+
+# --- paraphrase (6) ----------------------------------------------------------
+
+- question: "If the May 2026 consolidation of the vault launch scripts onto supervisord ever needed to be rolled back, where on disk does the backup file that the rollback script depends on actually live, and has anyone confirmed it's still there?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "scripts/revert-consolidation.sh's .bak.pre-consolidation
+    dependency... Confirmed the referenced backup file still exists at
+    /home/ben_sum/start-supervisord.sh.bak.pre-consolidation" -- avoids the
+    literal filename/script name in favor of "backup file", "rollback
+    script", and "still there".
+
+- question: "For the household filed under the Newtown property owner's surname and her partner Vasey's, what fraction of their home's value does the existing mortgage represent, and about how much more could they draw down while staying at an 80% cap?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Sangster, Tiffany & Vasey, Lucy.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "LVR: 75.09%... Potential equity (80% LVR): $109,300" --
+    avoids "LVR" and "equity" in favor of "fraction of their home's value"
+    and "draw down". Different client file than any known v3/holdout-1 entry.
+
+- question: "What discount off the standard rate did the Eqbal/Ucas refinance end up getting approved at, and what was the resulting indicative interest rate?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Eqbal, Yusuf.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "2.66% discount | 5.98% indicative" -- names the client
+    plainly (paraphrase tests vocabulary, not name resolution; that's the
+    entities_aliases entry below) but rewords "discount" and "indicative
+    rate" phrasing. Different client/fact than any known entry.
+
+- question: "Roughly how much annual income is the Ruffell/Daniells household now drawing from their share portfolio, and what career decision did that income let one partner make?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Ruffell, Nigel & Daniells, Katy.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "Rental income: ~$1M per annum from Macquarie share
+    portfolio... primary reason Nigel is stepping back from employment" --
+    avoids "Macquarie" and "stepping back from employment" in favor of
+    "share portfolio" and "career decision".
+
+- question: "What's the ballpark renovation spend the Machado/Pinheiro household is trying to fund by pulling equity out of their home, and which lender are they refinancing away from to do it?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Machado, Gustavo & Pinheiro, Marina.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "Equity release from PPOR to fund renovation (~$120k).
+    Refinancing St George..." -- avoids "equity release" and "PPOR" in
+    favor of "pulling equity out" and "ballpark renovation spend".
+
+- question: "How often does the vault's own backup script commit to its git repo, in plain minutes rather than a cron expression?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "scripts/vault-backup.sh (cron */15)... 15-min commit
+    cadence" -- avoids the literal cron expression and "vault-backup.sh" in
+    favor of "how often" and "plain minutes".
+
+# --- entities_aliases (6) -----------------------------------------------------
+
+- question: "Lucy's own file is indexed under her partner's surname first -- what investment property does the couple hold, and what's its loan-to-value ratio?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Sangster, Tiffany & Vasey, Lucy.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "Lucy" (first name only) filed under a joint Sangster/Vasey
+    surname to the Beaconsfield investment unit (LVR 67.72%) fact. Different
+    client than any known entities_aliases entry.
+
+- question: "The paediatrician at QLD Health and her partner are refinancing a Gold Coast property they now value well above $3M -- what's the client file called, and what lender did they end up approved with?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Eqbal, Yusuf.md"
+  decoy_paths: []
+  category_note: >
+    Resolves an occupation/situation description ("paediatrician at QLD
+    Health", her partner) to the formal file name Eqbal, Yusuf (filed under
+    the male partner's surname despite the female partner being described
+    first here) and the ANZ Health lender fact.
+
+- question: "One household holds a $10.5M Newport home outright plus an unencumbered Mona Vale rental -- who are they, and what's their investment debt secured against a third property?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Ruffell, Nigel & Daniells, Katy.md"
+  decoy_paths: []
+  category_note: >
+    Pure situational-description resolution (property values/ownership
+    status, no name in the question) to Ruffell, Nigel & Daniells, Katy and
+    the Church Point investment-debt fact.
+
+- question: "Two academics -- one an associate professor, one on a part-time appointment that's about to increase -- live in Westleigh and are financing their home through St George. What are their full names?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Machado, Gustavo & Pinheiro, Marina.md"
+  decoy_paths: []
+  category_note: >
+    Resolves occupation/location description to the formal names Gustavo De
+    Carvalho Machado and Marina De Barros Pinheiro.
+
+- question: "A TV newsreader with a farming side income is refinancing through St George -- what's her partner's name, and is his income for the loan application confirmed yet?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Asimus, Angie.md"
+  decoy_paths: []
+  category_note: >
+    Resolves occupation description ("TV newsreader", "farming side income")
+    to Angie Asimus and the "Chris (partner, income to be assessed... not
+    yet provided)" fact.
+
+- question: "A UNSW professor who goes by a shortened first name is married to a law firm partner receiving trust distributions -- how much did her trust distribution grow year-on-year on her most recent tax return?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Donald, Alex & Kate.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "goes by a shortened first name" (William Alexander -> Alex) and
+    occupation description to Donald, Alex & Kate and the +26.5% FY25 vs FY24
+    trust-distribution growth fact.
+
+# --- specific-fact / exact-identifiers (5) ------------------------------------
+
+- question: "What time of day does the daily memory-hygiene restart of the three vault MCP services actually fire, per its cron entry?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Tests exact recall of the "Daily `supervisorctl restart bs/cb/alcove-
+    brain-vault` (cron `0 17 * * *`)" fact -- 17:00 -- from the same record
+    used for two other questions above, each testing a distinct fact/skill
+    (the paraphrase question above tests the backup-script cadence; the
+    current_vs_stale question below tests the rollback-script status; this
+    one tests the restart-schedule identifier), matching holdout-1's own
+    precedent of reusing one document for multiple genuinely distinct
+    questions.
+
+- question: "How many minutes apart does the vault's live HTTP+cloudflared watchdog script actually run, per its cron entry?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Tests exact recall of check-vault-mcp.sh's `*/2 * * * *` cron cadence
+    (every 2 minutes), distinct from the paraphrase question above about
+    vault-backup.sh's own (different, 15-minute) cadence in the same file.
+
+- question: "What exact ING mortgage balance did Sanjot Singh's credit report confirm, and on what date was that account originally opened?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Singh, Sanjot & Madan, Nandini.md"
+  decoy_paths: []
+  category_note: >
+    Tests exact recall of a specific loan balance ($1,991,766) and account
+    open date (01/12/2025) from a client file not used in any known entry.
+
+- question: "By 2029, the Singh/Madan household wants to have upgraded to a Collaroy property -- roughly what's that property worth today, and what's the maximum mortgage size they want to carry?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Singh, Sanjot & Madan, Nandini.md"
+  decoy_paths: []
+  category_note: >
+    Tests exact recall of "Target property ~$4M in 2029 (~$3.4-3.5M today).
+    Want to keep mortgage at ~$2M" -- same file used above for a different
+    (ING balance) fact, deliberately testing a distinct number pair rather
+    than re-asking the same fact.
+
+- question: "On Kate Donald's most recent tax return, exactly how much trust distribution income did she declare, and how does that compare in dollar terms to the year before?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Donald, Alex & Kate.md"
+  decoy_paths: []
+  category_note: >
+    Tests exact recall of two dollar figures ($467,684 FY25 vs $369,620 FY24)
+    from the same client file used above for a different (alias-resolution)
+    question -- deliberately reuses the document for a distinct retrieval
+    skill, matching holdout-1's own precedent.
+
+# --- current_vs_stale (5) ------------------------------------------------------
+
+- question: "Right now, do the standalone start-bs-vault.sh / start-cb-vault.sh / start-alcove-vault.sh scripts serve as the live launch path for the vault services, or only as a rollback option?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: these scripts were the ORIGINAL launch
+    path but are now KEEP (rollback-only), superseded by brains.conf/
+    supervisord since the 2026-05-06 consolidation -- a naive reader could
+    mistake their continued presence in the repo for still-primary status.
+
+- question: "As things stand today, is the Eqbal/Ucas refinance structured through NAB or through ANZ, and at roughly what indicative rate?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Eqbal, Yusuf.md"
+  decoy_paths: []
+  category_note: >
+    The file records an explicit lender pivot: "Prior NAB structure
+    (superseded May 2026)... pivoted to ANZ Health", with ANZ pricing
+    approved 20 May 2026 at 5.98% indicative -- tests that retrieval
+    surfaces the current structure, not the superseded NAB one recorded in
+    the same document.
+
+- question: "What is the Machado/Pinheiro household currently planning to do with the equity they're releasing from their home -- buy an investment property, or renovate?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Machado, Gustavo & Pinheiro, Marina.md"
+  decoy_paths: []
+  category_note: >
+    The file records an explicit strategy pivot confirmed 20/06/2026 ("IP ->
+    Renovation confirmed") away from an earlier IP-purchase option recorded
+    earlier in the same document -- tests current-state accuracy within one
+    file, not just across files.
+
+- question: "What is Angie Asimus's current approved refinance rate with St George, after the escalation from where it started?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Asimus, Angie.md"
+  decoy_paths: []
+  category_note: >
+    "Pricing history: STG escalated from 6.14% to 5.98% (approved...)" --
+    tests that retrieval surfaces the current approved 5.98% rather than the
+    superseded 6.14% starting point recorded in the same sentence.
+
+- question: "Did the comment in the script that starts supervisord ever wrongly claim vault-mcp still ran via Task Scheduler, and if so, is that still the case today?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records/vault-maintenance-mechanisms.md"
+  decoy_paths: []
+  category_note: >
+    Tests "scripts/start-supervisord.sh header comment | FIXED | Comment
+    claimed vault-mcp/cloudflared still ran via Task Scheduler; false since
+    2026-05-06... Corrected" -- a genuine was-stale-now-fixed fact within the
+    same record used for two other questions above, each testing a distinct
+    fact (backup-script cadence, restart-schedule identifier, and here, the
+    header-comment fix status).
