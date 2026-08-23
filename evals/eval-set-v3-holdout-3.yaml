@@ -1,0 +1,281 @@
+# eval-set-v3-holdout-3.yaml -- fresh, hashed, BLIND generalisation holdout for
+# vault-retrieval-entity-resolution-r5-v2.
+#
+# Purpose: the implementation this build owns (entity/alias/situational-
+# descriptor candidate leg in vault_query, plus H1-alias and occupation-
+# descriptor extraction in dreaming.py) was diagnosed and calibrated entirely
+# against eval-set-v3.yaml, eval-set-v3-holdout.yaml, and eval-set-v3-
+# holdout-2.yaml. This file contains 24 NEW questions, over NEW client files
+# and NEW infrastructure facts never referenced by any of those three files
+# (verified below), weighted evenly across paraphrase / entities_aliases /
+# exact_identifiers / current_vs_stale per this build's spec. Built and
+# hashed BEFORE this build's implementation was scored against it. No code or
+# config change may occur after this file is scored -- if it fails, the
+# build fails honestly rather than tuning to it (see spec step 7).
+#
+# Non-overlap check performed before writing this file: none of the
+# expected_paths below appear in eval-set-v3.yaml's, eval-set-v3-holdout.
+# yaml's, or eval-set-v3-holdout-2.yaml's expected_paths/decoy_paths lists
+# (checked by direct diff against all three files' full path lists).
+# Every fact below was read directly from the live vault before being turned
+# into a question -- none is copied from, or reverse-engineered against, this
+# build's own code paths or test fixtures.
+#
+# Corpus: same live BS Brain vault filesystem as eval-set-v3.yaml.
+# Scoring: reuses run_eval_v3.py's score_entry/run_tool_eval_v3, same
+# R@5/MRR/source_correctness definitions, via evals/run_holdout3_eval.py.
+#
+# HARD RULE: never look at run results against this file and then edit a
+# question's wording or expected_paths to make it pass. If a question is
+# later found to be ambiguous/broken, it must be replaced with a NEW question
+# over a NEW fact, re-hashed, and the old result discarded and re-run in
+# full, not patched in place.
+
+# --- paraphrase (6) ----------------------------------------------------------
+
+- question: "A cardiologist client got a surprise rate offer from a competing major bank out of the blue -- what reason did the broker give for doubting the quoted rate was actually still on the table?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cheruvu, Sarat.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "ANZ's cold-call offer... likely predates the RBA's May
+    2026 hike... supports the stale-rate theory" -- avoids "cold-call",
+    "ANZ", and "RBA hike" in favor of "surprise rate offer" and "doubting the
+    quoted rate". Different client/fact than any known entry.
+
+- question: "For the commercial property leased to a government tenant that one client owns, roughly how many years of lease term were locked in when the deal was structured, all up?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Duff, Scott & Tracey.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "Government tenant (Department of Home Affairs), 7+5
+    lease" -- avoids "Department of Home Affairs" and the literal "7+5" in
+    favor of "government tenant" and "all up". Answer requires adding the
+    two lease terms together, not just quoting a single number verbatim.
+
+- question: "For the household doing a renovation equity-release through their existing bank, why did the lender approve a smaller top-up than what their income could actually support?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/De Bortoli, Melissa & Sortino, Luke.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "Serviceability supports the $255,000 request; the
+    constraint is LVR, not income" -- avoids "serviceability" and "LVR" in
+    favor of "why...smaller" and "income could actually support".
+
+- question: "One applicant's move to reduced working hours cut her usable income by roughly what percentage, comparing her current annualised pay to her last full financial year's figure?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cheruvu, Gouri & Cheruvu, Chaitu.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "current annualised salary $107,438...significantly below
+    FY25's $194,820" -- avoids "0.6 FTE" and "part time" in favor of
+    "reduced working hours" and asks for a derived percentage, not a quoted
+    figure.
+
+- question: "What's the property-investing game plan for the client who wants to buy, do up, and flip a home every couple of years while swapping whose name it's under each time?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Boyd, Nick.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "manufacture equity by buying a PPOR, renovating, and
+    selling after 2+ years (tax-free CGT as PPOR)...alternating ownership
+    between himself and his wife" -- avoids "manufacture equity", "CGT", and
+    "PPOR" in favor of "game plan" and "swapping whose name it's under".
+
+- question: "Roughly how large, in plain characters, is the ephemeral session-cache file allowed to grow before it's considered over its limit?"
+  category: paraphrase
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/hot-md-structure.md"
+  decoy_paths: []
+  category_note: >
+    Paraphrase of "Whole-file character budget (frontmatter excluded):
+    5,000 chars" -- avoids "hot.md" and "budget" in favor of "ephemeral
+    session-cache file" and "over its limit".
+
+# --- entities_aliases (6) -----------------------------------------------------
+
+- question: "A cardiologist client with an existing Westpac loan just got cold-called by a rival bank's home loan team -- which file should I open to review the offer and the broker's response?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cheruvu, Sarat.md"
+  decoy_paths: []
+  category_note: >
+    Resolves an occupation + situation description ("cardiologist",
+    "cold-called by a rival bank") with no surname given at all to
+    Cheruvu, Sarat.md. Different client than any known entities_aliases
+    entry, and no name token at all appears in the question.
+
+- question: "The CEO of a national real-estate franchise wants to flip a renovated PPOR on Sydney's Northern Beaches every couple of years -- what's his target purchase price range for the first cycle?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Boyd, Nick.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "CEO of a national real-estate franchise" (Belle Property,
+    never named in the question) to Boyd, Nick.md and the ~$2.2-2.3M target
+    purchase range. No surname in the question at all.
+
+- question: "Which client works in investment banking at Macquarie Capital and is releasing equity from his home specifically to invest in shares?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cacho, Carlos.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "works in investment banking at Macquarie Capital" +
+    "releasing equity...to invest in shares" to Cacho, Carlos.md without the
+    question ever naming Carlos or Cacho.
+
+- question: "One of our clients draws a CEO-level salary package north of a million dollars a year and is refinancing two investment properties through the same private bank -- who is she, and which private bank is it?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Berchtold, Erica.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "CEO-level salary package north of a million dollars" +
+    "private bank" to Berchtold, Erica.md (Westpac Private) with no name
+    given in the question.
+
+- question: "A part-time legal executive is married to a cardiologist who runs his own cardiology practice through his own company -- what is her current part-time annualised salary?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cheruvu, Gouri & Cheruvu, Chaitu.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "legal executive" + "married to a cardiologist who runs his own
+    company" to Cheruvu, Gouri & Cheruvu, Chaitu.md and the $107,438 current
+    salary fact, without naming either partner.
+
+- question: "A Victoria Police officer and his partner, a lawyer at a law firm, are releasing equity from their home for a renovation -- which bank currently holds their loan?"
+  category: entities_aliases
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/De Bortoli, Melissa & Sortino, Luke.md"
+  decoy_paths: []
+  category_note: >
+    Resolves "Victoria Police officer" + "partner, a lawyer at a law firm"
+    to De Bortoli, Melissa & Sortino, Luke.md (Bank of Melbourne) without
+    naming either Luke, Melissa, Sortino, or De Bortoli.
+
+# --- exact_identifiers (6) ----------------------------------------------------
+
+- question: "What is the exact LVR on Peter and Virginia Dickson's negative-equity Joondalup U22 unit?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Dickson, Peter & Dickson, Virginia.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: 120.7% LVR on the Joondalup U22 apartment,
+    stated once in the client file's portfolio table.
+
+- question: "What is the NAB application ID number for Carlos Cacho's equity-release refinance?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Cacho, Carlos.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: NAB application ID 9004972, stated in the
+    client file.
+
+- question: "What interest rate is currently showing on Claude and Simone Concha's NAB account ending 4205?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Concha, Claude & Concha, Simone.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: 7.87% on account ****4205, flagged in the
+    client file as anomalously high versus the other two splits.
+
+- question: "What discount rate applies to Megan Coall's lower-discount loan split, the one with account suffix 4501?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Coall, Megan.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: 2.63% discount on split xxxx4501, versus 2.87%
+    on the other split, stated in the client file.
+
+- question: "In what month and year does the commercial lease on Gerard Dagher's investment property expire?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Dagher, Gerard.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: lease expires November 2026, stated in the
+    client file.
+
+- question: "What UTC offset and city does BS Brain's documented timezone convention use?"
+  category: exact_identifiers
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/tech-stack.md"
+  decoy_paths: []
+  category_note: >
+    Single unambiguous fact: +10:00 AEST (Brisbane, no daylight saving),
+    stated in tech-stack.md.
+
+# --- current_vs_stale (6) ------------------------------------------------------
+
+- question: "As things stand today, is Erica Berchtold's investment-loan rate at Westpac Private 6.39% or 6.38%?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Berchtold, Erica.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: "current INV rate confirmed at 6.38%
+    (previously carried as a 6.39% estimate)" -- the 6.39% figure is an
+    explicitly superseded estimate recorded in the same document.
+
+- question: "Right now, is Claude and Simone Concha's refinance held with Heritage Bank or with NAB?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Concha, Claude & Concha, Simone.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: "Previously listed as Heritage Bank (HSL)
+    in pricing tool - corrected to NAB" -- the frontmatter `lender` field
+    itself still says Heritage Bank, but the body explicitly corrects it to
+    NAB as the true current lender.
+
+- question: "Does Benjamin and Aurelie's St George preapproval still stand today, or has it lapsed?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Baader, Benjamin & Jacquet, Aurelie.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: "Preapproval expired approximately May
+    2026" -- an earlier, now-superseded preapproval recorded in the same
+    document as the client's active search.
+
+- question: "What is Jared and Liza's current ANZ interest rate after the June 2026 pricing review, compared to what it was set at before that review?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/Bamford, Jared & Davenport, Liza.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: "Rate review completed June 2026 (6.57%
+    -> 6.43%)" -- tests that retrieval surfaces the current 6.43% rather
+    than the superseded 6.57% starting point recorded in the same sentence.
+
+- question: "Is Playwright MCP still the primary browser-automation tool in production today, or has it been superseded?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Infrastructure/Browser-Automation-Decision.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: "RETIRED: Playwright MCP as primary tool
+    (replaced by agent-browser May 2026, still installed as fallback at port
+    8429)" -- the retired-but-still-installed status is exactly the kind of
+    stale-vs-current trap this category targets.
+
+- question: "As of the most recent payslip evidence, has Luke Sortino's confirmed salary actually reached $123,391, or is it still sitting at the earlier $116,410 figure?"
+  category: current_vs_stale
+  expected_paths:
+    - "BS 2nd Brain/Alcove/Clients/De Bortoli, Melissa & Sortino, Luke.md"
+  decoy_paths: []
+  category_note: >
+    Tests current-state accuracy: salary progression "$116,410 (Mar26) ->
+    $119,902 (25/06/26)... -> $123,391 (current, Jul26)" -- the earlier
+    figures are superseded within the same document's own evidence trail.
