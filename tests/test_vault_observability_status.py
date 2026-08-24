@@ -207,3 +207,124 @@ def test_write_status_atomic(status_mod, tmp_path, env):
     loaded = json.loads(path.read_text())
     assert loaded["vault_name"] == "bs-brain"
     assert list(out_dir.glob("*.tmp")) == []
+
+
+def _mcp_status(vault_name: str, sli_status: str, value=1) -> dict:
+    return {
+        "vault_name": vault_name,
+        "slis": [{
+            "id": "mcp_availability",
+            "status": sli_status,
+            "value": value,
+            "unit": "watchdog_restarts_per_check",
+            "owner": "ben",
+            "runbook": "check-vault-mcp.sh already self-heals (restarts supervisord program); "
+                       "this SLI just makes repeated restarts visible instead of silently absorbed.",
+        }],
+    }
+
+
+def test_mcp_availability_new_failure_says_down_with_display_name_and_aest(status_mod, tmp_path):
+    status = _mcp_status("bs-brain", "critical")
+    sent = []
+    status_mod.alert_on_status(
+        status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now(),
+    )
+    assert sent == ["BS Brain DOWN — checked 22:00 AEST"]  # _now() 12:00 UTC == 22:00 AEST
+
+
+def test_mcp_availability_recurring_failure_says_still_down_with_since(status_mod, tmp_path):
+    alert_dir = tmp_path / "alert-state"
+    status = _mcp_status("bs-brain", "critical")
+    status_mod.alert_on_status(status, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now())
+
+    sent = []
+    status_mod.alert_on_status(
+        status, send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(hours=7), rate_limit_seconds=21600,
+    )
+    assert len(sent) == 1
+    assert "still DOWN" in sent[0]
+    assert "down since 22:00 AEST" in sent[0]
+    assert "checked 05:00 AEST" in sent[0]
+
+
+def test_mcp_availability_recurring_failure_within_window_is_suppressed(status_mod, tmp_path):
+    alert_dir = tmp_path / "alert-state"
+    status = _mcp_status("bs-brain", "critical")
+    status_mod.alert_on_status(status, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now())
+
+    sent = []
+    status_mod.alert_on_status(
+        status, send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(minutes=5), rate_limit_seconds=21600,
+    )
+    assert sent == []
+
+
+def test_mcp_availability_recovery_says_recovered_with_duration(status_mod, tmp_path):
+    alert_dir = tmp_path / "alert-state"
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "critical"), send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now(),
+    )
+
+    sent = []
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "ok", value=0), send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(minutes=45),
+    )
+    assert len(sent) == 1
+    assert sent[0].startswith("BS Brain RECOVERED")
+    assert "down for 45m" in sent[0]
+
+
+def test_mcp_availability_new_outage_after_recovery_alerts_again(status_mod, tmp_path):
+    alert_dir = tmp_path / "alert-state"
+    down_status = _mcp_status("bs-brain", "critical")
+    up_status = _mcp_status("bs-brain", "ok", value=0)
+
+    status_mod.alert_on_status(down_status, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now())
+    status_mod.alert_on_status(
+        up_status, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now() + timedelta(hours=1),
+    )
+
+    sent = []
+    status_mod.alert_on_status(
+        down_status, send_fn=sent.append, alert_state_dir=alert_dir, now=_now() + timedelta(hours=2),
+    )
+    assert len(sent) == 1
+    assert sent[0].startswith("BS Brain DOWN")
+
+
+def test_mcp_availability_unknown_does_not_alert_or_clear_in_progress_incident(status_mod, tmp_path):
+    from obsidian_vault_mcp.observability_alert import current_state
+
+    alert_dir = tmp_path / "alert-state"
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "critical"), send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now(),
+    )
+
+    sent = []
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "unknown", value=None), send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(minutes=10),
+    )
+    assert sent == []
+    assert current_state("bs-brain:mcp_availability", state_dir=alert_dir)["status"] == "failing"
+
+
+def test_non_availability_slis_keep_generic_wording_not_down(status_mod, tmp_path):
+    """DOWN/RECOVERED phrasing is specific to mcp_availability -- it would be
+    misleading applied to e.g. a stale backup, which isn't a service outage."""
+    status = {
+        "vault_name": "bs-brain",
+        "slis": [{
+            "id": "backup_age_hours", "status": "critical", "value": 72,
+            "unit": "hours", "owner": "ben", "runbook": "run vault-backup.sh",
+        }],
+    }
+    sent = []
+    status_mod.alert_on_status(status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now())
+    assert len(sent) == 1
+    assert "DOWN" not in sent[0]
+    assert sent[0].startswith("NEW FAILURE:")

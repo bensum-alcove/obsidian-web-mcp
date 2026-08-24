@@ -102,3 +102,41 @@ def test_new_distinct_failure_alerts_even_mid_incident_of_another_key(tmp_path):
     )
     assert outcome == AlertOutcome.NEW_FAILURE
     assert len(sent) == 2
+
+
+def test_render_new_failure_hook_overrides_default_wording(tmp_path):
+    sent = []
+    record_and_maybe_alert(
+        "k1", True, "boom", send_fn=sent.append, state_dir=tmp_path, now=_now(),
+        render_new_failure=lambda k, m, n: f"CUSTOM DOWN {k}",
+    )
+    assert sent == ["CUSTOM DOWN k1"]
+
+
+def test_render_recovered_hook_receives_first_failure_at(tmp_path):
+    record_and_maybe_alert("k1", True, "boom", state_dir=tmp_path, now=_now())
+    sent = []
+    record_and_maybe_alert(
+        "k1", False, "boom", send_fn=sent.append, state_dir=tmp_path,
+        now=_now() + timedelta(hours=1),
+        render_recovered=lambda k, m, ffa, n: f"UP {k} since {ffa}",
+    )
+    assert sent == [f"UP k1 since {_now().isoformat()}"]
+
+
+def test_render_recurring_hook_receives_count_and_since(tmp_path):
+    record_and_maybe_alert("k1", True, "boom", state_dir=tmp_path, now=_now())
+    sent = []
+    record_and_maybe_alert(
+        "k1", True, "boom", send_fn=sent.append, state_dir=tmp_path,
+        now=_now() + timedelta(hours=2), rate_limit_seconds=3600,
+        render_recurring=lambda k, m, s, c, n: f"{k} {c} checks since {s}",
+    )
+    assert sent == [f"k1 2 checks since {_now().isoformat()}"]
+
+
+def test_no_render_hooks_still_uses_default_templates(tmp_path):
+    """Existing callers that never pass render hooks keep exact prior wording."""
+    sent = []
+    record_and_maybe_alert("k1", True, "boom", send_fn=sent.append, state_dir=tmp_path, now=_now())
+    assert sent == ["NEW FAILURE: k1 -- boom"]

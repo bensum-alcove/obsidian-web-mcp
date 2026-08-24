@@ -102,6 +102,9 @@ def record_and_maybe_alert(
     send_fn: Callable[[str], None] | None = None,
     state_dir: Path = DEFAULT_STATE_DIR,
     now: datetime | None = None,
+    render_new_failure: Callable[[str, str, datetime], str] | None = None,
+    render_recurring: Callable[[str, str, str, int, datetime], str] | None = None,
+    render_recovered: Callable[[str, str, str | None, datetime], str] | None = None,
 ) -> str:
     """Update persistent incident state for `key` and decide whether to alert.
 
@@ -110,6 +113,12 @@ def record_and_maybe_alert(
     RECURRING_ALERTED, RECOVERED) -- never for RECURRING_SUPPRESSED or
     NO_CHANGE_OK, so a caller that always passes send_fn gets bounded alert
     volume for free.
+
+    render_new_failure/render_recurring/render_recovered let a caller with a
+    clearer, domain-specific message (e.g. "BS Brain DOWN -- checked 11:00
+    AEST") override the default wording for their outcome, without touching
+    the dedupe/rate-limit/persisted-state machinery -- callers that don't
+    need custom wording get the generic templates below unchanged.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -119,7 +128,8 @@ def record_and_maybe_alert(
     if not is_failing:
         if state.status == "failing":
             outcome = AlertOutcome.RECOVERED
-            rendered = f"RECOVERED: {key} -- {message}"
+            render = render_recovered or (lambda k, m, ffa, n: f"RECOVERED: {k} -- {m}")
+            rendered = render(key, message, state.first_failure_at, now)
             if send_fn is not None:
                 send_fn(rendered)
             _save_state(IncidentState.initial(key), state_dir)
@@ -134,7 +144,8 @@ def record_and_maybe_alert(
         state.last_alert_at = now_iso
         state.last_message = message
         _save_state(state, state_dir)
-        rendered = f"NEW FAILURE: {key} -- {message}"
+        render = render_new_failure or (lambda k, m, n: f"NEW FAILURE: {k} -- {m}")
+        rendered = render(key, message, now)
         if send_fn is not None:
             send_fn(rendered)
         return AlertOutcome.NEW_FAILURE
@@ -148,10 +159,10 @@ def record_and_maybe_alert(
         state.last_alert_at = now_iso
         _save_state(state, state_dir)
         since = state.first_failure_at or now_iso
-        rendered = (
-            f"STILL FAILING: {key} -- {message} "
-            f"(failing since {since}, {state.failure_count_since_recovery} checks)"
+        render = render_recurring or (
+            lambda k, m, s, c, n: f"STILL FAILING: {k} -- {m} (failing since {s}, {c} checks)"
         )
+        rendered = render(key, message, since, state.failure_count_since_recovery, now)
         if send_fn is not None:
             send_fn(rendered)
         return AlertOutcome.RECURRING_ALERTED

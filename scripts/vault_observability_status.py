@@ -44,7 +44,7 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -61,6 +61,18 @@ import job_miss_check_config  # noqa: E402
 import canonical_state_scan  # noqa: E402
 
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "vault-observability"
+
+# Australia/Brisbane, fixed UTC+10, no DST -- this box's cron/health-check
+# convention throughout the repo (see check-vault-mcp.sh watchdog log
+# timestamps, health-check.sh comments). Alert messages render in this zone
+# so "checked HH:MM AEST" matches what Ben sees on his clock.
+AEST = timezone(timedelta(hours=10))
+
+VAULT_DISPLAY_NAMES = {
+    "bs-brain": "BS Brain",
+    "cb-brain": "CB Brain",
+    "alcove-brain": "Alcove Brain",
+}
 DEFAULT_BACKUP_STATE_DIR = Path(
     os.environ.get("VAULT_BACKUP_STATE_DIR", str(Path.home() / ".local" / "state" / "vault-backup"))
 )
@@ -355,6 +367,43 @@ def collect_status(
     }
 
 
+def _aest_hhmm(dt: datetime) -> str:
+    return dt.astimezone(AEST).strftime("%H:%M")
+
+
+def _availability_renderers(display_name: str):
+    """Clear DOWN/RECOVERED wording for the mcp_availability SLI -- this is
+    the signal that actually means "is this Brain's MCP reachable", so it
+    gets human phrasing (explicit DOWN/RECOVERED + AEST timestamp + service
+    name) instead of the generic "[STATUS] sli_id = value" template other
+    SLIs use, since those aren't about service downtime and "DOWN" would be
+    misleading applied to e.g. backup_age_hours.
+    """
+
+    def render_new_failure(key: str, message: str, now: datetime) -> str:
+        return f"{display_name} DOWN — checked {_aest_hhmm(now)} AEST"
+
+    def render_recurring(key: str, message: str, first_failure_at: str, failure_count: int, now: datetime) -> str:
+        since = _aest_hhmm(datetime.fromisoformat(first_failure_at)) if first_failure_at else "unknown"
+        return (
+            f"{display_name} still DOWN — checked {_aest_hhmm(now)} AEST "
+            f"(down since {since} AEST, {failure_count} checks)"
+        )
+
+    def render_recovered(key: str, message: str, first_failure_at: str | None, now: datetime) -> str:
+        if not first_failure_at:
+            return f"{display_name} RECOVERED — checked {_aest_hhmm(now)} AEST"
+        since_dt = datetime.fromisoformat(first_failure_at)
+        minutes = max(0, int((now - since_dt).total_seconds() // 60))
+        duration = f"{minutes}m" if minutes < 60 else f"{minutes // 60}h{minutes % 60:02d}m"
+        return (
+            f"{display_name} RECOVERED — checked {_aest_hhmm(now)} AEST "
+            f"(down for {duration}, since {_aest_hhmm(since_dt)} AEST)"
+        )
+
+    return render_new_failure, render_recurring, render_recovered
+
+
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -383,6 +432,7 @@ def alert_on_status(
     incident -- see module docstring. Returns the list of alert outcomes for
     logging/testing."""
     outcomes = []
+    display_name = VAULT_DISPLAY_NAMES.get(status["vault_name"], status["vault_name"])
     for sli_status in status["slis"]:
         if sli_status["status"] == "unknown":
             continue
@@ -392,10 +442,18 @@ def alert_on_status(
             f"[{sli_status['status'].upper()}] {sli_status['id']} = {sli_status['value']} "
             f"{sli_status['unit']} (owner: {sli_status['owner']}). {sli_status['runbook']}"
         )
+        renderers = {}
+        if sli_status["id"] == "mcp_availability":
+            render_new_failure, render_recurring, render_recovered = _availability_renderers(display_name)
+            renderers = dict(
+                render_new_failure=render_new_failure,
+                render_recurring=render_recurring,
+                render_recovered=render_recovered,
+            )
         outcome = observability_alert.record_and_maybe_alert(
             key, is_failing, message,
             rate_limit_seconds=rate_limit_seconds, send_fn=send_fn,
-            state_dir=alert_state_dir, now=now,
+            state_dir=alert_state_dir, now=now, **renderers,
         )
         outcomes.append(outcome)
     return outcomes
@@ -423,7 +481,7 @@ def main() -> int:
     out_path = write_status(status, args.vault_name, args.status_dir)
 
     if not args.no_alert:
-        alert_on_status(status)
+        alert_on_status(status, now=now)
 
     print(json.dumps(status, indent=2))
     print(f"status written to {out_path}", file=sys.stderr)
