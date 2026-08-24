@@ -715,90 +715,21 @@ class TeamBotSiblingDispatcher:
         await self._main(scope, receive, send)
 
     async def _lifespan(self, scope, receive, send):
-        """Drive both apps' lifespans by sending proper ASGI lifespan events to each."""
-        import anyio
+        """Drive both sub-apps' lifespans through a single ASGI lifespan handshake.
 
-        asgi_version = scope.get("asgi", {})
-        main_started = anyio.Event()
-        teambot_started = anyio.Event()
-        shutdown_trigger = anyio.Event()
-
-        async def run_app_lifespan(app, started_event):
-            """Simulate the full ASGI lifespan protocol for one app."""
-            received_shutdown = anyio.Event()
-
-            async def app_receive():
-                if not started_event.is_set():
-                    return {"type": "lifespan.startup"}
-                await received_shutdown.wait()
-                return {"type": "lifespan.shutdown"}
-
-            async def app_send(message):
-                if message["type"] == "lifespan.startup.complete":
-                    started_event.set()
-                elif message["type"] == "lifespan.startup.failed":
-                    started_event.set()  # unblock even on failure
-
-            # Drive lifespan in background; shutdown when outer trigger fires
-            async with anyio.create_task_group() as sub_tg:
-                sub_tg.start_soon(
-                    app,
-                    {"type": "lifespan", "asgi": asgi_version},
-                    app_receive,
-                    app_send,
-                )
-                await started_event.wait()
-                await shutdown_trigger.wait()
-                received_shutdown.set()
-
-        try:
-            await receive()  # consume lifespan.startup from uvicorn before proceeding
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(run_app_lifespan, self._main, main_started)
-                tg.start_soon(run_app_lifespan, self._teambot, teambot_started)
-                await main_started.wait()
-                await teambot_started.wait()
-                await send({"type": "lifespan.startup.complete"})
-                await receive()  # wait for uvicorn lifespan.shutdown
-                shutdown_trigger.set()
-            await send({"type": "lifespan.shutdown.complete"})
-        except Exception as exc:
-            msg = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            await send({"type": "lifespan.startup.failed", "message": msg})
-
-
-class TeamBotSiblingDispatcher:
-    """Routes /mcp/teambot* to the teambot sub-app; all other requests to main app.
-
-    The main app's middleware stack is completely untouched — a bug in the
-    teambot route cannot affect the main vault-serving path.
-    """
-
-    def __init__(self, main_app, teambot_app):
-        self._main = main_app
-        self._teambot = teambot_app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "lifespan":
-            await self._lifespan(scope, receive, send)
-            return
-
-        if scope.get("type") == "http":
-            path = scope.get("path", "")
-            if path == "/mcp/teambot" or path.startswith("/mcp/teambot/"):
-                suffix = path[len("/mcp/teambot"):]
-                new_scope = dict(scope)
-                new_scope["path"] = "/mcp" + suffix
-                new_scope["raw_path"] = ("/mcp" + suffix).encode()
-                await self._teambot(new_scope, receive, send)
-                return
-
-        await self._main(scope, receive, send)
-
-    async def _lifespan(self, scope, receive, send):
-        """Drive both apps' lifespans concurrently."""
+        The ASGI lifespan protocol for one `receive`/`send` pair is exactly:
+        receive `lifespan.startup` once, do startup, send `lifespan.startup.complete`,
+        then receive again and block until `lifespan.shutdown` arrives. A prior version
+        of this method skipped the initial `receive()`, so the *next* receive (intended
+        to block for shutdown) was fed the unconsumed `lifespan.startup` message instead
+        — read as a shutdown signal, it tore down both sub-apps' session managers
+        (clearing their task groups) immediately after starting them, before the first
+        real request ever arrived. Both session managers must stay open for the
+        lifetime of the process, so the missing initial `receive()` is restored here.
+        """
         started = False
         try:
+            await receive()  # consume lifespan.startup before starting sub-apps
             async with contextlib.AsyncExitStack() as stack:
                 await stack.enter_async_context(
                     self._main.router.lifespan_context(self._main)
@@ -808,7 +739,7 @@ class TeamBotSiblingDispatcher:
                 )
                 await send({"type": "lifespan.startup.complete"})
                 started = True
-                await receive()  # wait for lifespan.shutdown
+                await receive()  # blocks until the real lifespan.shutdown arrives
             await send({"type": "lifespan.shutdown.complete"})
         except Exception as exc:
             if not started:
