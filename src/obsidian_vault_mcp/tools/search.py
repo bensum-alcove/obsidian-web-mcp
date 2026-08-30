@@ -42,20 +42,30 @@ def _search_ripgrep(
     max_results: int,
     context_lines: int,
 ) -> list[dict]:
-    """Search using ripgrep for performance."""
+    """Search using ripgrep for performance.
+
+    Security: `query` is caller-controlled and MUST NOT be placed where ripgrep
+    parses it as an option (a leading `-` would otherwise be interpreted as a
+    flag -- e.g. `--pre=/some/executable` launches that executable as a
+    per-file preprocessor, arbitrary command execution from a nominally
+    read-only search tool). `-e query --` pins it as a pattern argument
+    regardless of its contents; `--no-config` stops a local ripgrep config
+    file from injecting additional options into this invocation.
+    """
     cmd = [
         "rg",
         "--json",
+        "--no-config",
         f"--max-count={max_results}",
         f"--glob={file_pattern}",
         "-i",
         f"--context={context_lines}",
-        query,
-        str(search_path),
     ]
 
     for excluded in _excluded_dirs_for_scope(search_path):
-        cmd.insert(-2, f"--glob=!{excluded}/")
+        cmd.append(f"--glob=!{excluded}/")
+
+    cmd += ["-e", query, "--", str(search_path)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

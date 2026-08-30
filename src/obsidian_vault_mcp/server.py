@@ -21,9 +21,40 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from urllib.parse import urlparse
+
 from .access_control import should_register
-from .config import VAULT_ACCESS_MODE, VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
+from .config import VAULT_ACCESS_MODE, VAULT_BASE_URL, VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
 from .frontmatter_index import FrontmatterIndex
+
+# Static fallback list, kept only for instances that don't set VAULT_BASE_URL.
+# Security-review fix (2026-08-30, cb-brain-marketing-readonly-mcp-v1 Codex
+# xhigh review, LOW-9): every deployed instance sets a distinct VAULT_BASE_URL,
+# so its own hostname is derived from that instead of appending to one shared
+# list -- adding a new instance's hostname here used to make every OTHER
+# shared-code instance (bs/cb/alcove-brain-vault) accept that Host header too.
+# Per-instance bearer/OAuth credentials already prevented cross-instance
+# access even with the shared list (this was defense-in-depth, not a live
+# bypass), but there's no reason for BS Brain to accept
+# `Host: vault-cb-marketing.bensum.org` at all.
+_STATIC_ALLOWED_HOSTS_FALLBACK = [
+    "vault.bensum.org",
+    "vault-cb.bensum.org",
+    "vault-alcove.bensum.org",
+    "vault-cb-marketing.bensum.org",
+]
+
+
+def _allowed_hosts() -> list[str]:
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    hostname = urlparse(VAULT_BASE_URL).hostname if VAULT_BASE_URL else None
+    hosts.append(hostname if hostname else None)
+    hosts = [h for h in hosts if h]
+    if hostname:
+        return hosts
+    # No VAULT_BASE_URL configured -- preserve old behaviour rather than
+    # leaving this instance unreachable by any public hostname.
+    return hosts + _STATIC_ALLOWED_HOSTS_FALLBACK
 
 
 class SecretPathMiddleware(BaseHTTPMiddleware):
@@ -71,15 +102,7 @@ mcp = FastMCP(
     lifespan=lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "127.0.0.1:*",
-            "localhost:*",
-            "[::1]:*",
-"vault.bensum.org",
-            "vault-cb.bensum.org",
-            "vault-alcove.bensum.org",
-            "vault-cb-marketing.bensum.org",
-        ],
+        allowed_hosts=_allowed_hosts(),
     ),
 )
 
@@ -773,12 +796,59 @@ class TeamBotSiblingDispatcher:
                 raise
 
 
+def _audit_registered_tools(access_mode: str) -> None:
+    """Runtime backstop, independent of the `tool_gate()` decorator convention.
+
+    Security-review fix (2026-08-30, cb-brain-marketing-readonly-mcp-v1 Codex
+    xhigh review, MEDIUM-5): `tool_gate()`'s fail-closed classification check
+    only runs for tools registered *through* it. A future `@mcp.tool(...)`
+    call written directly (bypassing `tool_gate()`) would register
+    unconditionally in every mode, uncaught by anything at decoration time.
+    This walks the actual FastMCP tool registry -- not the source code -- so
+    it catches that regardless of how a tool got registered: every live tool
+    name must be classified (classify() itself fails closed for an unknown
+    name), and in read_only mode none of them may be mutation-classified.
+    """
+    from .access_control import AccessClass, classify
+
+    registered = set(mcp._tool_manager._tools.keys())
+    for name in registered:
+        access_class = classify(name)  # raises RuntimeError if unclassified
+        if access_mode == "read_only" and access_class is AccessClass.MUTATION:
+            raise RuntimeError(
+                f"Tool {name!r} is classified mutation but is registered on the "
+                f"live MCP tool surface while VAULT_ACCESS_MODE=read_only. This "
+                "means it was registered via a path that bypassed tool_gate() -- "
+                "refusing to start rather than serve a mutation tool from a "
+                "read-only deployment."
+            )
+
+
 def build_app(access_mode: str = VAULT_ACCESS_MODE):
     """Build the combined Starlette/ASGI app (auth middleware + OAuth routes +
     teambot sibling dispatcher). Split out from main() so tests can inspect the
     result (e.g. assert teambot is not built for access_mode="read_only")
     without invoking uvicorn.run().
+
+    Security-review fix (2026-08-30, cb-brain-marketing-readonly-mcp-v1 Codex
+    xhigh review, LOW-7): `access_mode` only ever controlled whether teambot
+    gets built here -- the actual tool *registry* (which tools exist on `mcp`
+    at all) was already fixed at import time by the module-level
+    VAULT_ACCESS_MODE every `@tool_gate(...)` call read. Calling
+    `build_app("read_only")` after importing under `full` mode would build an
+    app with no teambot but whose main registry still held every mutation
+    tool -- a caller could reasonably assume the argument governs the whole
+    app. Assert instead of silently diverging.
     """
+    if access_mode != VAULT_ACCESS_MODE:
+        raise ValueError(
+            f"build_app(access_mode={access_mode!r}) does not match the "
+            f"import-time VAULT_ACCESS_MODE={VAULT_ACCESS_MODE!r} that already "
+            "determined which tools are registered on `mcp` -- these cannot "
+            "diverge. Restart the process with VAULT_ACCESS_MODE set correctly "
+            "instead of passing a different mode here."
+        )
+    _audit_registered_tools(access_mode)
     from .auth import BearerAuthMiddleware
     import os as _os
 
@@ -832,21 +902,26 @@ def main():
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
-    try:
-        combined = build_app(VAULT_ACCESS_MODE)
-        import uvicorn
-        uvicorn.run(
-            combined,
-            host="0.0.0.0",
-            port=VAULT_MCP_PORT,
-            log_level="info",
-            proxy_headers=True,
-            forwarded_allow_ips="*",
-        )
-    except Exception as e:
-        logger.warning(f"Could not build app ({e}), falling back to mcp.run()")
-        logger.warning("Auth will NOT be enforced in this mode")
-        mcp.run(transport="streamable-http", port=VAULT_MCP_PORT)
+    # Security-review fix (2026-08-30, cb-brain-marketing-readonly-mcp-v1 Codex
+    # xhigh review, HIGH-4): this used to catch any exception from build_app()
+    # or uvicorn.run() and fall back to bare `mcp.run()`, which serves every
+    # registered tool -- vault contents included -- with NO auth middleware at
+    # all. That's tolerable for nothing this server does; it becomes critical
+    # the moment an instance is externally reachable (e.g. a transient
+    # build_app() error during a race, or any uvicorn startup hiccup, would
+    # have silently exposed an unauthenticated read surface to the public
+    # internet). Auth construction must fail closed: exit nonzero and let
+    # supervisord's autorestart recover the process instead.
+    combined = build_app(VAULT_ACCESS_MODE)
+    import uvicorn
+    uvicorn.run(
+        combined,
+        host="0.0.0.0",
+        port=VAULT_MCP_PORT,
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
 
 
 if __name__ == "__main__":
