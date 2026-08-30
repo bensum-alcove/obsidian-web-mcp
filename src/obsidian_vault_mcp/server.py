@@ -21,7 +21,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from .config import VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
+from .access_control import should_register
+from .config import VAULT_ACCESS_MODE, VAULT_MCP_PORT, VAULT_MCP_TOKEN, VAULT_PATH
 from .frontmatter_index import FrontmatterIndex
 
 
@@ -77,9 +78,32 @@ mcp = FastMCP(
 "vault.bensum.org",
             "vault-cb.bensum.org",
             "vault-alcove.bensum.org",
+            "vault-cb-marketing.bensum.org",
         ],
     ),
 )
+
+
+def tool_gate(*, name: str, description: str, annotations: dict):
+    """Wraps mcp.tool(): registers `name` on the live MCP tool surface only when
+    access_control.should_register() allows it for the current VAULT_ACCESS_MODE.
+
+    Fails closed at import time (server startup) if `name` has no explicit
+    access classification in access_control.TOOL_ACCESS_CLASS -- this applies
+    in EVERY access mode, not just read_only, so a newly added tool cannot
+    reach production unclassified.
+
+    In read_only mode, a gated-out tool's Python function is still defined
+    (the decorator returns it unchanged) but is never passed to mcp.tool(), so
+    it does not appear in tools/list and cannot be dispatched by name.
+    """
+    if should_register(name, VAULT_ACCESS_MODE):
+        return mcp.tool(name=name, description=description, annotations=annotations)
+
+    def _not_registered(fn):
+        return fn
+
+    return _not_registered
 
 
 # --- Register all tools ---
@@ -128,7 +152,7 @@ from .models import (
 )
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_read",
     description=(
         "Read a file from the Obsidian vault, returning content, metadata, and parsed YAML frontmatter. "
@@ -146,7 +170,7 @@ def vault_read(path: str, force: bool = False, max_chars: int | None = None) -> 
     return _vault_read(inp.path, inp.force, inp.max_chars)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_batch_read",
     description=(
         "Read multiple files from the vault in one call. Handles missing files gracefully. "
@@ -160,7 +184,7 @@ def vault_batch_read(paths: list[str], include_content: bool = True, force: bool
     return _vault_batch_read(inp.paths, inp.include_content, inp.force)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_write",
     description=(
         "Write a file to the Obsidian vault. Supports frontmatter merging with existing files. "
@@ -192,7 +216,7 @@ def vault_write(
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_batch_frontmatter_update",
     description=(
         "Update YAML frontmatter fields on multiple files without changing body content. Each update merges "
@@ -213,7 +237,7 @@ def vault_batch_frontmatter_update(updates: list[dict]) -> str:
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_search",
     description="Search for text across vault files. Uses ripgrep if available, falls back to Python. Returns matching lines with context and frontmatter excerpts.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -230,7 +254,7 @@ def vault_search(
     return _vault_search(inp.query, inp.path_prefix, inp.file_pattern, inp.max_results, inp.context_lines)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_search_frontmatter",
     description="Search vault files by YAML frontmatter field values. Queries an in-memory index for fast results. Supports exact match, contains, and field-exists queries.",
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
@@ -247,7 +271,7 @@ def vault_search_frontmatter(
     return _vault_search_frontmatter(inp.field, inp.value, inp.match_type, inp.path_prefix, inp.max_results)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_list",
     description=(
         "List directory contents in the vault. Supports recursion depth, file/dir filtering, and glob patterns. "
@@ -269,7 +293,7 @@ def vault_list(
     return _vault_list(inp.path, inp.depth, inp.include_files, inp.include_dirs, inp.pattern, inp.frontmatter_fields)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_move",
     description=(
         "Move a file or directory within the vault. Validates both source and destination paths. "
@@ -294,7 +318,7 @@ def vault_move(
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_delete",
     description=(
         "Delete a file by moving it to .trash/ in the vault root. Requires confirm=true as a safety gate. "
@@ -315,7 +339,7 @@ def vault_delete(path: str, confirm: bool = False, expected_revision: str | None
 
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_patch_section",
     description=(
         "Replace the content of a single markdown section without rewriting the entire file. Targets a "
@@ -336,7 +360,7 @@ def vault_patch_section(path: str, section: str, content: str, expected_revision
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_append",
     description=(
         "Append content to an existing vault file without reading or rewriting the whole file. Creates the "
@@ -361,7 +385,7 @@ def vault_append(
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_batch_write",
     description=(
         "Write up to 20 files in a single call. Each file is written atomically. Failures are reported "
@@ -382,7 +406,7 @@ def vault_batch_write(files: list[dict]) -> str:
         pass
     return result
 
-@mcp.tool(
+@tool_gate(
     name="vault_str_replace",
     description=(
         "Replace a unique string in a vault file with another string. old_str must appear exactly once in the file. "
@@ -408,7 +432,7 @@ def vault_str_replace(
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_read_section",
     description=(
         "Read a single markdown section by heading name. Returns only the content between the specified heading "
@@ -424,7 +448,7 @@ def vault_read_section(path: str, section: str) -> str:
     return _vault_read_section(inp.path, inp.section)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_batch_delete",
     description=(
         "Delete multiple files in one call by moving them to .trash/. "
@@ -444,7 +468,7 @@ def vault_batch_delete(
     return _vault_batch_delete(inp.paths, inp.confirm, inp.expected_revisions)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_batch_str_replace",
     description=(
         "Replace unique strings in multiple files in one call. "
@@ -468,7 +492,7 @@ def vault_batch_str_replace(replacements: list[dict]) -> str:
     return result
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_recent_changes",
     description=(
         "Return vault .md files modified after a given ISO datetime, sorted by most recent first. "
@@ -483,7 +507,7 @@ def vault_recent_changes(since: str, limit: int = 20) -> str:
     return _vault_recent_changes(inp.since, inp.limit)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_stats",
     description=(
         "Return vault-wide aggregate statistics: total .md files, total size in KB, "
@@ -498,7 +522,7 @@ def vault_stats() -> str:
     return _vault_stats()
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_session_start",
     description=(
         "Bundle tool for session start. Returns vault stats, files modified since `since` (default 7 days), "
@@ -513,7 +537,7 @@ def vault_session_start(since: str | None = None) -> str:
     return _vault_session_start(inp.since)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_client_context",
     description=(
         "Scoped session-start for a single client. One call returns: the matched client note (full content + frontmatter), "
@@ -535,7 +559,7 @@ def vault_client_context(
     return _vault_client_context(inp.client, inp.include_hot, inp.include_instructions)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_entity",
     description=(
         "Look up a vault entity (client, team member, referral partner) by name or alias. "
@@ -552,7 +576,7 @@ def vault_entity(name: str, max_backlinks: int = 15) -> str:
     return _vault_entity(inp.name, inp.max_backlinks)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_query",
     description=(
         "Fused hybrid search across the vault: merges the ripgrep keyword leg and the semantic "
@@ -577,7 +601,7 @@ def vault_query(
     return _vault_query(inp.query, inp.top_k, inp.path_prefix, inp.include_archive, inp.decay)
 
 
-@mcp.tool(
+@tool_gate(
     name="vault_answer_context",
     description=(
         "One-call brain-first pre-flight bundle: runs vault_query(question) and adds up to 3 relevant "
@@ -593,7 +617,7 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
     return _vault_answer_context(inp.question, inp.top_k)
 
 
-@mcp.tool(
+@tool_gate(
     name="bo_validate_build_graph",
     description=(
         "Read-only Build Orchestrator preflight: validate a proposed build graph (one or more typed build "
@@ -610,7 +634,7 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     return _bo_validate_build_graph([b.model_dump() for b in inp.builds], inp.schedule_path, inp.mode)
 
 
-@mcp.tool(
+@tool_gate(
     name="bo_create_build",
     description=(
         "Create one new Build Orchestrator build: validates the full proposed graph (including every "
@@ -630,7 +654,7 @@ def bo_create_build(build: dict, schedule_path: str) -> str:
     return _bo_create_build(inp.build.model_dump(), inp.schedule_path)
 
 
-@mcp.tool(
+@tool_gate(
     name="bo_create_chain",
     description=(
         "Create a same-project multi-build chain in Build Orchestrator: validates the WHOLE proposed graph "
@@ -650,7 +674,7 @@ def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
 
 
 if SEMANTIC_AVAILABLE:
-    @mcp.tool(
+    @tool_gate(
         name="vault_semantic_search",
         description=(
             "Search vault files by semantic similarity rather than exact keywords. "
@@ -669,7 +693,7 @@ if SEMANTIC_AVAILABLE:
         """Search vault by semantic similarity."""
         return await asyncio.to_thread(_vault_semantic_search, query, max_results, path_prefix)
 
-    @mcp.tool(
+    @tool_gate(
         name="vault_read_smart",
         description=(
             "Read only the relevant sections of a large file using semantic similarity. "
@@ -749,6 +773,50 @@ class TeamBotSiblingDispatcher:
                 raise
 
 
+def build_app(access_mode: str = VAULT_ACCESS_MODE):
+    """Build the combined Starlette/ASGI app (auth middleware + OAuth routes +
+    teambot sibling dispatcher). Split out from main() so tests can inspect the
+    result (e.g. assert teambot is not built for access_mode="read_only")
+    without invoking uvicorn.run().
+    """
+    from .auth import BearerAuthMiddleware
+    import os as _os
+
+    app = mcp.streamable_http_app()
+
+    # /health is auth-exempt (see auth.py _AUTH_EXEMPT) but had no handler --
+    # canary-restart verification needs a real 200 here.
+    async def _health(request):
+        return JSONResponse({"status": "ok"})
+
+    app.routes.insert(0, Route("/health", _health, methods=["GET"]))
+
+    # Mount OAuth 2.1 routes only when password gate is configured
+    if _os.environ.get("VAULT_AUTH_PASSWORD"):
+        from .oauth import oauth_routes
+        for route in oauth_routes:
+            app.routes.insert(0, route)
+        logger.info("OAuth 2.1 password gate active")
+
+    app.add_middleware(BearerAuthMiddleware)
+    app.add_middleware(SecretPathMiddleware)  # outermost — runs first, blocks wrong paths before auth
+
+    # teambot is a second, separately-tokened MCP app that always registers
+    # write tools (vault_write, vault_append, ...) regardless of
+    # VAULT_ACCESS_MODE. It's unreachable without TEAMBOT_MCP_TOKEN (a secret
+    # a read_only deployment is never given), but a read_only instance skips
+    # building it entirely rather than relying on that alone -- no write-tool
+    # object should exist in this process's memory at all.
+    if access_mode == "read_only":
+        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth, VAULT_ACCESS_MODE=read_only (teambot not built)")
+        return app
+
+    from .teambot import build_teambot_app
+    teambot_app = build_teambot_app()
+    logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth + teambot route")
+    return TeamBotSiblingDispatcher(app, teambot_app)
+
+
 def main():
     """Entry point. Run with streamable HTTP transport."""
     logging.basicConfig(
@@ -764,36 +832,8 @@ def main():
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
-    # Build the Starlette app with auth middleware and OAuth endpoints
     try:
-        from .auth import BearerAuthMiddleware
-        import os as _os
-
-        app = mcp.streamable_http_app()
-
-        # /health is auth-exempt (see auth.py _AUTH_EXEMPT) but had no handler --
-        # canary-restart verification needs a real 200 here.
-        async def _health(request):
-            return JSONResponse({"status": "ok"})
-
-        app.routes.insert(0, Route("/health", _health, methods=["GET"]))
-
-        # Mount OAuth 2.1 routes only when password gate is configured
-        if _os.environ.get("VAULT_AUTH_PASSWORD"):
-            from .oauth import oauth_routes
-            for route in oauth_routes:
-                app.routes.insert(0, route)
-            logger.info("OAuth 2.1 password gate active")
-
-        app.add_middleware(BearerAuthMiddleware)
-        app.add_middleware(SecretPathMiddleware)  # outermost — runs first, blocks wrong paths before auth
-
-        from .teambot import build_teambot_app
-        teambot_app = build_teambot_app()
-        combined = TeamBotSiblingDispatcher(app, teambot_app)
-
-        logger.info(f"Starting server on port {VAULT_MCP_PORT} with bearer auth + OAuth + teambot route")
-
+        combined = build_app(VAULT_ACCESS_MODE)
         import uvicorn
         uvicorn.run(
             combined,

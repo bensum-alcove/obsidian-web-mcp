@@ -109,8 +109,14 @@ def _get_model() -> "TextEmbedding":
 
 
 def _get_index_path() -> Path:
-    index_dir = config.VAULT_PATH / ".semantic-index"
-    index_dir.mkdir(exist_ok=True)
+    # VAULT_SERVICE_STATE_DIR redirects this cache off VAULT_PATH entirely --
+    # required when VAULT_PATH is a read-only filesystem view (config.py).
+    # Empty (default) is byte-identical to prior behaviour.
+    if config.VAULT_SERVICE_STATE_DIR:
+        index_dir = Path(config.VAULT_SERVICE_STATE_DIR) / ".semantic-index"
+    else:
+        index_dir = config.VAULT_PATH / ".semantic-index"
+    index_dir.mkdir(parents=True, exist_ok=True)
     return index_dir / "index.db"
 
 

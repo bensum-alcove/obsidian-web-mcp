@@ -7,6 +7,23 @@ VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 TEAMBOT_MCP_TOKEN = os.environ.get("TEAMBOT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
+# Tool-surface access mode: "full" (default, unchanged behaviour -- every tool
+# registers exactly as before) | "read_only" (only access_control.AccessClass.READ
+# tools register; mutation tools are absent from tools/list entirely, not merely
+# rejected on invocation). See access_control.py for the classification table and
+# server.py's tool_gate() for the registration-time enforcement.
+VAULT_ACCESS_MODE = os.environ.get("VAULT_ACCESS_MODE", "full").strip().lower()
+
+# Writable state directory for read-only deployments whose VAULT_PATH itself is a
+# read-only filesystem view (e.g. a read-only bind mount). When set, derived/cache
+# state that read tools legitimately need to write (currently: the semantic
+# embedding index -- see tools/semantic_search.py's _get_index_path()) is redirected
+# here instead of under VAULT_PATH/.semantic-index. Empty (default) preserves the
+# exact prior behaviour: state lives under VAULT_PATH, unchanged for every existing
+# deployment. This directory is never the vault itself and is never read by any
+# vault_* tool as vault content.
+VAULT_SERVICE_STATE_DIR = os.environ.get("VAULT_SERVICE_STATE_DIR", "")
+
 # OAuth 2.1 password gate (opt-in — leave unset for no auth gate)
 VAULT_AUTH_PASSWORD = os.environ.get("VAULT_AUTH_PASSWORD", "")
 VAULT_BASE_URL = os.environ.get("VAULT_BASE_URL", "")  # e.g. https://vault.bensum.org
