@@ -27,9 +27,11 @@ import json
 import logging
 
 import frontmatter
+import yaml
 
 from .. import bo_contract
 from ..bo_guard import SPECS_PREFIX, schedule_builds_from_content
+from ..frontmatter_safe import update_frontmatter_field
 from ..vault import RevisionConflictError, conflict_payload, read_file, write_file_atomic
 
 logger = logging.getLogger(__name__)
@@ -66,7 +68,8 @@ def _schedule_entry_for(build: dict) -> dict:
         "spec_path": _spec_path_for(build["build_id"]),
         "project": build["project"],
     }
-    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "engine", "notes"):
+    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "capital_path",
+                      "engine", "notes", "resources"):
         if build.get(optional) is not None:
             entry[optional] = build[optional]
     return entry
@@ -82,11 +85,44 @@ def _render_spec_item(build: dict, schedule_entry: dict) -> dict:
         "status": build.get("status") or "ready",
         "schedule_entry": schedule_entry,
     }
-    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "program",
-                      "tags", "created", "completion_contract"):
+    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "capital_path",
+                      "program", "tags", "created", "completion_contract", "deployment_intent",
+                      "resources", "review_gate"):
         if build.get(optional) is not None:
             item[optional] = build[optional]
     return item
+
+
+def _splice_schedule_entry_field(entry_text: str, field_name: str, value) -> str:
+    """Add one extra key to an already-rendered `builds:` entry fragment.
+
+    render_schedule_entry()'s own key allowlist (_SCHEDULE_ENTRY_KEY_ORDER)
+    doesn't include `resources` yet, so it's dropped from the rendered text
+    even though it's already present -- and validated -- on the raw
+    schedule_entry dict every validate_graph call receives. This inverts
+    render_schedule_entry's own "builds: [entry]" dump/2-space-indent
+    convention just far enough to reparse the fragment, add the key, and
+    reapply the identical convention -- a text-layout mirror, not a new BO
+    validation rule; the adapter's own validate_graph is still the only
+    thing that decides whether the resulting shape is valid.
+    """
+    unindented = []
+    for line in entry_text.splitlines():
+        if line.startswith("  - "):
+            unindented.append("- " + line[4:])
+        elif line.startswith("  "):
+            unindented.append(line[2:])
+        else:
+            unindented.append(line)
+    parsed = yaml.safe_load("builds:\n" + "\n".join(unindented) + "\n")
+    parsed["builds"][0][field_name] = value
+    dumped = yaml.safe_dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    out = []
+    for line in dumped.split("\n")[1:]:
+        if not line.strip():
+            continue
+        out.append(("  - " + line[2:]) if line.startswith("- ") else ("  " + line))
+    return "\n".join(out) + "\n"
 
 
 def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[list[dict], str | None]:
@@ -165,6 +201,31 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
     render_specs = [_render_spec_item(b, schedule_entries[b["build_id"]]) for b in normalized_builds]
 
     rendered = bo_contract.render_graph(render_specs)["rendered"]
+
+    # `resources` and `review_gate` are current spec-frontmatter fields the
+    # adapter's own validate_spec_frontmatter already understands (it runs
+    # resource_resolve.validate_resource_claims_shape / _validate_review_gate_block
+    # against them), but render_spec() doesn't yet accept them as render
+    # parameters, so the adapter's own render_graph silently drops them. Splice
+    # them into the rendered frontmatter with the same generic, semantics-free
+    # YAML field-set helper VaultWriteInput.merge_frontmatter uses -- this adds
+    # no BO validation logic locally; the spliced result is what validate_graph
+    # below (and the eventual write) actually sees, so the adapter still has
+    # the only word on whether the shape is valid.
+    for b in normalized_builds:
+        spec_text = rendered[b["build_id"]]["spec"]
+        for field_name in ("resources", "review_gate"):
+            if b.get(field_name) is not None:
+                spec_text = update_frontmatter_field(spec_text, field_name, b[field_name], require_existing=False)
+        rendered[b["build_id"]]["spec"] = spec_text
+
+        # `resources` also belongs on the schedule entry itself (the resource-
+        # aware scheduler reads locks from the schedule file, not the spec) --
+        # same rendering gap, same fix, at the schedule_entry fragment layer.
+        if b.get("resources") is not None:
+            rendered[b["build_id"]]["schedule_entry"] = _splice_schedule_entry_field(
+                rendered[b["build_id"]]["schedule_entry"], "resources", b["resources"]
+            )
 
     new_nodes = [
         {
