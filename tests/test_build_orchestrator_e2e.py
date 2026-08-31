@@ -8,9 +8,11 @@ isolation) by proving the real wiring actually works.
 import json
 from pathlib import Path
 
+import frontmatter
 import pytest
 
 from obsidian_vault_mcp import config
+from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
 from obsidian_vault_mcp.tools import build_orchestrator as bo
 
 _ADAPTER_PRESENT = Path(config.BO_AUTHORING_CONTRACT_PATH).exists()
@@ -39,6 +41,10 @@ def _build(build_id, **overrides):
         "tier": "simple", "project": "edge-trading-system",
         "risk_domain": "observability", "blast_radius": "single-component",
         "reversible": True, "shadowable": True,
+        # schema v6+ requires newly-authored specs to state completion intent
+        # explicitly (missing_completion_intent) -- see
+        # vault-checkout-remote-reconciliation-v1.
+        "deployment_intent": "required",
     }
     b.update(overrides)
     return b
@@ -81,3 +87,59 @@ def test_real_forward_reference_chain_succeeds(seeded_schedule):
     assert result["ok"] is True, result
     assert (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-fwd1.md").exists()
     assert (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-fwd2.md").exists()
+
+
+def test_real_review_gate_resources_and_deployment_intent_survive_create(seeded_schedule):
+    """schema-parity fields (vault-checkout-remote-reconciliation-v1): a
+    structured create must actually persist review_gate/resources/
+    deployment_intent into the written spec (and resources into the written
+    schedule entry too) -- not just accept them without error."""
+    review_gate = {
+        "artifact_path": "BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/opus-review-scratch-real-e2e-schema.md",
+        "required_verdict": "APPROVED",
+        "required_status": "pass",
+        "max_blocker_count": 0,
+        "max_high_count": 0,
+        "accepted_models": ["claude-opus-4-8"],
+        "require_model_verified": True,
+        "reviewed_sha_must_match": "current_head",
+    }
+    resources = [{"id": "repo:scratch-real-e2e-schema", "mode": "exclusive"}]
+    build = _build(
+        "scratch-real-e2e-schema",
+        deployment_intent="required",
+        review_gate=review_gate,
+        resources=resources,
+    )
+
+    validated = json.loads(bo.bo_validate_build_graph([build], SCHEDULE_PATH))
+    assert validated["ok"] is True, validated
+
+    created = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert created["ok"] is True, created
+
+    spec_content = (
+        seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-schema.md"
+    ).read_text()
+    parsed_spec = frontmatter.loads(spec_content)
+    assert parsed_spec.metadata["deployment_intent"] == "required"
+    assert parsed_spec.metadata["review_gate"]["required_verdict"] == "APPROVED"
+    assert parsed_spec.metadata["resources"] == resources
+
+    schedule_content = (
+        seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    ).read_text()
+    entries = schedule_builds_from_content(schedule_content, source_name=SCHEDULE_PATH)
+    entry = next(e for e in entries if e["id"] == "scratch-real-e2e-schema")
+    assert entry["resources"] == resources
+
+
+def test_real_bad_review_gate_shape_rejected_with_no_writes(seeded_schedule):
+    """The adapter, not this repo, still owns review_gate's shape rules --
+    a malformed block must fail validate_graph, proving this repo isn't
+    silently accepting a value it never checks."""
+    build = _build("scratch-real-e2e-badgate", review_gate={"artifact_path": 123})
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert any(e["code"] == "bad_review_gate_field" for e in result["errors"])
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-badgate.md").exists()

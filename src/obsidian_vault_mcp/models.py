@@ -652,10 +652,27 @@ class BOBuildSpecInput(BaseModel):
     blast_radius: str | None = Field(default=None, max_length=100)
     reversible: bool | None = Field(default=None)
     shadowable: bool | None = Field(default=None)
+    capital_path: bool | None = Field(
+        default=None,
+        description="Deprecated pre-v5 risk-classification alias -- compatibility-only, never sufficient alone for a new spec",
+    )
     engine: str | None = Field(default=None, description="One of: auto, cc, codex", max_length=20)
     tags: list[str] | None = Field(default=None)
     status: str = Field(default="ready", description="'ready' (dispatch-eligible) or 'proposed'", max_length=20)
     completion_contract: dict | None = Field(default=None)
+    deployment_intent: str | None = Field(
+        default=None,
+        description="One of: deferred, not_applicable, required -- exact vocabulary owned by the BO authoring contract, never validated here",
+        max_length=50,
+    )
+    resources: list[dict] | None = Field(
+        default=None,
+        description="BO resource claims (e.g. [{'id': 'repo:name', 'mode': 'exclusive'}]) -- shape/semantics owned by the BO authoring contract, never validated here",
+    )
+    review_gate: dict | None = Field(
+        default=None,
+        description="BO review-gate block (artifact_path, required_verdict, required_status, etc.) -- shape/semantics owned by the BO authoring contract, never validated here",
+    )
     notes: str | None = Field(default=None, max_length=2000)
     created: str | None = Field(default=None, max_length=50)
 
