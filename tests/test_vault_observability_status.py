@@ -39,14 +39,19 @@ def env(tmp_path):
         "ledger_path": tmp_path / "ledger.jsonl",
         "history_dir": tmp_path / "history",
         "watchdog_log": tmp_path / "watchdog.log",
+        # Hermetic default: no test should hit the real network via
+        # probe_local_health unless it explicitly opts in. Tests that care
+        # about "no health data available" override this back to `lambda: None`.
+        "health_probe": lambda: "up",
     }
 
 
 def test_all_sources_missing_is_unknown_not_ok(status_mod, tmp_path, env):
     """No data anywhere must never be silently read as healthy."""
+    env = dict(env, health_probe=lambda: None)
     status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
     sli_by_id = {s["id"]: s for s in status["slis"]}
-    for sli_id in ("functional_read_query", "backup_age_hours", "restore_drill_age_days"):
+    for sli_id in ("functional_read_query", "backup_age_hours", "restore_drill_age_days", "mcp_availability"):
         assert sli_by_id[sli_id]["status"] == "unknown", sli_id
     assert status["overall_status"] == "unknown"
 
@@ -159,6 +164,7 @@ def test_contradiction_and_malformed_notes_are_always_unknown_no_fake_parsing(st
 
 
 def test_alert_on_status_never_fires_for_unknown(status_mod, tmp_path, env):
+    env = dict(env, health_probe=lambda: None)
     status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
     assert status["overall_status"] == "unknown"
     sent = []
@@ -209,17 +215,17 @@ def test_write_status_atomic(status_mod, tmp_path, env):
     assert list(out_dir.glob("*.tmp")) == []
 
 
-def _mcp_status(vault_name: str, sli_status: str, value=1) -> dict:
+def _mcp_status(vault_name: str, sli_status: str, value="down") -> dict:
     return {
         "vault_name": vault_name,
         "slis": [{
             "id": "mcp_availability",
             "status": sli_status,
             "value": value,
-            "unit": "watchdog_restarts_per_check",
+            "unit": "probe_result",
             "owner": "ben",
-            "runbook": "check-vault-mcp.sh already self-heals (restarts supervisord program); "
-                       "this SLI just makes repeated restarts visible instead of silently absorbed.",
+            "runbook": "Check supervisord status and this vault's process/port -- a live "
+                       "/health probe just failed or timed out at check time.",
         }],
     }
 
@@ -270,7 +276,7 @@ def test_mcp_availability_recovery_says_recovered_with_duration(status_mod, tmp_
 
     sent = []
     status_mod.alert_on_status(
-        _mcp_status("bs-brain", "ok", value=0), send_fn=sent.append, alert_state_dir=alert_dir,
+        _mcp_status("bs-brain", "ok", value="up"), send_fn=sent.append, alert_state_dir=alert_dir,
         now=_now() + timedelta(minutes=45),
     )
     assert len(sent) == 1
@@ -281,7 +287,7 @@ def test_mcp_availability_recovery_says_recovered_with_duration(status_mod, tmp_
 def test_mcp_availability_new_outage_after_recovery_alerts_again(status_mod, tmp_path):
     alert_dir = tmp_path / "alert-state"
     down_status = _mcp_status("bs-brain", "critical")
-    up_status = _mcp_status("bs-brain", "ok", value=0)
+    up_status = _mcp_status("bs-brain", "ok", value="up")
 
     status_mod.alert_on_status(down_status, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now())
     status_mod.alert_on_status(
@@ -310,7 +316,9 @@ def test_mcp_availability_unknown_does_not_alert_or_clear_in_progress_incident(s
         now=_now() + timedelta(minutes=10),
     )
     assert sent == []
-    assert current_state("bs-brain:mcp_availability", state_dir=alert_dir)["status"] == "failing"
+    assert current_state(
+        f"bs-brain:mcp_availability{status_mod.MCP_AVAILABILITY_KEY_SUFFIX}", state_dir=alert_dir
+    )["status"] == "failing"
 
 
 def test_non_availability_slis_keep_generic_wording_not_down(status_mod, tmp_path):
@@ -328,3 +336,169 @@ def test_non_availability_slis_keep_generic_wording_not_down(status_mod, tmp_pat
     assert len(sent) == 1
     assert "DOWN" not in sent[0]
     assert sent[0].startswith("NEW FAILURE:")
+
+
+# --- vault-brain-live-health-alert-truth-v1 regression coverage -----------
+# Reproduces and pins closed the 2026-08-31 false-positive: three healthy
+# Brains kept alerting "still DOWN" because mcp_availability was a 24h
+# watchdog-restart count, not a live probe.
+
+def test_historical_watchdog_event_plus_current_200_is_no_down(status_mod, tmp_path, env):
+    """The exact 2026-08-31 scenario: a restart happened recently (so the
+    watchdog log has a 'Forcing recovery' line inside the 24h window) but the
+    live /health probe is healthy right now -- must never say DOWN."""
+    env["watchdog_log"].write_text(
+        "2026-08-30 19:34:01 [WATCHDOG] bs-brain-vault unhealthy — HTTP 000 (expected 401). "
+        "Forcing recovery.\n"
+    )
+    env = dict(env, health_probe=lambda: "up")
+    status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
+    sli_by_id = {s["id"]: s for s in status["slis"]}
+    assert sli_by_id["mcp_availability"]["value"] == "up"
+    assert sli_by_id["mcp_availability"]["status"] == "ok"
+    assert sli_by_id["watchdog_recovery_events_24h"]["value"] == 1
+
+    sent = []
+    status_mod.alert_on_status(status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now())
+    assert not any("DOWN" in m for m in sent)
+
+
+def test_three_healthy_brains_with_stale_old_alert_state_is_no_still_down(status_mod, tmp_path):
+    """A pre-existing 'failing' incident under the OLD unversioned key (the
+    real production state found on 2026-08-31: 100 checks, status=failing)
+    must not bleed into the new live-health signal as a still-DOWN or a fake
+    RECOVERED -- the versioned key starts fresh and old state is left alone."""
+    from obsidian_vault_mcp.observability_alert import current_state
+
+    alert_dir = tmp_path / "alert-state"
+    alert_dir.mkdir(parents=True)
+    old_key_path = alert_dir / "bs-brain_mcp_availability.json"
+    old_key_path.write_text(json.dumps({
+        "key": "bs-brain:mcp_availability",
+        "status": "failing",
+        "first_failure_at": "2026-08-30T09:45:01.371972+00:00",
+        "last_alert_at": "2026-08-31T10:15:01.854886+00:00",
+        "failure_count_since_recovery": 100,
+        "last_message": "stale pre-migration state",
+    }))
+
+    sent = []
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "ok", value="up"), send_fn=sent.append, alert_state_dir=alert_dir, now=_now(),
+    )
+    assert sent == []  # no still-DOWN, no fake RECOVERED
+    assert json.loads(old_key_path.read_text())["failure_count_since_recovery"] == 100  # untouched, preserved for audit
+
+    new_key = f"bs-brain:mcp_availability{status_mod.MCP_AVAILABILITY_KEY_SUFFIX}"
+    assert current_state(new_key, state_dir=alert_dir)["status"] == "ok"
+
+
+def test_consecutive_current_health_failures_have_truthful_count(status_mod, tmp_path):
+    """'N checks' must count consecutive current-probe failures only, never
+    an inflated historical restart count."""
+    alert_dir = tmp_path / "alert-state"
+    down = _mcp_status("bs-brain", "critical")
+    status_mod.alert_on_status(down, send_fn=lambda m: None, alert_state_dir=alert_dir, now=_now())
+    status_mod.alert_on_status(
+        down, send_fn=lambda m: None, alert_state_dir=alert_dir,
+        now=_now() + timedelta(hours=1), rate_limit_seconds=3600,
+    )
+    sent = []
+    status_mod.alert_on_status(
+        down, send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(hours=2), rate_limit_seconds=3600,
+    )
+    assert len(sent) == 1
+    assert "3 checks" in sent[0]
+
+
+def test_current_recovery_produces_exactly_one_recovered_message(status_mod, tmp_path):
+    alert_dir = tmp_path / "alert-state"
+    sent = []
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "critical"), send_fn=sent.append, alert_state_dir=alert_dir, now=_now(),
+    )
+    status_mod.alert_on_status(
+        _mcp_status("bs-brain", "ok", value="up"), send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(minutes=30),
+    )
+    recovered = [m for m in sent if "RECOVERED" in m]
+    assert len(recovered) == 1
+    assert recovered[0].startswith("BS Brain RECOVERED")
+
+
+def test_local_healthy_remote_unhealthy_uses_remote_wording_not_brain_down(status_mod, tmp_path, env):
+    env = dict(env, health_probe=lambda: "up", remote_probe=lambda: "down")
+    status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
+    sli_by_id = {s["id"]: s for s in status["slis"]}
+    assert sli_by_id["mcp_availability"]["status"] == "ok"
+    assert sli_by_id["remote_access"]["status"] == "critical"
+
+    sent = []
+    status_mod.alert_on_status(status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now())
+    remote_messages = [m for m in sent if "remote access" in m]
+    assert len(remote_messages) == 1
+    assert "DOWN" not in remote_messages[0]
+    assert "degraded" in remote_messages[0]
+    assert not any(m.startswith("BS Brain DOWN") for m in sent)
+
+
+def test_remote_access_is_unknown_by_default_no_probe_wired(status_mod, tmp_path, env):
+    """No remote_probe configured (the real production default -- no safe
+    secret-free URL exists) must report unknown, never down."""
+    status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
+    sli_by_id = {s["id"]: s for s in status["slis"]}
+    assert sli_by_id["remote_access"]["status"] == "unknown"
+
+    sent = []
+    status_mod.alert_on_status(status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now())
+    assert not any("remote access" in m for m in sent)
+
+
+def test_current_local_failure_with_zero_watchdog_restarts_still_says_down(status_mod, tmp_path, env):
+    """DOWN must be driven purely by the live probe -- a genuine current
+    failure with a clean (zero-restart) watchdog history must still alert."""
+    env["watchdog_log"].write_text("")  # exists, but no "Forcing recovery" lines -- a real zero, not unknown
+    env = dict(env, health_probe=lambda: "down")
+    status = status_mod.collect_status("bs-brain", tmp_path, _now(), job_statuses={}, **env)
+    sli_by_id = {s["id"]: s for s in status["slis"]}
+    assert sli_by_id["mcp_availability"]["status"] == "critical"
+    assert sli_by_id["watchdog_recovery_events_24h"]["value"] == 0
+
+    sent = []
+    status_mod.alert_on_status(status, send_fn=sent.append, alert_state_dir=tmp_path / "alert-state", now=_now())
+    assert any(m.startswith("BS Brain DOWN") for m in sent)
+
+
+def test_watchdog_recovery_events_never_use_down_or_recovered_wording(status_mod, tmp_path):
+    """Elevated-then-resolved watchdog events must never render with DOWN/
+    still DOWN/down since/RECOVERED wording -- that vocabulary is reserved for
+    mcp_availability's genuine current-health incidents."""
+    def _watchdog_status(vault_name, sli_status, value=2):
+        return {
+            "vault_name": vault_name,
+            "slis": [{
+                "id": "watchdog_recovery_events_24h",
+                "status": sli_status,
+                "value": value,
+                "unit": "restarts_per_24h",
+                "owner": "ben",
+                "runbook": "check-vault-mcp.sh already self-heals.",
+            }],
+        }
+
+    alert_dir = tmp_path / "alert-state"
+    forbidden = ("DOWN", "RECOVERED")
+
+    sent = []
+    status_mod.alert_on_status(
+        _watchdog_status("bs-brain", "warning"), send_fn=sent.append, alert_state_dir=alert_dir, now=_now(),
+    )
+    status_mod.alert_on_status(
+        _watchdog_status("bs-brain", "ok", value=0), send_fn=sent.append, alert_state_dir=alert_dir,
+        now=_now() + timedelta(minutes=30),
+    )
+    assert len(sent) == 2
+    for message in sent:
+        for word in forbidden:
+            assert word not in message, message

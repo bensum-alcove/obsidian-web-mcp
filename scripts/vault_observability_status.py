@@ -11,7 +11,15 @@ thresholds) signals that ALREADY EXIST elsewhere in this repo -- it never
 recomputes them:
 
   functional_read_query / index_freshness_seconds  <- vault_functional_canary.py's own status JSON
-  mcp_availability                                  <- check-vault-mcp.sh's watchdog log (restarts, 24h window)
+  mcp_availability                                  <- live probe of this vault's own
+                                                        unauthenticated http://127.0.0.1:<port>/health
+                                                        at check time (current truth, not history)
+  watchdog_recovery_events_24h                      <- check-vault-mcp.sh's watchdog log (restarts, 24h
+                                                        window) -- reliability history ONLY, never rendered
+                                                        as a current outage (vault-brain-live-health-
+                                                        alert-truth-v1, see module tail for why)
+  remote_access                                     <- UNKNOWN in production: no non-secret public health
+                                                        URL is wired into this repo; see remote_probe param
   backup_age_hours                                  <- vault-backup.sh's per-vault STATE_DIR lastchange file
   restore_drill_age_days                            <- newest ~/backups/vault-clean-room-restore-proof-*/ mtime
   dreaming_state / hot_md_policy_state               <- job_miss_check's own OK/LATE/MISSED classification
@@ -36,6 +44,18 @@ rate-limit schedule instead of spamming every 15-minute run, and restarting
 this script never forgets an in-progress incident (state lives on disk).
 UNKNOWN never triggers or clears an alert -- a missing data source must not
 be misread as either a new failure or a recovery.
+
+vault-brain-live-health-alert-truth-v1 (2026-08-31): mcp_availability used to
+equal the 24h watchdog-restart count, so a single restart kept "DOWN" alerting
+for a full rolling day even after the service was already healthy again --
+confirmed live on 2026-08-31 when all three Brains' /health endpoints returned
+200 while Telegram still said "still DOWN ... 99 checks". mcp_availability is
+now a live /health probe result only; the restart count moved to its own
+watchdog_recovery_events_24h SLI, which is alerted on but can never use DOWN/
+RECOVERED wording. Because this changed what "failing" means for the same SLI
+id, its alert-state key is versioned (MCP_AVAILABILITY_KEY_SUFFIX below) so a
+pre-existing false "failing" incident from the old semantics is never silently
+reinterpreted as this new signal's RECOVERED or still-failing.
 """
 from __future__ import annotations
 
@@ -46,6 +66,7 @@ import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 SRC_ROOT = SCRIPTS_DIR.parent / "src"
@@ -94,6 +115,7 @@ VAULT_PROFILES = {
         "hot_md_job": "hot-md-curate",
         "canonical_state_scan": True,
         "retrieval_eval": True,
+        "health_port": 8420,
     },
     "cb-brain": {
         "backup_state_name": "CB_Brain",
@@ -102,6 +124,7 @@ VAULT_PROFILES = {
         "hot_md_job": None,
         "canonical_state_scan": False,
         "retrieval_eval": False,
+        "health_port": 8423,
     },
     "alcove-brain": {
         "backup_state_name": "Alcove_Brain",
@@ -110,8 +133,17 @@ VAULT_PROFILES = {
         "hot_md_job": None,
         "canonical_state_scan": False,
         "retrieval_eval": False,
+        "health_port": 8426,
     },
 }
+
+# mcp_availability's meaning changed (2026-08-31, vault-brain-live-health-alert-
+# truth-v1) from a 24h watchdog-restart count to a live /health probe result --
+# see module docstring. Suffixing the alert-state key stops a pre-existing
+# "failing" incident under the old semantics from being silently read as this
+# new signal recovering or still failing; the old unsuffixed state file is left
+# on disk untouched, for audit.
+MCP_AVAILABILITY_KEY_SUFFIX = ":live-health-v1"
 
 
 def _hours_since(mtime: float, now: datetime) -> float:
@@ -124,6 +156,19 @@ def read_canary_status(vault_name: str, status_dir: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def probe_local_health(port: int, timeout: float = 5.0) -> str:
+    """Live current-health probe of this vault's own unauthenticated /health
+    endpoint (server.py's `/health` route, always {"status": "ok"} on 200).
+    Returns "up" for HTTP 200, "down" for anything else -- timeout, connection
+    refused, non-200 -- these must all read as one current-origin-failure
+    class to the caller, never distinguished by cause here."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as resp:
+            return "up" if resp.status == 200 else "down"
+    except Exception:
+        return "down"
 
 
 def read_watchdog_restarts_24h(log_path: Path, now: datetime) -> int | None:
@@ -245,6 +290,8 @@ def collect_status(
     history_dir: Path = EVALS_HISTORY_DIR,
     watchdog_log: Path | None = None,
     job_statuses: dict[str, str] | None = None,
+    health_probe: Callable[[], str] | None = None,
+    remote_probe: Callable[[], str] | None = None,
 ) -> dict:
     profile = dict(VAULT_PROFILES.get(vault_name, {}))
     if watchdog_log is not None:
@@ -274,11 +321,33 @@ def collect_status(
         evidence["functional_read_query"] = "no canary status file found -- has it ever run?"
         evidence["index_freshness_seconds"] = evidence["functional_read_query"]
 
+    health_port = profile.get("health_port")
+    if health_probe is not None:
+        values["mcp_availability"] = health_probe()
+    elif health_port is not None:
+        values["mcp_availability"] = probe_local_health(health_port)
+    else:
+        values["mcp_availability"] = None
+    evidence["mcp_availability"] = (
+        f"live probe http://127.0.0.1:{health_port}/health" if health_port is not None
+        else "no local health port configured for this vault"
+    )
+
+    values["remote_access"] = remote_probe() if remote_probe is not None else None
+    evidence["remote_access"] = (
+        "remote_probe callable result (test double)" if remote_probe is not None
+        else "no non-secret, unauthenticated public health URL is wired for this "
+             "vault -- remote path is not tracked; mcp_availability's local /health "
+             "probe above remains the sole origin-truth signal"
+    )
+
     watchdog_log = profile.get("watchdog_log")
-    values["mcp_availability"] = (
+    values["watchdog_recovery_events_24h"] = (
         read_watchdog_restarts_24h(watchdog_log, now) if watchdog_log else None
     )
-    evidence["mcp_availability"] = str(watchdog_log) if watchdog_log else "no watchdog log configured"
+    evidence["watchdog_recovery_events_24h"] = (
+        str(watchdog_log) if watchdog_log else "no watchdog log configured"
+    )
 
     backup_name = profile.get("backup_state_name")
     values["backup_age_hours"] = (
@@ -404,6 +473,51 @@ def _availability_renderers(display_name: str):
     return render_new_failure, render_recurring, render_recovered
 
 
+def _watchdog_renderers(display_name: str):
+    """Reliability-history wording for watchdog_recovery_events_24h -- a restart
+    count over a rolling 24h window, NOT current availability. Must never say
+    DOWN, still DOWN, down since, or RECOVERED (vault-brain-live-health-alert-
+    truth-v1) so it can never be misread as a current outage."""
+
+    def render_new_failure(key: str, message: str, now: datetime) -> str:
+        return (
+            f"{display_name} watchdog recovery events elevated — checked {_aest_hhmm(now)} AEST "
+            f"(reliability history, not a current outage)"
+        )
+
+    def render_recurring(key: str, message: str, first_failure_at: str, failure_count: int, now: datetime) -> str:
+        since = _aest_hhmm(datetime.fromisoformat(first_failure_at)) if first_failure_at else "unknown"
+        return (
+            f"{display_name} watchdog recovery events still elevated — checked {_aest_hhmm(now)} AEST "
+            f"(elevated since {since} AEST, {failure_count} checks; reliability history, not a current outage)"
+        )
+
+    def render_resolved(key: str, message: str, first_failure_at: str | None, now: datetime) -> str:
+        return f"{display_name} watchdog recovery events back to baseline — checked {_aest_hhmm(now)} AEST"
+
+    return render_new_failure, render_recurring, render_resolved
+
+
+def _remote_access_renderers(display_name: str):
+    """Remote-path wording for remote_access -- must never say "<Brain> DOWN"
+    when local origin health is fine (vault-brain-live-health-alert-truth-v1)."""
+
+    def render_new_failure(key: str, message: str, now: datetime) -> str:
+        return f"{display_name} local healthy — remote access degraded, checked {_aest_hhmm(now)} AEST"
+
+    def render_recurring(key: str, message: str, first_failure_at: str, failure_count: int, now: datetime) -> str:
+        since = _aest_hhmm(datetime.fromisoformat(first_failure_at)) if first_failure_at else "unknown"
+        return (
+            f"{display_name} local healthy — remote access still degraded, checked {_aest_hhmm(now)} AEST "
+            f"(degraded since {since} AEST, {failure_count} checks)"
+        )
+
+    def render_recovered(key: str, message: str, first_failure_at: str | None, now: datetime) -> str:
+        return f"{display_name} remote access restored — checked {_aest_hhmm(now)} AEST"
+
+    return render_new_failure, render_recurring, render_recovered
+
+
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -436,7 +550,8 @@ def alert_on_status(
     for sli_status in status["slis"]:
         if sli_status["status"] == "unknown":
             continue
-        key = f"{status['vault_name']}:{sli_status['id']}"
+        key_suffix = MCP_AVAILABILITY_KEY_SUFFIX if sli_status["id"] == "mcp_availability" else ""
+        key = f"{status['vault_name']}:{sli_status['id']}{key_suffix}"
         is_failing = sli_status["status"] in ("warning", "critical")
         message = (
             f"[{sli_status['status'].upper()}] {sli_status['id']} = {sli_status['value']} "
@@ -445,6 +560,20 @@ def alert_on_status(
         renderers = {}
         if sli_status["id"] == "mcp_availability":
             render_new_failure, render_recurring, render_recovered = _availability_renderers(display_name)
+            renderers = dict(
+                render_new_failure=render_new_failure,
+                render_recurring=render_recurring,
+                render_recovered=render_recovered,
+            )
+        elif sli_status["id"] == "watchdog_recovery_events_24h":
+            render_new_failure, render_recurring, render_recovered = _watchdog_renderers(display_name)
+            renderers = dict(
+                render_new_failure=render_new_failure,
+                render_recurring=render_recurring,
+                render_recovered=render_recovered,
+            )
+        elif sli_status["id"] == "remote_access":
+            render_new_failure, render_recurring, render_recovered = _remote_access_renderers(display_name)
             renderers = dict(
                 render_new_failure=render_new_failure,
                 render_recurring=render_recurring,
