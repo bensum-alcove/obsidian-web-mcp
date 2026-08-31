@@ -5,7 +5,8 @@ from obsidian_vault_mcp.slo import SLI, Direction, Status, REGISTRY, layers
 
 def test_registry_is_populated_with_documented_signals():
     expected_ids = {
-        "mcp_availability", "functional_read_query", "index_freshness_seconds",
+        "mcp_availability", "watchdog_recovery_events_24h", "remote_access",
+        "functional_read_query", "index_freshness_seconds",
         "backup_age_hours", "restore_drill_age_days", "retrieval_trend",
         "validation_rejects_count", "concurrency_conflicts_count",
         "malformed_notes_count", "contradiction_count", "dreaming_state",

@@ -90,18 +90,66 @@ def _register(sli: SLI) -> SLI:
 
 mcp_availability = _register(SLI(
     id="mcp_availability",
-    description="Vault MCP process/HTTP liveness (localhost + cloudflared + external URL).",
+    description="Vault MCP current local /health liveness -- a live probe result "
+                 "('up'/'down') at check time, independent of restart history.",
     layer="process",
-    unit="watchdog_restarts_per_check",
+    unit="probe_result",
     direction=Direction.EQUALS,
     warning=None,
     critical=None,
-    ok_value=0,
+    ok_value="up",
+    runbook="Check supervisord status and this vault's process/port -- a live "
+            "/health probe just failed or timed out at check time.",
+    baseline_evidence="vault-brain-live-health-alert-truth-v1 (2026-08-31): replaced "
+                       "the prior 24h watchdog-restart-count proxy after it produced a "
+                       "false 'all three Brains DOWN' alert while every /health endpoint "
+                       "was returning 200 -- ok_value='up' on a live probe result is the "
+                       "only truthful baseline for current availability.",
+))
+
+watchdog_recovery_events_24h = _register(SLI(
+    id="watchdog_recovery_events_24h",
+    description="check-vault-mcp.sh watchdog 'Forcing recovery' restarts in the "
+                 "trailing 24h -- reliability history, NOT current availability; a "
+                 "healthy current /health probe can coexist with a nonzero count here.",
+    layer="process",
+    unit="restarts_per_24h",
+    direction=Direction.ABOVE,
+    warning=1,
+    critical=10,
     runbook="check-vault-mcp.sh already self-heals (restarts supervisord program); "
-            "this SLI just makes repeated restarts visible instead of silently absorbed.",
-    baseline_evidence="check-vault-mcp.sh has run every 2 minutes per vault since "
-                       "before this build with no counted-restart history kept -- "
-                       "0 restarts/check is the only defensible starting baseline.",
+            "this SLI makes repeated restarts visible as a reliability trend. It must "
+            "never be read as a current outage -- see mcp_availability for that.",
+    baseline_evidence="split out of the old mcp_availability SLI (vault-brain-live-"
+                       "health-alert-truth-v1, 2026-08-31), which conflated this same "
+                       "restart count with current availability. warning=1 keeps the "
+                       "prior 'any restart is worth surfacing' bar; critical=10 is a new, "
+                       "conservative sustained-thrashing threshold with no prior incident "
+                       "to calibrate against.",
+))
+
+remote_access = _register(SLI(
+    id="remote_access",
+    description="Public tunnel reachability for this vault's MCP endpoint, probed "
+                 "separately from local origin health so a healthy origin behind a "
+                 "broken tunnel is never reported as a Brain outage.",
+    layer="process",
+    unit="probe_result",
+    direction=Direction.EQUALS,
+    warning=None,
+    critical=None,
+    ok_value="up",
+    runbook="Check cloudflared tunnel status/logs for this vault (see check-vault-"
+            "mcp.sh's [CLOUDFLARED] log lines) -- this is a remote-path signal, not "
+            "local origin health.",
+    baseline_evidence="none -- new signal (vault-brain-live-health-alert-truth-v1). "
+                       "No non-secret, unauthenticated public health URL is currently "
+                       "wired into this repo's code -- the tunnel URLs check-vault-"
+                       "mcp.sh probes carry a secret-equivalent path segment and must "
+                       "not be embedded here -- so this SLI reports UNKNOWN in "
+                       "production until a safe external probe exists. The EQUALS/"
+                       "ok_value='up' evaluation and alert wording are implemented now "
+                       "so wiring a real probe later is a one-line change.",
 ))
 
 functional_read_query = _register(SLI(
