@@ -80,6 +80,21 @@ JOBS = [
         "enabled": True,
     },
     {
+        # alcovestats-daily-refresh-recovery-v1 (2026-09-02): the entry above
+        # only proves the cron fired, which is exactly what let the pipeline
+        # silently fail from 2026-08-23 onward while reporting healthy. This
+        # artifact is written by run-alcovestats.sh ONLY when the hardened
+        # wrapper's classify_result() sees a genuine ALCOVESTATS_RESULT:
+        # SUCCESS marker from the pipeline -- a failed/aborted run leaves it
+        # stale even though the log above is fresh. Same cadence as the
+        # export job above.
+        "name": "alcovestats-outcome",
+        "artifact": "/home/ben_sum/logs/alcovestats-last-success",
+        "max_age_hours": 13,
+        "period_hours": 24,
+        "enabled": True,
+    },
+    {
         # Every 5 minutes — the checker's own bootstrap dependency: mem-monitor
         # is the canary for "cron isn't running at all" on this box.
         "name": "mem-monitor-heartbeat",
