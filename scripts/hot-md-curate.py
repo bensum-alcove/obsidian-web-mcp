@@ -19,7 +19,7 @@ three forms plus real frontmatter status fields.
 
 Check E (build_id: hot-md-curate-scheduled-reviews): additive-only. Parses
 scheduled-reviews.md for pending reviews due today or earlier and surfaces
-them in the report and Telegram summary. Report-only — never writes anything,
+them in the dated report. Report-only — never writes anything,
 in either mode. Missing/unparseable file degrades to a single warning line;
 Checks A-D still run and the script still exits 0.
 
@@ -62,6 +62,16 @@ bullet is flagged CANONICAL-CONFLICT and rotated to hot-archive/ in apply
 mode -- same as every other rotation here, canonical-state is never written
 by this tool, and the conflicting hot.md claim always loses, never the other
 way around.
+
+v5 additions (build_id: hot-md-curate-exception-only-selfheal-v2): cron apply
+holds the existing singleton lock while waiting out recent mtimes, then
+re-reads every target and retries within a fixed bound. The dated report keeps
+all attempt diagnostics, while a fresh final read is the sole notification
+authority. Routine maintenance and REVIEW-DUE bookkeeping are Telegram-silent;
+only unresolved write, preservation, parse/structure, or retry-exhaustion
+exceptions can produce one concise cron notification. Archive bytes are
+verified before source removal, including resolved watchpoints that older
+versions removed without archiving.
 """
 
 import argparse
@@ -96,6 +106,11 @@ LONG_BULLET_CHARS = 250
 MTIME_GUARD_SECONDS = 15 * 60
 ARCHIVE_DIR = "hot-archive"
 CONTENT_STALE_DAYS = 14
+CRON_RETRY_MARGIN_SECONDS = 5
+# Long enough to absorb a fresh edit during the first quiet-window wait, but
+# finite so a continually edited target cannot turn the daily cron into a
+# daemon. The process-wide LOCK_FILE remains held throughout the wait.
+CRON_RETRY_LIMIT_SECONDS = (2 * MTIME_GUARD_SECONDS) + (5 * 60)
 
 # Read-only cross-reference target for Check F — canonical_state.py never writes here.
 CANONICAL_STATE_RECORDS_DIR = "BS 2nd Brain/Alcove/Infrastructure/Canonical State/records"
@@ -427,6 +442,31 @@ def non_canonical_section_report(lines, sections, rel_path):
     return report
 
 
+def structure_safety_errors(text, sections, rel_path):
+    """Return only ambiguities that make deterministic mutation unsafe.
+
+    Ordinary non-canonical sections remain diagnostics. An unterminated
+    frontmatter block or two headings claiming the same canonical section is
+    different: continuing would make line ownership ambiguous, so apply mode
+    must leave the target untouched and surface one integrity exception.
+    """
+    errors = []
+    if text.startswith("---\n") and FRONTMATTER_RE.match(text) is None:
+        errors.append(f"{rel_path}: malformed or unterminated YAML frontmatter")
+
+    for prefix in CANONICAL_SECTIONS:
+        matches = [
+            sec for sec in sections
+            if sec["level"] == 2
+            and sec["heading"].strip().lower().startswith(prefix)
+        ]
+        if len(matches) > 1:
+            errors.append(
+                f"{rel_path}: duplicate canonical section for {prefix!r} blocks safe curation"
+            )
+    return errors
+
+
 def content_stale_check(lines, scan_start, today_str, rel_path):
     """Report-only: flags rel_path if the newest YYYY-MM-DD date found anywhere
     in the body (headings or inline) is more than CONTENT_STALE_DAYS before
@@ -472,9 +512,10 @@ def check_c(lines, sections, rel_path):
 
 
 def check_d(lines, sections):
-    """Returns (report_lines, remove_line_indices)."""
+    """Returns (report_lines, remove_line_indices, archive_chunks)."""
     report = []
     remove = set()
+    archive_chunks = []
     flag_re = re.compile(r"~~|removed 2026-|resolved|superseded", re.IGNORECASE)
     for sec in sections:
         if sec["level"] != 2 or not is_watchpoint_section(sec["heading"]):
@@ -485,7 +526,8 @@ def check_d(lines, sections):
             if flag_re.search(text):
                 report.append(f'ROTATE-CANDIDATE: "{lines[s].strip()}"')
                 remove.update(range(s, e))
-    return report, remove
+                archive_chunks.append((frozenset(range(s, e)), text))
+    return report, remove, archive_chunks
 
 
 def render_with_removals(lines, remove, sections):
@@ -617,6 +659,20 @@ def backup_targets(vault_root, ts, phase):
     return backup_dir
 
 
+def append_archive_losslessly(archive_path, chunk_text):
+    """Append one complete preservation record and verify its exact bytes.
+
+    ``atomic_append`` serialises against every cooperating vault writer. The
+    post-read accepts a later append by another writer, but requires our exact
+    contiguous record to be present before the source hot.md is rewritten.
+    """
+    archive_path = Path(archive_path).resolve()
+    data = chunk_text.encode("utf-8")
+    vault_lock.atomic_append(archive_path, data)
+    if data not in archive_path.read_bytes():
+        raise OSError("lossless archive verification failed")
+
+
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
@@ -640,9 +696,14 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         "resolved_findings": [],
         "rotate_candidates": [],
         "content_stale": None,
+        "canonical_conflicts": [],
+        "safety_exceptions": [],
+        "operation_failed": False,
     }
     if not result["exists"]:
-        result["report_lines"].append(f"MISSING: {rel_path} not found")
+        error = f"{rel_path}: target is missing"
+        result["safety_exceptions"].append(error)
+        result["report_lines"].append(f"SAFETY-EXCEPTION: {error}")
         return result
 
     text = read_file(abs_path)
@@ -662,6 +723,14 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         trailing_newline = False
 
     sections = parse_sections(all_lines)
+
+    structure_errors = structure_safety_errors(text, sections, rel_path)
+    if structure_errors:
+        result["safety_exceptions"].extend(structure_errors)
+        result["report_lines"].extend(
+            f"SAFETY-EXCEPTION: {error}" for error in structure_errors
+        )
+        return result
 
     result["report_lines"].extend(non_canonical_section_report(all_lines, sections, rel_path))
 
@@ -687,14 +756,14 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
                 "— possible live edit in progress"
             )
             c_report, _, _ = check_c(all_lines, sections, rel_path)
-            d_report, _ = check_d(all_lines, sections)
+            d_report, _, _ = check_d(all_lines, sections)
             result["report_lines"].extend(c_report)
             result["rotate_candidates"] = d_report
             result["report_lines"].extend(d_report)
             return result
 
     c_report, c_remove, c_archive = check_c(all_lines, sections, rel_path)
-    d_report, d_remove = check_d(all_lines, sections)
+    d_report, d_remove, d_archive = check_d(all_lines, sections)
     result["report_lines"].extend(c_report)
     result["rotate_candidates"] = d_report
     result["report_lines"].extend(d_report)
@@ -722,7 +791,16 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         f_archive.append((prefix, chunk))
 
     remove = existing_remove | f_remove
-    archive_entries = [(None, chunk) for chunk in c_archive] + b_archive + f_archive
+    archive_entries = (
+        [(None, chunk) for chunk in c_archive]
+        + [
+            ("[resolved-watchpoint]", chunk)
+            for rng, chunk in d_archive
+            if not rng & c_remove
+        ]
+        + b_archive
+        + f_archive
+    )
 
     working_lines = render_with_removals(all_lines, remove, sections) if remove else list(all_lines)
     working_lines, budget_archive, over_budget = budget_enforcement_pass(working_lines)
@@ -742,9 +820,6 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
 
     new_text = "\n".join(working_lines) + ("\n" if trailing_newline else "")
 
-    write_file(abs_path, new_text)
-    result["changed"] = True
-
     if archive_entries:
         archive_path = os.path.join(vault_root, ARCHIVE_DIR, f"{today_str[:7]}.md")
         header = f"## Rotated {today_str} from {rel_path}\n\n"
@@ -756,17 +831,111 @@ def process_target(vault_root, rel_path, apply_mode, today_str, now_ts):
         # Shared cross-process mutation authority -- read-append-replace
         # under the same lock atomic_write uses, so two concurrent
         # appenders (or a concurrent MCP write) can never interleave bytes.
-        vault_lock.atomic_append(Path(archive_path).resolve(), chunk_text.encode("utf-8"))
+        try:
+            append_archive_losslessly(archive_path, chunk_text)
+        except Exception as exc:
+            error = f"{rel_path}: archive write/preservation verification failed ({exc})"
+            result["safety_exceptions"].append(error)
+            result["operation_failed"] = True
+            result["report_lines"].append(f"SAFETY-EXCEPTION: {error}")
+            return result
         result["report_lines"].append(
             f"Archived {len(archive_entries)} bullet block(s) to {os.path.relpath(archive_path, vault_root)}"
         )
 
+    try:
+        write_file(abs_path, new_text)
+        if read_file(abs_path) != new_text:
+            raise OSError("post-write byte verification failed")
+    except Exception as exc:
+        error = f"{rel_path}: curated target write/verification failed ({exc})"
+        result["safety_exceptions"].append(error)
+        result["operation_failed"] = True
+        result["report_lines"].append(f"SAFETY-EXCEPTION: {error}")
+        return result
+    result["changed"] = True
+
     if d_remove:
         result["report_lines"].append(
-            f"Removed {len(d_report)} resolved watchpoint bullet(s) in place (not archived)"
+            f"Archived {len(d_report)} resolved watchpoint bullet(s) before removal"
         )
 
     return result
+
+
+def process_all_targets(vault_root, apply_mode, today_str, now_ts):
+    return [
+        process_target(vault_root, rel, apply_mode, today_str, now_ts)
+        for rel in TARGETS
+    ]
+
+
+def quiet_wait_seconds(vault_root, skipped_rel_paths, now_ts):
+    """Calculate from fresh mtimes, never from the first-pass snapshot."""
+    remaining = 0.0
+    for rel_path in skipped_rel_paths:
+        abs_path = os.path.join(vault_root, rel_path)
+        if not os.path.isfile(abs_path):
+            continue
+        age = max(0.0, now_ts - os.path.getmtime(abs_path))
+        remaining = max(remaining, max(0.0, MTIME_GUARD_SECONDS - age))
+    return remaining + CRON_RETRY_MARGIN_SECONDS
+
+
+def apply_with_bounded_retry(
+    vault_root, today_str, invoked_by_cron, *, clock=time.time, sleep=time.sleep
+):
+    """Run apply, self-healing recent-mtime skips only for the cron path.
+
+    Every retry re-reads and re-evaluates every target. Attempt diagnostics
+    are returned for the dated report; callers must compute notification
+    authority from the final state plus unresolved operation failures only.
+    """
+    start = clock()
+    deadline = start + CRON_RETRY_LIMIT_SECONDS
+    current = process_all_targets(vault_root, True, today_str, start)
+    attempts = [current]
+
+    def unresolved_operation_failures(results):
+        return [
+            error
+            for result in results if result.get("operation_failed")
+            for error in result["safety_exceptions"]
+        ]
+
+    if not invoked_by_cron:
+        return attempts, current, unresolved_operation_failures(current)
+
+    while True:
+        skipped = [result["rel_path"] for result in current if result["mtime_skipped"]]
+        if not skipped:
+            return attempts, current, unresolved_operation_failures(current)
+
+        now_ts = clock()
+        wait_seconds = quiet_wait_seconds(vault_root, skipped, now_ts)
+        if wait_seconds <= 0:
+            wait_seconds = CRON_RETRY_MARGIN_SECONDS
+        if now_ts + wait_seconds > deadline:
+            targets = ", ".join(skipped)
+            failures = unresolved_operation_failures(current)
+            failures.append(
+                f"quiet-window retry exhausted after {CRON_RETRY_LIMIT_SECONDS}s: {targets}"
+            )
+            return attempts, current, failures
+
+        sleep(wait_seconds)
+        current = process_all_targets(vault_root, True, today_str, clock())
+        attempts.append(current)
+
+
+def exception_message(today_str, exceptions, report_path):
+    unique = list(dict.fromkeys(exceptions))
+    lines = [f"hot-md-curate integrity exception — {today_str}"]
+    lines.extend(f"- {error}" for error in unique[:4])
+    if len(unique) > 4:
+        lines.append(f"- plus {len(unique) - 4} more; see dated report")
+    lines.append(f"Report: {report_path}")
+    return "\n".join(lines)
 
 
 def main():
@@ -781,7 +950,6 @@ def main():
              "(bo-awaiting-input-precision) — the dated report file is the audit trail for those.",
     )
     args = parser.parse_args()
-
     apply_mode = bool(args.apply)
 
     lock_fp = open(LOCK_FILE, "w")
@@ -789,142 +957,136 @@ def main():
         fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print("Another hot-md-curate.py instance is running; exiting.")
-        sys.exit(0)
+        return 0
 
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
-    now_ts = time.time()
+    invoked_by_cron = args.from_cron or os.environ.get("HOT_MD_CURATE_FROM_CRON") == "1"
+    safety_exceptions = []
+    attempts = []
+    backup_dir_before = None
+    backup_dir_after = None
+    ts = now.strftime("%Y-%m-%dT%H-%M-%SZ")
 
     if apply_mode:
-        ts = now.strftime("%Y-%m-%dT%H-%M-%SZ")
-        backup_dir_before = backup_targets(args.vault_root, ts, "before")
-    else:
-        backup_dir_before = None
+        try:
+            backup_dir_before = backup_targets(args.vault_root, ts, "before")
+        except Exception as exc:
+            safety_exceptions.append(f"before-backup failed; apply was not started ({exc})")
 
-    all_results = []
-    for rel in TARGETS:
-        res = process_target(args.vault_root, rel, apply_mode, today_str, now_ts)
-        all_results.append(res)
+    if apply_mode and not safety_exceptions:
+        attempts, _last_apply_results, operation_failures = apply_with_bounded_retry(
+            args.vault_root, today_str, invoked_by_cron
+        )
+        safety_exceptions.extend(operation_failures)
+        try:
+            backup_dir_after = backup_targets(args.vault_root, ts, "after")
+        except Exception as exc:
+            safety_exceptions.append(f"after-backup failed ({exc})")
 
-    if apply_mode:
-        backup_dir_after = backup_targets(args.vault_root, ts, "after")
-    else:
-        backup_dir_after = None
+    # Final notification authority and totals come from a fresh, non-mutating
+    # read after all bounded apply/retry work. First-pass data is diagnostic.
+    all_results = process_all_targets(args.vault_root, False, today_str, time.time())
+    safety_exceptions.extend(
+        error for result in all_results for error in result["safety_exceptions"]
+    )
 
-    report_lines = []
-    report_lines.append(f"# Hot.md Curation Report — {today_str}")
-    report_lines.append("")
-    report_lines.append(f"Mode: {'apply' if apply_mode else 'report'}")
+    report_lines = [
+        f"# Hot.md Curation Report — {today_str}",
+        "",
+        f"Mode: {'apply' if apply_mode else 'report'}",
+    ]
     if backup_dir_before:
         report_lines.append(f"Backup (before): {backup_dir_before}")
     if backup_dir_after:
         report_lines.append(f"Backup (after): {backup_dir_after}")
     report_lines.append("")
 
+    if attempts:
+        report_lines.append("## Apply attempts (diagnostic only)")
+        for attempt_number, attempt in enumerate(attempts, 1):
+            report_lines.append(f"### Attempt {attempt_number}")
+            for result in attempt:
+                report_lines.append(f"- {result['rel_path']}")
+                for line in result["report_lines"]:
+                    report_lines.append(f"  - {line}")
+        report_lines.append("")
+
+    report_lines.extend(["## Final state (notification authority)", ""])
     total_resolved = 0
     total_stale = 0
     total_rotate = 0
     total_content_stale = 0
     total_canonical_conflict = 0
-    tg_lines = []
 
     for res in all_results:
-        report_lines.append(f"## {res['rel_path']}")
+        report_lines.append(f"### {res['rel_path']}")
         if not res["exists"]:
-            report_lines.append("- MISSING")
-            report_lines.append("")
+            report_lines.extend(["- MISSING", ""])
             continue
-        for l in res["report_lines"]:
-            report_lines.append(f"- {l}")
+        for line in res["report_lines"]:
+            report_lines.append(f"- {line}")
         report_lines.append("")
 
-        resolved = sum(1 for f in res["resolved_findings"] if f.startswith("RESOLVED"))
-        stale = sum(1 for f in res["resolved_findings"] if f.startswith("STALE-BLOCKER"))
-        rotate = len(res["rotate_candidates"])
-        content_stale = 1 if res.get("content_stale") else 0
-        canonical_conflict = len(res.get("canonical_conflicts") or [])
+        resolved = sum(1 for finding in res["resolved_findings"] if finding.startswith("RESOLVED"))
+        stale = sum(1 for finding in res["resolved_findings"] if finding.startswith("STALE-BLOCKER"))
         total_resolved += resolved
         total_stale += stale
-        total_rotate += rotate
-        total_content_stale += content_stale
-        total_canonical_conflict += canonical_conflict
-
-        a = res.get("check_a", {})
-        tg_lines.append(
-            f"{res['rel_path']}: {a.get('chars', '?')}/{BUDGET_CHARS} chars "
-            f"(RESOLVED={resolved} STALE-BLOCKER={stale} ROTATE-CANDIDATE={rotate} "
-            f"CONTENT-STALE={content_stale} CANONICAL-CONFLICT={canonical_conflict})"
-        )
+        total_rotate += len(res["rotate_candidates"])
+        total_content_stale += 1 if res.get("content_stale") else 0
+        total_canonical_conflict += len(res.get("canonical_conflicts") or [])
 
     totals_line = (
         f"Totals: RESOLVED={total_resolved} STALE-BLOCKER={total_stale} "
         f"ROTATE-CANDIDATE={total_rotate} CONTENT-STALE={total_content_stale} "
         f"CANONICAL-CONFLICT={total_canonical_conflict}"
     )
-    report_lines.append(f"## Totals")
-    report_lines.append(f"- {totals_line}")
-    report_lines.append("")
+    report_lines.extend(["## Totals", f"- {totals_line}", ""])
 
     review_due, review_warnings = check_e(args.vault_root, today_str)
     report_lines.append("## Scheduled Reviews")
-    for l in review_due:
-        report_lines.append(f"- {l}")
-    for l in review_warnings:
-        report_lines.append(f"- {l}")
+    report_lines.extend(f"- {line}" for line in review_due)
+    report_lines.extend(f"- {line}" for line in review_warnings)
     if not review_due and not review_warnings:
         report_lines.append("- None due")
     report_lines.append("")
 
-    report_text = "\n".join(report_lines) + "\n"
+    if safety_exceptions:
+        report_lines.append("## Unresolved safety / integrity exceptions")
+        report_lines.extend(f"- {error}" for error in dict.fromkeys(safety_exceptions))
+        report_lines.append("")
 
+    report_text = "\n".join(report_lines) + "\n"
     report_path = os.path.join(
         args.vault_root,
         "BS 2nd Brain/Alcove/Infrastructure/hot-md-reports",
         f"{today_str}.md",
     )
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    write_file(report_path, report_text)
+    try:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        write_file(report_path, report_text)
+    except Exception as exc:
+        safety_exceptions.append(f"dated report write failed ({exc})")
 
     print(report_text)
-    print(f"Report written to {report_path}")
-
-    # Notifications are quiet unless the run is both cron-invoked and actionable
-    # (bo-awaiting-input-precision Part B). A clean run's dated report file above
-    # is the audit trail; Telegram is reserved for things needing attention.
-    invoked_by_cron = args.from_cron or os.environ.get("HOT_MD_CURATE_FROM_CRON") == "1"
-    actionable = (
-        any(res["changed"] for res in all_results)
-        or total_resolved > 0
-        or total_stale > 0
-        or total_canonical_conflict > 0
-        or len(review_due) > 0
-        or "OVER-BUDGET-AT-FLOOR" in report_text
-        or "LONG-BULLET" in report_text
-        or "CONTENT-STALE" in report_text
-    )
+    if not any(error.startswith("dated report write failed") for error in safety_exceptions):
+        print(f"Report written to {report_path}")
 
     if args.no_telegram:
         pass
     elif not invoked_by_cron:
         print("Telegram notify skipped: not invoked by cron (manual/build-invoked run)")
-    elif not actionable:
-        print("Telegram notify skipped: no actionable findings (clean run)")
+    elif not safety_exceptions:
+        print("Telegram notify skipped: no unresolved safety/integrity exception")
     else:
-        tg_message = (
-            f"hot-md-curate ({'apply' if apply_mode else 'report'}) — {today_str}\n"
-            + "\n".join(tg_lines)
-            + f"\n{totals_line} REVIEW-DUE={len(review_due)}"
-        )
-        if review_due:
-            tg_message += "\n" + "\n".join(review_due)
-        if review_warnings:
-            tg_message += "\n" + "\n".join(review_warnings)
         try:
-            resp = send_telegram(tg_message)
-            print(f"Telegram response: {resp}")
-        except Exception as e:
-            print(f"Telegram send failed: {e}", file=sys.stderr)
+            response = send_telegram(exception_message(today_str, safety_exceptions, report_path))
+            print(f"Telegram response: {response}")
+        except Exception as exc:
+            print(f"Telegram send failed: {exc}", file=sys.stderr)
+
+    return 1 if safety_exceptions else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

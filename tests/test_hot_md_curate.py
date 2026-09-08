@@ -277,3 +277,241 @@ def test_telegram_credentials_loaded_from_environment(monkeypatch):
     module = _load_curate_module("hot_md_curate_with_env")
     assert module.TELEGRAM_BOT_TOKEN == "fake-token-for-test"
     assert module.TELEGRAM_CHAT_ID == "fake-chat-id-for-test"
+
+
+# --- hot-md-curate-exception-only-selfheal-v2: bounded retry and final-state
+# notification authority. ---
+
+
+def _write_hot_target(root, rel_path="hot.md", *, extra="", bullet_count=6):
+    target = root / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    bullets = "\n".join(f"- shipped exact block {i}" for i in range(bullet_count))
+    target.write_text(
+        "---\nupdated: '2026-01-01'\n---\n"
+        "## Last session shipped\n"
+        f"{bullets}\n\n"
+        "## In flight\n- current work\n\n"
+        f"{extra}"
+    )
+    return target
+
+
+def _configure_single_target(curate, monkeypatch, tmp_path, rel_path="hot.md"):
+    monkeypatch.setattr(curate, "TARGETS", [rel_path])
+    monkeypatch.setattr(curate, "BACKUP_ROOT", str(tmp_path / "backups"))
+    monkeypatch.setattr(curate, "LOCK_FILE", str(tmp_path / "curate.lock"))
+
+
+def test_recent_mtime_cron_retry_applies_and_does_not_notify_before_retry(
+    curate, tmp_path, monkeypatch
+):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(tmp_path)
+    monkeypatch.setattr(curate, "MTIME_GUARD_SECONDS", 10)
+    monkeypatch.setattr(curate, "CRON_RETRY_MARGIN_SECONDS", 1)
+    monkeypatch.setattr(curate, "CRON_RETRY_LIMIT_SECONDS", 30)
+
+    fake_now = [1_000.0]
+    os.utime(target, (995.0, 995.0))
+    notifications = []
+
+    def clock():
+        return fake_now[0]
+
+    def sleep(seconds):
+        assert notifications == []
+        fake_now[0] += seconds
+
+    real_apply = curate.apply_with_bounded_retry
+    captured = []
+
+    def run_with_fake_time(vault_root, today_str, invoked_by_cron):
+        outcome = real_apply(
+            vault_root, today_str, invoked_by_cron, clock=clock, sleep=sleep
+        )
+        captured.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(curate, "apply_with_bounded_retry", run_with_fake_time)
+    monkeypatch.setattr(
+        curate, "send_telegram", lambda message: notifications.append(message) or "ok"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT_PATH), "--apply", "--from-cron", "--vault-root", str(tmp_path)],
+    )
+
+    assert curate.main() == 0
+    attempts, final_apply, failures = captured[0]
+
+    assert len(attempts) == 2
+    assert attempts[0][0]["mtime_skipped"] is True
+    assert final_apply[0]["changed"] is True
+    assert failures == []
+    assert notifications == []
+    assert "- shipped exact block 0" not in target.read_text()
+    assert "- shipped exact block 0" in (tmp_path / "hot-archive/2026-09.md").read_text()
+
+
+def test_second_apply_is_idempotent_and_archive_is_lossless(curate, tmp_path, monkeypatch):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(tmp_path, bullet_count=7)
+    old_time = time.time() - curate.MTIME_GUARD_SECONDS - 1
+    os.utime(target, (old_time, old_time))
+
+    original_blocks = [f"- shipped exact block {i}" for i in range(2)]
+    first = curate.process_target(str(tmp_path), "hot.md", True, "2026-09-09", time.time())
+    archive = tmp_path / "hot-archive/2026-09.md"
+    archive_after_first = archive.read_bytes()
+    target_after_first = target.read_bytes()
+
+    os.utime(target, (old_time, old_time))
+    second = curate.process_target(str(tmp_path), "hot.md", True, "2026-09-09", time.time())
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert target.read_bytes() == target_after_first
+    assert archive.read_bytes() == archive_after_first
+    for block in original_blocks:
+        assert archive_after_first.count(block.encode()) == 1
+
+
+def test_continuing_edits_exhaust_bounded_retry(curate, tmp_path, monkeypatch):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(tmp_path)
+    monkeypatch.setattr(curate, "MTIME_GUARD_SECONDS", 10)
+    monkeypatch.setattr(curate, "CRON_RETRY_MARGIN_SECONDS", 1)
+    monkeypatch.setattr(curate, "CRON_RETRY_LIMIT_SECONDS", 12)
+    fake_now = [1_000.0]
+    os.utime(target, (995.0, 995.0))
+
+    def sleep_and_edit(seconds):
+        fake_now[0] += seconds
+        os.utime(target, (fake_now[0], fake_now[0]))
+
+    attempts, final_apply, failures = curate.apply_with_bounded_retry(
+        str(tmp_path),
+        "2026-09-09",
+        True,
+        clock=lambda: fake_now[0],
+        sleep=sleep_and_edit,
+    )
+
+    assert len(attempts) == 2
+    assert final_apply[0]["mtime_skipped"] is True
+    assert len(failures) == 1
+    assert failures[0].startswith("quiet-window retry exhausted")
+    assert "- shipped exact block 0" in target.read_text()
+
+
+def test_report_mode_is_verbose_and_does_not_touch_target_or_archive(
+    curate, tmp_path, monkeypatch
+):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(
+        tmp_path,
+        extra="## Historical notes\n" + ("old material " * 500) + "\n",
+    )
+    target.write_text(
+        target.read_text().replace(
+            "- current work",
+            "- blocked on `finished-blocker` shipping\n"
+            "- shipped `finished-item`\n"
+            + "- " + ("long routine diagnostic " * 20),
+        )
+    )
+    _write_spec_and_log(tmp_path, "finished-blocker", "## Status: pass\n")
+    _write_spec_and_log(tmp_path, "finished-item", "## Status: pass\n")
+    before = target.read_bytes()
+
+    result = curate.process_target(
+        str(tmp_path), "hot.md", False, "2026-09-09", time.time()
+    )
+
+    assert target.read_bytes() == before
+    assert not (tmp_path / "hot-archive").exists()
+    joined = "\n".join(result["report_lines"])
+    assert "NON-CANONICAL-SECTION" in joined
+    assert "to rotate to hot-archive/" in joined
+
+
+def test_routine_final_findings_and_review_due_send_zero_telegram(
+    curate, tmp_path, monkeypatch
+):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(
+        tmp_path,
+        extra="## Historical notes\n" + ("old material " * 500) + "\n",
+    )
+    target.write_text(
+        target.read_text().replace(
+            "- current work",
+            "- blocked on `finished-blocker` shipping\n"
+            "- shipped `finished-item`\n"
+            + "- " + ("long routine diagnostic " * 20),
+        )
+    )
+    _write_spec_and_log(tmp_path, "finished-blocker", "## Status: pass\n")
+    _write_spec_and_log(tmp_path, "finished-item", "## Status: pass\n")
+    old_time = time.time() - curate.MTIME_GUARD_SECONDS - 1
+    os.utime(target, (old_time, old_time))
+    reviews = tmp_path / curate.SCHEDULED_REVIEWS_PATH
+    reviews.parent.mkdir(parents=True, exist_ok=True)
+    reviews.write_text("### bookkeeping\ndue: 2026-01-01\nstatus: pending\n")
+    sent = []
+    monkeypatch.setattr(curate, "send_telegram", lambda message: sent.append(message))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT_PATH), "--apply", "--from-cron", "--vault-root", str(tmp_path)],
+    )
+
+    assert curate.main() == 0
+    assert sent == []
+    report = (tmp_path / "BS 2nd Brain/Alcove/Infrastructure/hot-md-reports/2026-09-09.md").read_text()
+    assert "OVER-BUDGET-AT-FLOOR" in report
+    assert "STALE-BLOCKER: finished-blocker" in report
+    assert "RESOLVED: finished-item" in report
+    assert "LONG-BULLET" in report
+    assert "REVIEW DUE: bookkeeping" in report
+
+
+@pytest.mark.parametrize("failure", ["archive", "backup", "parse"])
+def test_true_safety_failure_sends_exactly_one_exception_message(
+    curate, tmp_path, monkeypatch, failure
+):
+    _configure_single_target(curate, monkeypatch, tmp_path)
+    target = _write_hot_target(tmp_path)
+    old_time = time.time() - curate.MTIME_GUARD_SECONDS - 1
+    os.utime(target, (old_time, old_time))
+
+    if failure == "archive":
+        monkeypatch.setattr(
+            curate,
+            "append_archive_losslessly",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fixture archive failure")),
+        )
+    elif failure == "backup":
+        monkeypatch.setattr(
+            curate,
+            "backup_targets",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fixture backup failure")),
+        )
+    else:
+        target.write_text("---\nunterminated frontmatter\n## Last session shipped\n- item\n")
+
+    sent = []
+    monkeypatch.setattr(curate, "send_telegram", lambda message: sent.append(message) or "ok")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(SCRIPT_PATH), "--apply", "--from-cron", "--vault-root", str(tmp_path)],
+    )
+
+    assert curate.main() == 1
+    assert len(sent) == 1
+    assert "integrity exception" in sent[0]
+    assert "Chars:" not in sent[0]
+    assert "REVIEW-DUE" not in sent[0]
