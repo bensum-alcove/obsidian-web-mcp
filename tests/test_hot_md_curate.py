@@ -151,6 +151,11 @@ def test_non_canonical_section_flagged(curate):
     assert not any("What's current" in l for l in report)
 
 
+def test_distinct_canonical_suffix_variants_are_not_parse_corruption(curate):
+    text = "## Parked / considered and rejected\n- one\n## Parked (with CEO sign-off)\n- two\n"
+    assert curate.structure_safety_errors(text, curate.parse_sections(text.splitlines()), "hot.md") == []
+
+
 def _write_spec_and_log(vault_root, candidate, status_text):
     (vault_root / "Personal/Build Orchestrator/specs").mkdir(parents=True, exist_ok=True)
     (vault_root / "Personal/Build Orchestrator/specs" / f"{candidate}.md").write_text("spec")

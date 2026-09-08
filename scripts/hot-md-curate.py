@@ -446,23 +446,25 @@ def structure_safety_errors(text, sections, rel_path):
     """Return only ambiguities that make deterministic mutation unsafe.
 
     Ordinary non-canonical sections remain diagnostics. An unterminated
-    frontmatter block or two headings claiming the same canonical section is
-    different: continuing would make line ownership ambiguous, so apply mode
-    must leave the target untouched and surface one integrity exception.
+    frontmatter block or an exactly duplicated canonical heading is different:
+    continuing would make line ownership ambiguous, so apply mode must leave
+    the target untouched and surface one integrity exception. Distinct allowed
+    suffix variants (for example two differently-qualified Parked sections)
+    remain valid.
     """
     errors = []
     if text.startswith("---\n") and FRONTMATTER_RE.match(text) is None:
         errors.append(f"{rel_path}: malformed or unterminated YAML frontmatter")
 
-    for prefix in CANONICAL_SECTIONS:
-        matches = [
-            sec for sec in sections
-            if sec["level"] == 2
-            and sec["heading"].strip().lower().startswith(prefix)
-        ]
-        if len(matches) > 1:
+    canonical_headings = [
+        sec["heading"].strip().lower()
+        for sec in sections
+        if sec["level"] == 2 and is_canonical_section(sec["heading"])
+    ]
+    for heading in sorted(set(canonical_headings)):
+        if canonical_headings.count(heading) > 1:
             errors.append(
-                f"{rel_path}: duplicate canonical section for {prefix!r} blocks safe curation"
+                f"{rel_path}: duplicate canonical section {heading!r} blocks safe curation"
             )
     return errors
 
