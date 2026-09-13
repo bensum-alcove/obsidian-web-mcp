@@ -361,11 +361,13 @@ def _schedule_text(vault):
     return (vault / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml").read_text()
 
 
-def _inert_spec_markdown(build_id="scratch-inert"):
+def _inert_spec_markdown(build_id="scratch-inert", depends_on=None):
+    deps = [] if depends_on is None else depends_on
     return (
         f"---\nbuild_id: {build_id}\ntier: simple\nproject: edge-trading-system\n"
         "status: ready\nrisk_domain: observability\nblast_radius: single-component\n"
-        "reversible: true\nshadowable: true\ndeployment_intent: required\n---\n\n"
+        "reversible: true\nshadowable: true\ndeployment_intent: required\n"
+        f"depends_on: {deps}\n---\n\n"
         f"# {build_id} — t\n\ndo the thing\n"
     )
 
@@ -430,6 +432,29 @@ def test_schedule_with_comments_frontmatter_and_heading_remains_parseable(monkey
     entries = schedule_builds_from_content(content, source_name=SCHEDULE_PATH)
     assert entries is not None
     assert entries[0]["id"] == "scratch-1"
+
+
+def test_empty_flow_list_preserves_trailing_yaml_and_comments(monkeypatch, vault_dir):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    sched_dir = vault_dir / "Personal" / "Build Orchestrator" / "schedules"
+    sched_dir.mkdir(parents=True)
+    seed = (
+        "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
+        "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n"
+        "# 2026-W99 — scratch\n\n"
+        "builds: []\n"
+        "# trailing operator comment\n"
+        "notes: keep-this-sibling-key\n"
+    )
+    (sched_dir / "2026-W99-scratch.yaml").write_text(seed)
+    result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    content = (sched_dir / "2026-W99-scratch.yaml").read_text()
+    assert "trailing operator comment" in content
+    assert "notes: keep-this-sibling-key" in content
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(content, source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["scratch-1"]
 
 
 def test_malformed_schedule_fails_before_any_write(monkeypatch, vault_dir):
@@ -539,6 +564,43 @@ def test_activate_existing_spec_binds_one_inert_spec(monkeypatch, empty_flow_sch
     entries = schedule_builds_from_content(_schedule_text(empty_flow_schedule), source_name=SCHEDULE_PATH)
     matching = [e for e in entries if e.get("id") == "scratch-inert"]
     assert len(matching) == 1
+
+
+def test_create_build_persists_depends_on_on_spec(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    result = json.loads(bo.bo_create_build(_build("scratch-dep", depends_on=["upstream-1"]), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    spec = (empty_flow_schedule / "Personal/Build Orchestrator/specs/scratch-dep.md").read_text()
+    parsed = __import__("frontmatter").loads(spec)
+    assert parsed.metadata.get("depends_on") == ["upstream-1"]
+
+
+def test_activate_existing_spec_refuses_missing_depends_on_contract(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    (specs_dir / "scratch-inert.md").write_text(
+        "---\nbuild_id: scratch-inert\ntier: simple\nproject: edge-trading-system\n"
+        "status: ready\n---\n\n# scratch-inert — t\n\ndo the thing\n"
+    )
+    seed = _schedule_text(empty_flow_schedule)
+    result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert "depends_on" in result["error"]
+    assert _schedule_text(empty_flow_schedule) == seed
+
+
+def test_activate_existing_spec_preserves_recorded_depends_on(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    (specs_dir / "scratch-inert.md").write_text(_inert_spec_markdown(depends_on=["upstream-1"]))
+    result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(_schedule_text(empty_flow_schedule), source_name=SCHEDULE_PATH)
+    matching = [e for e in entries if e.get("id") == "scratch-inert"]
+    assert matching[0]["depends_on"] == ["upstream-1"]
 
 
 def test_activate_existing_spec_refuses_missing_ambiguous_already_bound_and_raw_yaml(monkeypatch, empty_flow_schedule):
