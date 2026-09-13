@@ -183,8 +183,21 @@ def compose_schedule_document(existing_content: str, new_entry_texts: list[str],
         prefix = existing_content.rstrip("\n")
         joiner = "\n\n" if prefix else ""
         return f"{prefix}{joiner}builds:\n\n{entry_block}"
+    # Replace only the empty builds *value* (`[]` or a null/absent block
+    # value). Keep every byte after that value -- trailing comments, extra
+    # top-level YAML keys, and heading-adjacent prose must survive.
     prefix = existing_content[: match.start()]
-    return prefix + "builds:\n\n" + entry_block
+    after_key = existing_content[match.end():]
+    after_empty_value = re.sub(
+        r"^[ \t]*(?:\[[ \t]*\]|~|null|Null|NULL)?[ \t]*",
+        "",
+        after_key,
+        count=1,
+    )
+    suffix = after_empty_value.lstrip(" \t")
+    if suffix.startswith("\n"):
+        suffix = suffix[1:]
+    return prefix + "builds:\n\n" + entry_block + suffix
 
 
 def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str) -> dict:
@@ -219,6 +232,11 @@ def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str)
     for required in ("tier", "project"):
         if not fm.get(required):
             raise BOToolError(f"existing spec at {spec_path!r} is missing required field {required!r}")
+    if "depends_on" not in fm:
+        raise BOToolError(
+            f"existing spec at {spec_path!r} does not record depends_on; "
+            "refusing to invent an empty dependency list"
+        )
     build = {
         "build_id": build_id,
         "title": title,
@@ -344,6 +362,13 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
             for field_name in ("resources", "review_gate"):
                 if b.get(field_name) is not None:
                     spec_text = update_frontmatter_field(spec_text, field_name, b[field_name], require_existing=False)
+            # Persist depends_on onto the spec so a later schedule-only
+            # activation can recover the scheduling contract instead of
+            # inventing []. Always write the field, including an explicit
+            # empty list.
+            spec_text = update_frontmatter_field(
+                spec_text, "depends_on", b.get("depends_on") or [], require_existing=False,
+            )
             rendered[b["build_id"]]["spec"] = spec_text
 
         # `resources` also belongs on the schedule entry itself (the resource-
