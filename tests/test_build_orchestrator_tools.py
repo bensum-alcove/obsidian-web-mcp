@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from obsidian_vault_mcp import bo_contract, config
-from obsidian_vault_mcp.models import BOCreateBuildInput, BOCreateChainInput
+from obsidian_vault_mcp.models import BOCreateBuildInput, BOCreateChainInput, BOActivateExistingSpecInput
 from obsidian_vault_mcp.tools import build_orchestrator as bo
 
 SCHEDULE_PATH = "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
@@ -24,6 +24,14 @@ SCHEDULE_PATH = "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
 SCHEDULE_SEED = (
     "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
     "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n# 2026-W99 — scratch\n\nbuilds:\n"
+)
+
+# Exact live failure shape: a flow-style empty sequence, not a block key with
+# no items. String-splicing a `  - id:` fragment after `builds: []` is not a
+# valid YAML document.
+EMPTY_FLOW_SCHEDULE_SEED = (
+    "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
+    "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n# 2026-W99 — scratch\n\nbuilds: []\n"
 )
 
 
@@ -64,6 +72,14 @@ def seeded_schedule(vault_dir):
     sched_dir = vault_dir / "Personal" / "Build Orchestrator" / "schedules"
     sched_dir.mkdir(parents=True)
     (sched_dir / "2026-W99-scratch.yaml").write_text(SCHEDULE_SEED)
+    return vault_dir
+
+
+@pytest.fixture
+def empty_flow_schedule(vault_dir):
+    sched_dir = vault_dir / "Personal" / "Build Orchestrator" / "schedules"
+    sched_dir.mkdir(parents=True)
+    (sched_dir / "2026-W99-scratch.yaml").write_text(EMPTY_FLOW_SCHEDULE_SEED)
     return vault_dir
 
 
@@ -115,6 +131,27 @@ def test_create_build_writes_spec_then_schedule(monkeypatch, seeded_schedule):
     assert "id: scratch-1" in schedule_content
     assert result["created"][0]["spec_path"] == "Personal/Build Orchestrator/specs/scratch-1.md"
     assert result["activation"]["schedule_path"] == SCHEDULE_PATH
+
+
+def test_create_build_on_existing_empty_flow_list_schedule(monkeypatch, empty_flow_schedule):
+    """Reproduce the 2026-09-13 live failure: an existing schedule whose
+    `builds:` value is the flow-style empty list `[]` must re-parse as a
+    single valid YAML document containing exactly one new schedule entry.
+    """
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    spec_file = empty_flow_schedule / "Personal/Build Orchestrator/specs/scratch-1.md"
+    assert spec_file.exists()
+    schedule_content = (
+        empty_flow_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    ).read_text()
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(schedule_content, source_name=SCHEDULE_PATH)
+    assert entries is not None, result
+    matching = [e for e in entries if isinstance(e, dict) and e.get("id") == "scratch-1"]
+    assert len(matching) == 1
+    assert "builds: []" not in schedule_content
 
 
 def test_create_build_writes_nothing_when_validation_fails(monkeypatch, seeded_schedule):
@@ -295,6 +332,7 @@ def test_bo_create_build_python_function_no_longer_accepts_mode():
     import inspect
     assert "mode" not in inspect.signature(bo.bo_create_build).parameters
     assert "mode" not in inspect.signature(bo.bo_create_chain).parameters
+    assert "mode" not in inspect.signature(bo.bo_activate_existing_spec).parameters
 
 
 def test_bo_create_build_always_validates_strict_new_even_for_legacy_shaped_build(monkeypatch, seeded_schedule):
@@ -312,4 +350,250 @@ def test_bo_create_build_always_validates_strict_new_even_for_legacy_shaped_buil
     result = json.loads(bo.bo_create_build(legacy_build, SCHEDULE_PATH))
     assert captured["mode"] == "strict_new"
     assert result["ok"] is False
+
+
+# --------------------------------------------------------------------------
+# Empty-schedule document construction + shared builder + activation recovery
+# --------------------------------------------------------------------------
+
+
+def _schedule_text(vault):
+    return (vault / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml").read_text()
+
+
+def _inert_spec_markdown(build_id="scratch-inert"):
+    return (
+        f"---\nbuild_id: {build_id}\ntier: simple\nproject: edge-trading-system\n"
+        "status: ready\nrisk_domain: observability\nblast_radius: single-component\n"
+        "reversible: true\nshadowable: true\ndeployment_intent: required\n---\n\n"
+        f"# {build_id} — t\n\ndo the thing\n"
+    )
+
+
+def test_create_build_and_create_chain_share_one_schedule_document_builder():
+    import inspect
+    assert "compose_schedule_document" in inspect.getsource(bo._activate)
+    assert "_activate" in inspect.getsource(bo.bo_create_build)
+    assert "_activate" in inspect.getsource(bo.bo_create_chain)
+    assert "_activate" in inspect.getsource(bo.bo_activate_existing_spec)
+
+
+def test_create_chain_on_empty_flow_list_writes_all_entries_in_order(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    result = json.loads(bo.bo_create_chain([_build("chain-a"), _build("chain-b")], SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(_schedule_text(empty_flow_schedule), source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["chain-a", "chain-b"]
+    assert "builds: []" not in _schedule_text(empty_flow_schedule)
+
+
+def test_nonempty_schedule_append_preserves_existing_bytes_apart_from_new_entries(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    original = (
+        SCHEDULE_SEED.rstrip("\n") + "\n"
+        "  - id: existing-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/existing-build.md\n"
+        "    project: edge-trading-system\n"
+    )
+    sched_path.write_text(original)
+    result = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    updated = sched_path.read_text()
+    assert updated.startswith(original.rstrip("\n"))
+    assert "id: scratch-1" in updated
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(updated, source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["existing-build", "scratch-1"]
+
+
+def test_schedule_with_comments_frontmatter_and_heading_remains_parseable(monkeypatch, vault_dir):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    sched_dir = vault_dir / "Personal" / "Build Orchestrator" / "schedules"
+    sched_dir.mkdir(parents=True)
+    seed = (
+        "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
+        "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n"
+        "# 2026-W99 — scratch\n\n"
+        "> operator note: keep this heading and comment\n\n"
+        "builds: []\n"
+    )
+    (sched_dir / "2026-W99-scratch.yaml").write_text(seed)
+    result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    content = (sched_dir / "2026-W99-scratch.yaml").read_text()
+    assert "type: schedule" in content
+    assert "# 2026-W99 — scratch" in content
+    assert "operator note: keep this heading and comment" in content
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(content, source_name=SCHEDULE_PATH)
+    assert entries is not None
+    assert entries[0]["id"] == "scratch-1"
+
+
+def test_malformed_schedule_fails_before_any_write(monkeypatch, vault_dir):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    sched_dir = vault_dir / "Personal" / "Build Orchestrator" / "schedules"
+    sched_dir.mkdir(parents=True)
+    (sched_dir / "2026-W99-scratch.yaml").write_text(
+        "---\ntype: schedule\nproject: edge-trading-system\n---\n\nbuilds: [\n"
+    )
+    result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert result["activated"] is False
+    assert "malformed" in result["error"]
+    assert not (vault_dir / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert (sched_dir / "2026-W99-scratch.yaml").read_text().endswith("builds: [\n")
+
+
+def test_adapter_duplicate_id_mixed_project_cycle_and_review_gate_still_fail_closed(monkeypatch, seeded_schedule):
+    cases = [
+        "duplicate_id_in_graph",
+        "terminal_id_reuse",
+        "mixed_project_schedule",
+        "dependency_cycle",
+        "bad_review_gate_field",
+    ]
+    for code in cases:
+        monkeypatch.setattr(
+            bo_contract, "validate_graph",
+            lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None, code=code: {
+                "ok": False, "errors": [{"code": code, "message": "x"}], "warnings": [],
+            },
+        )
+        result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+        assert result["ok"] is False, code
+        assert result["activated"] is False, code
+        assert result["errors"][0]["code"] == code
+        assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+        assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
+
+
+def test_simulated_spec_write_failure_does_not_mutate_schedule(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+
+    def fail_spec_write(path, content, **kwargs):
+        if "specs" in path:
+            raise OSError("simulated spec write failure")
+        raise AssertionError(f"schedule write must not be attempted after spec failure: {path}")
+
+    monkeypatch.setattr(bo, "write_file_atomic", fail_spec_write)
+    result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert result["activated"] is False
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
+
+
+def test_create_does_not_duplicate_id_already_in_schedule_without_spec(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    original = (
+        SCHEDULE_SEED.rstrip("\n") + "\n"
+        "  - id: scratch-1\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/scratch-1.md\n"
+        "    project: edge-trading-system\n"
+    )
+    sched_path.write_text(original)
+    result = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert "already-bound" in result["error"]
+    assert sched_path.read_text() == original
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+
+
+def test_create_retry_does_not_duplicate_already_bound_entry(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    first = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert first["ok"] is True
+    after_first = _schedule_text(seeded_schedule)
+    retry = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert retry["ok"] is False
+    assert retry["activated"] is False
+    assert _schedule_text(seeded_schedule) == after_first
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(after_first, source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries].count("scratch-1") == 1
+
+
+def test_validate_build_graph_remains_read_only_on_empty_flow_schedule(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    result = json.loads(bo.bo_validate_build_graph([_build()], SCHEDULE_PATH))
+    assert result["ok"] is True
+    assert not (empty_flow_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert _schedule_text(empty_flow_schedule) == EMPTY_FLOW_SCHEDULE_SEED
+
+
+def test_activate_existing_spec_binds_one_inert_spec(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    spec_path = specs_dir / "scratch-inert.md"
+    original = _inert_spec_markdown()
+    spec_path.write_text(original)
+    result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    assert spec_path.read_text() == original
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(_schedule_text(empty_flow_schedule), source_name=SCHEDULE_PATH)
+    matching = [e for e in entries if e.get("id") == "scratch-inert"]
+    assert len(matching) == 1
+
+
+def test_activate_existing_spec_refuses_missing_ambiguous_already_bound_and_raw_yaml(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    missing = json.loads(bo.bo_activate_existing_spec("no-such-spec", SCHEDULE_PATH))
+    assert missing["ok"] is False
+    assert "missing spec" in missing["error"]
+
+    ambiguous = json.loads(bo.bo_activate_existing_spec(
+        "scratch-inert", SCHEDULE_PATH, spec_path="Personal/Build Orchestrator/specs/other.md",
+    ))
+    assert ambiguous["ok"] is False
+    assert "ambiguous" in ambiguous["error"]
+
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    (specs_dir / "scratch-inert.md").write_text(_inert_spec_markdown())
+    first = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert first["ok"] is True, first
+    after = _schedule_text(empty_flow_schedule)
+    retry = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert retry["ok"] is False
+    assert "already-bound" in retry["error"]
+    assert _schedule_text(empty_flow_schedule) == after
+
+    with pytest.raises(Exception):
+        BOActivateExistingSpecInput(
+            build_id="scratch-inert",
+            schedule_path=SCHEDULE_PATH,
+            raw_yaml="builds: []",
+        )
+    with pytest.raises(Exception):
+        BOActivateExistingSpecInput(
+            build_id="scratch-inert",
+            schedule_path=SCHEDULE_PATH,
+            mode="compat_existing",
+        )
+
+
+def test_activate_existing_spec_rejects_adapter_fail_closed_classes(monkeypatch, empty_flow_schedule):
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    (specs_dir / "scratch-inert.md").write_text(_inert_spec_markdown())
+    seed = _schedule_text(empty_flow_schedule)
+    for code in ("terminal_id_reuse", "mixed_project_schedule", "dependency_cycle", "bad_review_gate_field"):
+        monkeypatch.setattr(
+            bo_contract, "validate_graph",
+            lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None, code=code: {
+                "ok": False, "errors": [{"code": code, "message": "x"}], "warnings": [],
+            },
+        )
+        result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+        assert result["ok"] is False, code
+        assert result["activated"] is False, code
+        assert result["errors"][0]["code"] == code
+        assert _schedule_text(empty_flow_schedule) == seed
+        assert (specs_dir / "scratch-inert.md").exists()
 

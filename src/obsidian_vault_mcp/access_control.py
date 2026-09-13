@@ -57,6 +57,7 @@ TOOL_ACCESS_CLASS: dict[str, AccessClass] = {
     "vault_batch_str_replace": AccessClass.MUTATION,
     "bo_create_build": AccessClass.MUTATION,
     "bo_create_chain": AccessClass.MUTATION,
+    "bo_activate_existing_spec": AccessClass.MUTATION,
 }
 
 

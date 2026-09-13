@@ -25,6 +25,10 @@ SCHEDULE_SEED = (
     "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
     "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n# 2026-W99 — scratch\n\nbuilds:\n"
 )
+EMPTY_FLOW_SCHEDULE_SEED = (
+    "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
+    "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n# 2026-W99 — scratch\n\nbuilds: []\n"
+)
 
 
 @pytest.fixture
@@ -143,3 +147,75 @@ def test_real_bad_review_gate_shape_rejected_with_no_writes(seeded_schedule):
     assert result["ok"] is False
     assert any(e["code"] == "bad_review_gate_field" for e in result["errors"])
     assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-badgate.md").exists()
+
+
+def test_real_empty_flow_list_schedule_creates_exactly_one_entry(seeded_schedule):
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    sched_path.write_text(EMPTY_FLOW_SCHEDULE_SEED)
+    build = _build("scratch-real-e2e-empty-flow")
+    created = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert created["ok"] is True, created
+    content = sched_path.read_text()
+    entries = schedule_builds_from_content(content, source_name=SCHEDULE_PATH)
+    matching = [e for e in entries if e["id"] == "scratch-real-e2e-empty-flow"]
+    assert len(matching) == 1
+    assert "builds: []" not in content
+
+
+def test_real_empty_flow_list_chain_writes_entries_in_order(seeded_schedule):
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    sched_path.write_text(EMPTY_FLOW_SCHEDULE_SEED)
+    b1 = _build("scratch-real-e2e-empty-a")
+    b2 = _build("scratch-real-e2e-empty-b", depends_on=["scratch-real-e2e-empty-a"])
+    result = json.loads(bo.bo_create_chain([b1, b2], SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    entries = schedule_builds_from_content(sched_path.read_text(), source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["scratch-real-e2e-empty-a", "scratch-real-e2e-empty-b"]
+
+
+def test_real_nonempty_schedule_still_appends(seeded_schedule):
+    first = json.loads(bo.bo_create_build(_build("scratch-real-e2e-nonempty-1"), SCHEDULE_PATH))
+    assert first["ok"] is True, first
+    second = json.loads(bo.bo_create_build(_build("scratch-real-e2e-nonempty-2"), SCHEDULE_PATH))
+    assert second["ok"] is True, second
+    entries = schedule_builds_from_content(
+        (seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml").read_text(),
+        source_name=SCHEDULE_PATH,
+    )
+    assert [e["id"] for e in entries] == [
+        "scratch-real-e2e-nonempty-1",
+        "scratch-real-e2e-nonempty-2",
+    ]
+
+
+def test_real_activate_existing_spec_on_empty_flow_schedule(seeded_schedule):
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    sched_path.write_text(EMPTY_FLOW_SCHEDULE_SEED)
+    build = _build("scratch-real-e2e-activate")
+    created = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert created["ok"] is True, created
+    spec_path = seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-activate.md"
+    spec_text = spec_path.read_text()
+    sched_path.write_text(EMPTY_FLOW_SCHEDULE_SEED)
+    result = json.loads(bo.bo_activate_existing_spec("scratch-real-e2e-activate", SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    assert spec_path.read_text() == spec_text
+    entries = schedule_builds_from_content(sched_path.read_text(), source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["scratch-real-e2e-activate"]
+
+
+def test_real_mixed_project_on_existing_schedule_fails_closed(seeded_schedule):
+    sched_path = seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
+    sched_path.write_text(
+        "---\ntags:\n  - orchestrator\n  - schedule\ntype: schedule\nweek: '2026-W99'\n"
+        "project: edge-trading-system\ncreated: '2026-08-17'\n---\n\n# 2026-W99 — scratch\n\nbuilds:\n"
+        "  - id: existing-other-project\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n"
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/existing-other-project.md\n"
+        "    project: mcp-infrastructure\n"
+    )
+    original = sched_path.read_text()
+    result = json.loads(bo.bo_create_build(_build("scratch-real-e2e-mixed"), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert any(e["code"] == "mixed_project_schedule" for e in result.get("errors", [])), result
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-mixed.md").exists()
+    assert sched_path.read_text() == original

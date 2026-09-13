@@ -714,6 +714,33 @@ class BOCreateChainInput(BaseModel):
     )
 
 
+class BOActivateExistingSpecInput(BaseModel):
+    """Activate one already-written inert spec onto an existing schedule.
+
+    Identity-only: no raw YAML, no schedule-entry dict, no DB mutation. If
+    spec_path is supplied it must equal the canonical specs/{build_id}.md path.
+    Always validated strict_new -- see BOCreateBuildInput.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    build_id: str = Field(
+        ...,
+        description="Build id of an already-written spec to activate; canonical spec path is derived from this id",
+        min_length=1,
+        max_length=200,
+    )
+    schedule_path: str = Field(
+        ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
+    )
+    spec_path: str | None = Field(
+        default=None,
+        description="Optional vault-relative spec path; if given, must match Personal/Build Orchestrator/specs/{build_id}.md",
+        min_length=1,
+        max_length=500,
+    )
+
+
 class VaultReadSmartInput(BaseModel):
     """Read only the relevant sections of a large file by semantic similarity."""
 

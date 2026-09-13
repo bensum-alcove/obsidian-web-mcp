@@ -32,6 +32,7 @@ KNOWN_MUTATION_TOOLS = {
     "vault_batch_str_replace",
     "bo_create_build",
     "bo_create_chain",
+    "bo_activate_existing_spec",
 }
 
 KNOWN_READ_TOOLS = {
