@@ -154,7 +154,7 @@ VAULT_MUTATION_LEDGER_MAX_BYTES = int(os.environ.get("VAULT_MUTATION_LEDGER_MAX_
 VAULT_MUTATION_LEDGER_BACKUP_COUNT = int(os.environ.get("VAULT_MUTATION_LEDGER_BACKUP_COUNT", "10"))
 
 # Build Orchestrator authoring contract adapter (vault-bo-authoring-mcp-v1). The
-# bo_validate_build_graph/bo_create_build/bo_create_chain tools invoke this CLI as
+# bo_validate_build_graph/bo_create_build/bo_create_chain/bo_activate_existing_spec tools invoke this CLI as
 # a subprocess (shell=False, JSON stdin/stdout) rather than re-encoding BO schema
 # rules in this repo -- see bo_contract.py. Absent/wrong-version/failing adapter
 # means those tools fail closed (no schedule activation), by design.

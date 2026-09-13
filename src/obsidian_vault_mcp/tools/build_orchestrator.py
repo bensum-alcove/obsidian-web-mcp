@@ -1,10 +1,13 @@
 """Build Orchestrator authoring tools (vault-bo-authoring-mcp-v1).
 
-bo_validate_build_graph / bo_create_build / bo_create_chain. All three delegate
-BO schema validation and rendering entirely to the authoring contract adapter
-(bo_contract.py -> authoring_contract.py's JSON CLI) -- this module only:
+bo_validate_build_graph / bo_create_build / bo_create_chain /
+bo_activate_existing_spec. All four delegate BO schema validation and
+rendering entirely to the authoring contract adapter (bo_contract.py ->
+authoring_contract.py's JSON CLI) -- this module only:
 
   - shapes typed tool inputs into the adapter's node/spec JSON shape,
+  - constructs one valid YAML schedule document (never string-splices an
+    entry after a flow-style empty `builds: []`),
   - enforces the write ordering invariant (validate the whole graph -> write
     every new spec -> write/replace the schedule last, as the activation
     boundary), so a pre-schedule failure leaves any already-written spec
@@ -13,18 +16,17 @@ BO schema validation and rendering entirely to the authoring contract adapter
   - fails closed if the adapter is unavailable or a schema-version mismatch is
     detected (bo_contract.BOContractError) -- never guesses at validity.
 
-v1 is create-only, matching the plan's scope (no bo_update_build): builds are
-appended to an EXISTING schedule file, never created fresh -- the exact,
-already-proven append operation build_generator.generate_build() uses
-(a fully-rendered, structured YAML entry block appended after the existing
-content, then the whole result re-parsed and asserted correct before anything
-is written -- never hand-indented YAML).
+Create paths append to an EXISTING schedule file, never created fresh.
+bo_activate_existing_spec reuses the same prepare/compose/commit primitive
+to bind one already-written inert spec as the final schedule write only.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 
 import frontmatter
 import yaml
@@ -37,6 +39,8 @@ from ..vault import RevisionConflictError, conflict_payload, read_file, write_fi
 logger = logging.getLogger(__name__)
 
 REQUIRED_BUILD_FIELDS = ("build_id", "title", "body_markdown", "tier", "project")
+_BUILDS_KEY_RE = re.compile(r"^(builds\s*:)", re.MULTILINE)
+_SPEC_HEADING_RE = re.compile(r"^#\s+(?:.+?\s+[—-]\s+)?(.+)\s*$", re.MULTILINE)
 
 
 class BOToolError(Exception):
@@ -125,6 +129,115 @@ def _splice_schedule_entry_field(entry_text: str, field_name: str, value) -> str
     return "\n".join(out) + "\n"
 
 
+def _parse_existing_schedule(content: str, source_name: str) -> tuple[dict, list]:
+    """Parse one on-disk schedule through the canonical adapter parser.
+
+    Distinguishes malformed YAML (BOToolError, fail closed) from an empty
+    `builds` sequence (`[]`, null, or missing), which is a valid empty
+    document that the shared composer must rewrite as a block sequence.
+    """
+    try:
+        parsed = bo_contract.parse_schedule_document(content, source_name=source_name)
+    except ValueError as e:
+        raise BOToolError(f"malformed schedule {source_name}: {e}") from e
+    if not isinstance(parsed, dict):
+        raise BOToolError(f"malformed schedule {source_name}: document is not a mapping")
+    builds = parsed.get("builds")
+    if builds is None:
+        builds = []
+    elif not isinstance(builds, list):
+        raise BOToolError(f"malformed schedule {source_name}: builds is not a list")
+    return parsed, builds
+
+
+def compose_schedule_document(existing_content: str, new_entry_texts: list[str], *,
+                              source_name: str, new_ids: list[str] | None = None) -> str:
+    """Build one valid YAML schedule document containing the new entries.
+
+    Shared by bo_create_build, bo_create_chain, and bo_activate_existing_spec.
+    Empty sequences (`builds: []`, `builds:` with a null/missing value, or a
+    missing `builds:` key) are rewritten as a block `builds:` sequence --
+    never string-spliced after a flow-style empty list. Non-empty documents
+    keep existing bytes and append the new rendered entry fragments.
+    """
+    if not new_entry_texts:
+        raise BOToolError(f"compose_schedule_document requires at least one new entry for {source_name}")
+
+    _parsed, existing_builds = _parse_existing_schedule(existing_content, source_name)
+    existing_ids = {entry.get("id") for entry in existing_builds if isinstance(entry, dict)}
+    if new_ids:
+        overlap = existing_ids & set(new_ids)
+        if overlap:
+            raise BOToolError(
+                f"refusing to duplicate already-bound build id(s) in {source_name}: {sorted(overlap)}"
+            )
+
+    fragments = [text.rstrip("\n") for text in new_entry_texts]
+    entry_block = "\n\n".join(fragments) + "\n"
+
+    if existing_builds:
+        return existing_content.rstrip("\n") + "\n\n" + entry_block
+
+    match = _BUILDS_KEY_RE.search(existing_content)
+    if match is None:
+        prefix = existing_content.rstrip("\n")
+        joiner = "\n\n" if prefix else ""
+        return f"{prefix}{joiner}builds:\n\n{entry_block}"
+    prefix = existing_content[: match.start()]
+    return prefix + "builds:\n\n" + entry_block
+
+
+def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str) -> dict:
+    """Derive a typed build dict from an already-written spec.
+
+    Schedule-entry rendering still goes through the adapter via
+    `_prepare_graph`; this only copies identity/body fields the adapter
+    already understands. Refuses identity mismatch and a spec that cannot
+    supply the fields `_normalize_build` requires.
+    """
+    parsed = frontmatter.loads(spec_markdown)
+    fm = parsed.metadata or {}
+    body = (parsed.content or "").strip()
+    spec_build_id = fm.get("build_id")
+    if spec_build_id and spec_build_id != build_id:
+        raise BOToolError(
+            f"ambiguous spec identity: spec build_id {spec_build_id!r} != requested {build_id!r}"
+        )
+    stem = Path(spec_path).stem
+    if stem != build_id:
+        raise BOToolError(
+            f"ambiguous spec identity: spec filename stem {stem!r} != requested {build_id!r}"
+        )
+    title = fm.get("title")
+    if not title:
+        heading = _SPEC_HEADING_RE.search(parsed.content or "")
+        title = heading.group(1).strip() if heading else None
+    if not title:
+        raise BOToolError(f"existing spec at {spec_path!r} is missing a title")
+    if not body:
+        raise BOToolError(f"existing spec at {spec_path!r} is missing a body")
+    for required in ("tier", "project"):
+        if not fm.get(required):
+            raise BOToolError(f"existing spec at {spec_path!r} is missing required field {required!r}")
+    build = {
+        "build_id": build_id,
+        "title": title,
+        "body_markdown": body,
+        "tier": fm["tier"],
+        "project": fm["project"],
+        "status": fm.get("status") or "ready",
+        "depends_on": fm.get("depends_on") or [],
+    }
+    for optional in (
+        "description", "run_when", "risk_domain", "blast_radius", "reversible", "shadowable",
+        "capital_path", "engine", "notes", "program", "tags", "created", "completion_contract",
+        "deployment_intent", "resources", "review_gate",
+    ):
+        if fm.get(optional) is not None:
+            build[optional] = fm[optional]
+    return build
+
+
 def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[list[dict], str | None]:
     """Load every entry already in schedule_path's builds: list (excluding
     ids the caller is about to (re)supply) as additional graph nodes, each
@@ -136,11 +249,15 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
     because the existing entry was never part of the graph being checked
     (codex-review-bo-authoring-contract-v1, B2). Returns (nodes,
     schedule_project) -- schedule_project is None for a brand-new schedule.
+    Malformed existing content fails closed (BOToolError) rather than being
+    treated as an empty graph.
     """
     try:
         content, _ = read_file(schedule_path)
     except FileNotFoundError:
         return [], None
+
+    _parsed, existing_builds = _parse_existing_schedule(content, schedule_path)
 
     project = None
     try:
@@ -149,7 +266,7 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
         pass
 
     nodes = []
-    for entry in schedule_builds_from_content(content, source_name=schedule_path) or []:
+    for entry in existing_builds:
         if not isinstance(entry, dict) or entry.get("id") in new_build_ids:
             continue
         spec_path = entry.get("spec_path")
@@ -169,7 +286,8 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
     return nodes, project
 
 
-def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
+def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
+                   spec_markdown_overrides: dict[str, str] | None = None) -> dict:
     """Shape + render + validate a proposed graph. Never writes anything.
 
     Validates the COMPLETE resulting graph -- every entry already in
@@ -179,6 +297,11 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
     included in every cross-node check (duplicate id, mixed project,
     dependency/cycle) but evaluated leniently at the per-node level, via
     `bo_contract.validate_graph`'s `new_ids` parameter.
+
+    `spec_markdown_overrides` (used by bo_activate_existing_spec) replaces the
+    adapter-rendered spec body with the already-written on-disk spec so
+    validation inspects the artifact that will actually be activated, not a
+    re-render. Schedule-entry YAML still comes from the adapter renderer.
 
     Returns {"ok", "errors", "warnings", "nodes", "rendered", "version_info"}
     where "nodes"/"rendered" are only meaningful when "ok" is True, and
@@ -212,12 +335,16 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str) -> dict:
     # no BO validation logic locally; the spliced result is what validate_graph
     # below (and the eventual write) actually sees, so the adapter still has
     # the only word on whether the shape is valid.
+    overrides = spec_markdown_overrides or {}
     for b in normalized_builds:
-        spec_text = rendered[b["build_id"]]["spec"]
-        for field_name in ("resources", "review_gate"):
-            if b.get(field_name) is not None:
-                spec_text = update_frontmatter_field(spec_text, field_name, b[field_name], require_existing=False)
-        rendered[b["build_id"]]["spec"] = spec_text
+        if b["build_id"] in overrides:
+            rendered[b["build_id"]]["spec"] = overrides[b["build_id"]]
+        else:
+            spec_text = rendered[b["build_id"]]["spec"]
+            for field_name in ("resources", "review_gate"):
+                if b.get(field_name) is not None:
+                    spec_text = update_frontmatter_field(spec_text, field_name, b[field_name], require_existing=False)
+            rendered[b["build_id"]]["spec"] = spec_text
 
         # `resources` also belongs on the schedule entry itself (the resource-
         # aware scheduler reads locks from the schedule file, not the spec) --
@@ -280,16 +407,25 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     })
 
 
-def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
-    """Shared create path for bo_create_build (1 build) and bo_create_chain (N builds).
+def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
+              write_new_specs: bool = True,
+              spec_markdown_overrides: dict[str, str] | None = None) -> str:
+    """Shared create/activate path for bo_create_build, bo_create_chain, and
+    bo_activate_existing_spec.
 
     Always validates in "strict_new" mode -- `compat_existing` is a read-only
     audit/compatibility mode for the historical corpus and must not be
     caller-selectable on a path that writes new artifacts (B3: "compatibility
     mode is exposed on mutation tools ... allows new malformed artifacts").
+    Schedule-document construction always goes through compose_schedule_document.
+    When write_new_specs is False, specs must already exist and only the
+    schedule activation write is performed.
     """
     try:
-        prep = _prepare_graph(builds, schedule_path, "strict_new")
+        prep = _prepare_graph(
+            builds, schedule_path, "strict_new",
+            spec_markdown_overrides=spec_markdown_overrides,
+        )
     except BOToolError as e:
         return json.dumps({"ok": False, "error": str(e), "activated": False})
     except bo_contract.BOContractError as e:
@@ -303,17 +439,20 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
     # Refuse to silently overwrite an existing spec file -- even an orphaned
     # one never ingested as a task -- matching build_generator.generate_build()'s
     # established "refusing to overwrite existing spec" behaviour exactly.
-    for node in prep["nodes"]:
-        spec_path = node["schedule_entry"]["spec_path"]
-        try:
-            read_file(spec_path)
-        except FileNotFoundError:
-            continue
-        return json.dumps({
-            "ok": False,
-            "error": f"refusing to overwrite existing spec at {spec_path!r}",
-            "activated": False,
-        })
+    # Activation of an already-written spec inverts this: the spec must exist
+    # and is never rewritten.
+    if write_new_specs:
+        for node in prep["nodes"]:
+            spec_path = node["schedule_entry"]["spec_path"]
+            try:
+                read_file(spec_path)
+            except FileNotFoundError:
+                continue
+            return json.dumps({
+                "ok": False,
+                "error": f"refusing to overwrite existing spec at {spec_path!r}",
+                "activated": False,
+            })
 
     try:
         schedule_content, schedule_meta = read_file(schedule_path)
@@ -327,15 +466,20 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
             "activated": False,
         })
 
-    new_schedule_content = schedule_content
-    for node in prep["nodes"]:
-        entry_text = prep["rendered"][node["build_id"]]["schedule_entry"]
-        new_schedule_content = new_schedule_content.rstrip("\n") + "\n\n" + entry_text
+    new_ids = [node["build_id"] for node in prep["nodes"]]
+    new_entry_texts = [prep["rendered"][node["build_id"]]["schedule_entry"] for node in prep["nodes"]]
+    try:
+        new_schedule_content = compose_schedule_document(
+            schedule_content, new_entry_texts, source_name=schedule_path, new_ids=new_ids,
+        )
+    except BOToolError as e:
+        return json.dumps({"ok": False, "error": str(e), "activated": False})
 
     # Validate the fully-rendered result BEFORE writing anything -- a
     # half-written pair (spec written, schedule broken) is worse than writing
-    # neither. Structural self-check only (parses, every new id present) --
-    # not a second schema validator; BO semantics were already checked above.
+    # neither. Structural self-check only (parses, every new id present, no
+    # duplicate ids) -- not a second schema validator; BO semantics were
+    # already checked above.
     try:
         parsed_builds = schedule_builds_from_content(new_schedule_content, source_name=schedule_path)
     except bo_contract.BOContractError as e:
@@ -346,7 +490,14 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
             "error": "generated schedule content failed to re-parse before write -- refusing to write anything",
             "activated": False,
         })
-    parsed_ids = {b.get("id") for b in parsed_builds if isinstance(b, dict)}
+    parsed_id_list = [b.get("id") for b in parsed_builds if isinstance(b, dict)]
+    if len(parsed_id_list) != len(set(parsed_id_list)):
+        return json.dumps({
+            "ok": False,
+            "error": "generated schedule content would duplicate a build id -- refusing to write anything",
+            "activated": False,
+        })
+    parsed_ids = set(parsed_id_list)
     for node in prep["nodes"]:
         if node["build_id"] not in parsed_ids:
             return json.dumps({
@@ -357,15 +508,26 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
 
     created = []
     try:
-        for node in prep["nodes"]:
-            spec_path = node["schedule_entry"]["spec_path"]
-            write_file_atomic(spec_path, node["spec_markdown"], create_dirs=True, tool=tool_name)
-            created.append({
-                "build_id": node["build_id"],
-                "spec_path": spec_path,
-                "project": node["schedule_entry"].get("project"),
-                "depends_on": node["schedule_entry"].get("depends_on", []),
-            })
+        if write_new_specs:
+            for node in prep["nodes"]:
+                spec_path = node["schedule_entry"]["spec_path"]
+                write_file_atomic(spec_path, node["spec_markdown"], create_dirs=True, tool=tool_name)
+                created.append({
+                    "build_id": node["build_id"],
+                    "spec_path": spec_path,
+                    "project": node["schedule_entry"].get("project"),
+                    "depends_on": node["schedule_entry"].get("depends_on", []),
+                })
+        else:
+            created = [
+                {
+                    "build_id": node["build_id"],
+                    "spec_path": node["schedule_entry"]["spec_path"],
+                    "project": node["schedule_entry"].get("project"),
+                    "depends_on": node["schedule_entry"].get("depends_on", []),
+                }
+                for node in prep["nodes"]
+            ]
 
         is_new, size = write_file_atomic(
             schedule_path, new_schedule_content, create_dirs=False, tool=tool_name,
@@ -380,7 +542,7 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str) -> str:
             "ok": False,
             "error": str(e),
             "activated": False,
-            "orphaned_specs": [c["spec_path"] for c in created],
+            "orphaned_specs": [c["spec_path"] for c in created] if write_new_specs else [],
         }
         if isinstance(e, RevisionConflictError):
             payload.update(conflict_payload(e))
@@ -408,3 +570,44 @@ def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
     same request). Validates the whole graph, writes every spec, then appends
     all schedule entries in one final schedule write. Always strict_new -- see _activate."""
     return _activate(builds, schedule_path, "bo_create_chain")
+
+
+def bo_activate_existing_spec(build_id: str, schedule_path: str, spec_path: str | None = None) -> str:
+    """Activate one already-written inert spec onto an existing schedule.
+
+    Reuses `_activate` / `compose_schedule_document` -- no second state machine.
+    Derives the schedule entry from the spec, validates the full graph
+    strict_new, and performs only the final schedule write. Refuses missing
+    or ambiguous specs, already-bound ids, a missing schedule, and any path
+    that would rewrite the spec or accept raw YAML.
+    """
+    if not build_id or not isinstance(build_id, str):
+        return json.dumps({"ok": False, "error": "build_id is required", "activated": False})
+    canonical = _spec_path_for(build_id)
+    if spec_path and spec_path != canonical:
+        return json.dumps({
+            "ok": False,
+            "error": (
+                f"ambiguous spec identity: spec_path {spec_path!r} does not match "
+                f"canonical path {canonical!r} for build_id {build_id!r}"
+            ),
+            "activated": False,
+        })
+    resolved_spec_path = canonical
+    try:
+        spec_markdown, _ = read_file(resolved_spec_path)
+    except FileNotFoundError:
+        return json.dumps({
+            "ok": False,
+            "error": f"missing spec at {resolved_spec_path!r}",
+            "activated": False,
+        })
+    try:
+        build = _build_from_existing_spec(build_id, spec_markdown, resolved_spec_path)
+    except BOToolError as e:
+        return json.dumps({"ok": False, "error": str(e), "activated": False})
+    return _activate(
+        [build], schedule_path, "bo_activate_existing_spec",
+        write_new_specs=False,
+        spec_markdown_overrides={build_id: spec_markdown},
+    )

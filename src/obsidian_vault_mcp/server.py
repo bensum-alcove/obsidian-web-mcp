@@ -143,6 +143,7 @@ from .tools.build_orchestrator import (
     bo_validate_build_graph as _bo_validate_build_graph,
     bo_create_build as _bo_create_build,
     bo_create_chain as _bo_create_chain,
+    bo_activate_existing_spec as _bo_activate_existing_spec,
 )
 from .models import (
     VaultReadInput,
@@ -172,6 +173,7 @@ from .models import (
     BOValidateBuildGraphInput,
     BOCreateBuildInput,
     BOCreateChainInput,
+    BOActivateExistingSpecInput,
 )
 
 
@@ -662,11 +664,13 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     description=(
         "Create one new Build Orchestrator build: validates the full proposed graph (including every "
         "pre-existing entry already in schedule_path) against the authoritative BO authoring contract, "
-        "writes the new spec file, then appends its schedule entry to schedule_path (an EXISTING schedule "
-        "file -- this tool never creates a new schedule file) as the activation boundary. Writes nothing if "
-        "validation fails. Always validates strict_new (compat_existing is a read-only audit mode, not "
-        "selectable here). Delegates all BO schema/project/risk/dependency rules to the authoring-contract "
-        "adapter; fails closed (no writes) if that adapter is unavailable or reports a mismatched schema or "
+        "writes the new spec file, then writes a single valid YAML schedule document to schedule_path "
+        "(an EXISTING schedule file -- this tool never creates a new schedule file) as the activation "
+        "boundary. Empty `builds: []` schedules are rewritten as a block sequence; non-empty schedules "
+        "keep existing bytes and append the new entry. Writes nothing if validation fails. Always "
+        "validates strict_new (compat_existing is a read-only audit mode, not selectable here). "
+        "Delegates all BO schema/project/risk/dependency rules to the authoring-contract adapter; "
+        "fails closed (no writes) if that adapter is unavailable or reports a mismatched schema or "
         "contract version."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
@@ -683,8 +687,9 @@ def bo_create_build(build: dict, schedule_path: str) -> str:
         "Create a same-project multi-build chain in Build Orchestrator: validates the WHOLE proposed graph "
         "at once (forward references -- a later build's depends_on may name an earlier build in this same "
         "request -- are allowed, and every pre-existing entry already in schedule_path is included too) "
-        "against the authoring contract, writes every new spec file, then appends all schedule entries to "
-        "schedule_path (an EXISTING schedule file) in one final write as the activation boundary. Writes "
+        "against the authoring contract, writes every new spec file, then writes a single valid YAML "
+        "schedule document to schedule_path (an EXISTING schedule file) in one final write as the "
+        "activation boundary, using the same schedule-document builder as bo_create_build. Writes "
         "nothing if validation fails for any build in the chain. Always validates strict_new (compat_existing "
         "is a read-only audit mode, not selectable here)."
     ),
@@ -694,6 +699,26 @@ def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
     """Create a multi-build chain (specs + schedule entries) in one activation."""
     inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path)
     return _bo_create_chain([b.model_dump() for b in inp.builds], inp.schedule_path)
+
+
+@tool_gate(
+    name="bo_activate_existing_spec",
+    description=(
+        "Activate one already-written inert Build Orchestrator spec onto an EXISTING schedule file: "
+        "derives the schedule entry from the spec, validates the full proposed graph (including every "
+        "pre-existing entry already in schedule_path) against the authoritative BO authoring contract "
+        "in strict_new mode, and performs only the final schedule write as the activation boundary. "
+        "Never creates or rewrites a spec, never creates a new schedule file, never accepts raw YAML "
+        "or a caller-supplied schedule-entry dict. Refuses a missing or ambiguous spec, an already-bound "
+        "build id, and any adapter validation failure. Reuses the same schedule-document builder as "
+        "bo_create_build / bo_create_chain."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def bo_activate_existing_spec(build_id: str, schedule_path: str, spec_path: str | None = None) -> str:
+    """Activate one already-written inert spec onto an existing schedule."""
+    inp = BOActivateExistingSpecInput(build_id=build_id, schedule_path=schedule_path, spec_path=spec_path)
+    return _bo_activate_existing_spec(inp.build_id, inp.schedule_path, inp.spec_path)
 
 
 if SEMANTIC_AVAILABLE:
