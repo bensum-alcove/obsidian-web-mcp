@@ -16,7 +16,12 @@ from pathlib import Path
 import pytest
 
 from obsidian_vault_mcp import bo_contract, config
-from obsidian_vault_mcp.models import BOCreateBuildInput, BOCreateChainInput, BOActivateExistingSpecInput
+from obsidian_vault_mcp.models import (
+    BOActivateExistingSpecInput,
+    BOBuildSpecInput,
+    BOCreateBuildInput,
+    BOCreateChainInput,
+)
 from obsidian_vault_mcp.tools import build_orchestrator as bo
 
 SCHEDULE_PATH = "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
@@ -658,4 +663,181 @@ def test_activate_existing_spec_rejects_adapter_fail_closed_classes(monkeypatch,
         assert result["errors"][0]["code"] == code
         assert _schedule_text(empty_flow_schedule) == seed
         assert (specs_dir / "scratch-inert.md").exists()
+
+
+GOAL_ROUTING_FIELDS = {
+    "goal_id": "schema-v17-consistency-hardening",
+    "goal_root_build_id": "scratch-1",
+    "goal_completion": False,
+    "work_role": "executor",
+    "engine": "codex",
+    "codex_model": "gpt-5.6-sol",
+    "codex_reasoning_effort": "high",
+}
+
+
+def _closed_sibling_schedule(vault, sibling_id="closed-sibling"):
+    sched_dir = vault / "Personal" / "Build Orchestrator" / "schedules"
+    specs_dir = vault / "Personal" / "Build Orchestrator" / "specs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    (specs_dir / f"{sibling_id}.md").write_text(_inert_spec_markdown(sibling_id))
+    content = (
+        SCHEDULE_SEED
+        + f"  - id: {sibling_id}\n    title: t\n    description: t\n    run_when: x\n"
+        "    tier: simple\n    depends_on: []\n"
+        f"    spec_path: Personal/Build Orchestrator/specs/{sibling_id}.md\n"
+        "    project: edge-trading-system\n"
+    )
+    (sched_dir / "2026-W99-scratch.yaml").write_text(content)
+    return content
+
+
+def test_typed_input_accepts_current_goal_and_routing_fields():
+    inp = BOBuildSpecInput(**_build("scratch-1", **GOAL_ROUTING_FIELDS))
+    dumped = inp.model_dump(exclude_none=True)
+    for key, value in GOAL_ROUTING_FIELDS.items():
+        assert dumped[key] == value
+
+
+def test_typed_input_extra_allow_does_not_reject_before_projection():
+    inp = BOBuildSpecInput(**_build("scratch-1"), not_a_real_bo_field="nope")
+    assert inp.model_dump()["not_a_real_bo_field"] == "nope"
+
+
+def test_unknown_typed_field_fails_closed_with_no_writes(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    result = json.loads(bo.bo_create_build(_build(not_a_real_bo_field="nope"), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert result["activated"] is False
+    assert "unknown authoring field" in result["error"]
+    assert "not_a_real_bo_field" in result["error"]
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
+
+
+def test_goal_and_routing_fields_round_trip_create_validate_and_chain(monkeypatch, seeded_schedule):
+    captured = {}
+
+    def capture_render(specs, timeout=None):
+        captured["render"] = specs
+        return _fake_render_graph(specs, timeout=timeout)
+
+    monkeypatch.setattr(bo_contract, "render_graph", capture_render)
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+
+    build = _build("scratch-1", **GOAL_ROUTING_FIELDS)
+    validated = json.loads(bo.bo_validate_build_graph([build], SCHEDULE_PATH))
+    assert validated["ok"] is True, validated
+    item = captured["render"][0]
+    for key, value in GOAL_ROUTING_FIELDS.items():
+        assert item[key] == value
+        if key in ("engine", "work_role", "codex_model", "codex_reasoning_effort"):
+            assert item["schedule_entry"][key] == value
+
+    created = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert created["ok"] is True, created
+    import frontmatter
+    spec = frontmatter.loads(
+        (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").read_text()
+    )
+    for key, value in GOAL_ROUTING_FIELDS.items():
+        assert spec.metadata[key] == value
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entry = schedule_builds_from_content(_schedule_text(seeded_schedule), source_name=SCHEDULE_PATH)[0]
+    assert entry["engine"] == "codex"
+    assert entry["work_role"] == "executor"
+    assert entry["codex_model"] == "gpt-5.6-sol"
+    assert entry["codex_reasoning_effort"] == "high"
+
+    chain = json.loads(bo.bo_create_chain(
+        [_build("scratch-chain", **{**GOAL_ROUTING_FIELDS, "goal_root_build_id": "scratch-chain"})],
+        SCHEDULE_PATH,
+    ))
+    assert chain["ok"] is True, chain
+    chain_spec = frontmatter.loads(
+        (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-chain.md").read_text()
+    )
+    assert chain_spec.metadata["work_role"] == "executor"
+    assert chain_spec.metadata["codex_reasoning_effort"] == "high"
+
+
+def test_activate_projects_goal_and_routing_fields_from_existing_spec(monkeypatch, empty_flow_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    specs_dir = empty_flow_schedule / "Personal/Build Orchestrator/specs"
+    specs_dir.mkdir(parents=True)
+    spec = _inert_spec_markdown("scratch-inert").replace(
+        "depends_on: []\n",
+        "depends_on: []\n"
+        "goal_id: schema-v17-consistency-hardening\n"
+        "goal_root_build_id: scratch-inert\n"
+        "goal_completion: false\n"
+        "work_role: executor\n"
+        "engine: codex\n"
+        "codex_model: gpt-5.6-sol\n"
+        "codex_reasoning_effort: high\n"
+        "created_by: ChatGPT\n"
+        "provenance: extra spec metadata must not fail activation\n",
+    )
+    (specs_dir / "scratch-inert.md").write_text(spec)
+    original = spec
+    result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    assert (specs_dir / "scratch-inert.md").read_text() == original
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entry = schedule_builds_from_content(
+        _schedule_text(empty_flow_schedule), source_name=SCHEDULE_PATH
+    )[0]
+    assert entry["engine"] == "codex"
+    assert entry["work_role"] == "executor"
+    assert entry["codex_model"] == "gpt-5.6-sol"
+    assert entry["codex_reasoning_effort"] == "high"
+
+
+def test_new_build_beside_unchanged_terminal_sibling_appends_once(monkeypatch, seeded_schedule):
+    _closed_sibling_schedule(seeded_schedule)
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{
+                "code": "terminal_id_reuse",
+                "message": "closed-sibling already reached terminal status",
+                "build_id": "closed-sibling",
+            }],
+            "warnings": [],
+        },
+    )
+    result = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
+    entries = schedule_builds_from_content(_schedule_text(seeded_schedule), source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries] == ["closed-sibling", "scratch-1"]
+    retry = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert retry["ok"] is False
+    assert retry["activated"] is False
+    entries_after = schedule_builds_from_content(_schedule_text(seeded_schedule), source_name=SCHEDULE_PATH)
+    assert [e["id"] for e in entries_after] == ["closed-sibling", "scratch-1"]
+    assert entries_after[0]["id"] == "closed-sibling"
+
+
+def test_true_terminal_id_reuse_on_new_id_still_fails(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{
+                "code": "terminal_id_reuse",
+                "message": "scratch-1 already reached terminal status",
+                "build_id": "scratch-1",
+            }],
+            "warnings": [],
+        },
+    )
+    result = json.loads(bo.bo_create_build(_build("scratch-1"), SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert result["activated"] is False
+    assert result["errors"][0]["code"] == "terminal_id_reuse"
+    assert result["errors"][0]["build_id"] == "scratch-1"
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
 

@@ -606,9 +606,18 @@ class VaultAnswerContextInput(BaseModel):
 
 
 class BOBuildSpecInput(BaseModel):
-    """One typed Build Orchestrator build spec -- never raw schedule YAML."""
+    """One typed Build Orchestrator build spec -- never raw schedule YAML.
 
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    extra="allow" is the lag-proof intake: a later additive BO schema field
+    must reach the authoring-contract adapter instead of being rejected here
+    before validation. Declared fields below advertise the current contract
+    surface in the MCP schema. Unknown names still fail closed at projection
+    unless the live adapter source itself names them. extra="forbid" remains
+    on the outer create/chain/activate models so caller-selected `mode` and
+    raw YAML cannot sneak onto mutation paths.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="allow")
 
     build_id: str = Field(
         ...,
@@ -656,7 +665,62 @@ class BOBuildSpecInput(BaseModel):
         default=None,
         description="Deprecated pre-v5 risk-classification alias -- compatibility-only, never sufficient alone for a new spec",
     )
-    engine: str | None = Field(default=None, description="One of: auto, cc, codex", max_length=20)
+    engine: str | None = Field(
+        default=None, description="One of: auto, cc, codex, cursor — vocabulary owned by the BO authoring contract",
+        max_length=20,
+    )
+    work_role: str | None = Field(
+        default=None,
+        description="Optional schema-v14 work role (mechanical|executor|adviser|reviewer) — validated by the BO contract",
+        max_length=50,
+    )
+    review_policy: str | None = Field(
+        default=None,
+        description="Optional schema-v17 review policy; 'auto' freezes a risk-weighted assurance floor — validated by the BO contract",
+        max_length=50,
+    )
+    goal_id: str | None = Field(
+        default=None,
+        description="Schema-v15 durable goal id; must be declared together with goal_root_build_id and goal_completion",
+        max_length=200,
+    )
+    goal_root_build_id: str | None = Field(
+        default=None,
+        description="Schema-v15 exact goal-root build id; must be declared together with goal_id and goal_completion",
+        max_length=200,
+    )
+    goal_completion: bool | None = Field(
+        default=None,
+        description="Schema-v15 goal-completion authority flag; must be declared together with goal_id and goal_root_build_id",
+    )
+    claude_model: str | None = Field(
+        default=None,
+        description="Optional explicit Claude model pin; valid only with engine=cc — validated by the BO contract",
+        max_length=100,
+    )
+    codex_model: str | None = Field(
+        default=None,
+        description="Optional explicit Codex model pin (gpt-5.6-sol|gpt-6-astra); valid only with engine=codex — validated by the BO contract",
+        max_length=100,
+    )
+    codex_reasoning_effort: str | None = Field(
+        default=None,
+        description="Optional Codex reasoning effort (medium|high|xhigh); valid only with engine=codex — validated by the BO contract",
+        max_length=20,
+    )
+    windows_gui_backend: str | None = Field(
+        default=None,
+        description="Optional Codex Windows GUI backend (edge_browser|computer_use) — validated by the BO contract",
+        max_length=50,
+    )
+    execution_context: dict | None = Field(
+        default=None,
+        description="Optional schema-v8 execution context ({type: project}|{type: scratch}) — validated by the BO contract",
+    )
+    adviser_authority: dict | None = Field(
+        default=None,
+        description="Optional schema-v16 exact adviser permit; omission is default-zero — validated by the BO contract",
+    )
     tags: list[str] | None = Field(default=None)
     status: str = Field(default="ready", description="'ready' (dispatch-eligible) or 'proposed'", max_length=20)
     completion_contract: dict | None = Field(default=None)

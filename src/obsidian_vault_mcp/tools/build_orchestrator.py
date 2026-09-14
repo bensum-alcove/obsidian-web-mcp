@@ -41,6 +41,14 @@ logger = logging.getLogger(__name__)
 REQUIRED_BUILD_FIELDS = ("build_id", "title", "body_markdown", "tier", "project")
 _BUILDS_KEY_RE = re.compile(r"^(builds\s*:)", re.MULTILINE)
 _SPEC_HEADING_RE = re.compile(r"^#\s+(?:.+?\s+[—-]\s+)?(.+)\s*$", re.MULTILINE)
+# DB-collision codes the adapter applies to every node it is given, including
+# unchanged historical siblings included only as graph context. Same client-side
+# filter shape as bo_guard HI5-3: keep the finding when it names a newly
+# proposed id; drop it when it names a context sibling. Graph-wide codes
+# (mixed_project_schedule, dependency_cycle) are never filtered here.
+_CONTEXT_DB_COLLISION_CODES = frozenset({
+    "terminal_id_reuse", "duplicate_authority", "frozen_contract_mutation",
+})
 
 
 class BOToolError(Exception):
@@ -61,7 +69,14 @@ def _spec_path_for(build_id: str) -> str:
     return f"{SPECS_PREFIX}{build_id}.md"
 
 
-def _schedule_entry_for(build: dict) -> dict:
+def _unknown_typed_fields(build: dict, accepted: frozenset[str]) -> list[str]:
+    return sorted(
+        key for key, value in build.items()
+        if value is not None and key not in accepted
+    )
+
+
+def _schedule_entry_for(build: dict, schedule_keys: frozenset[str]) -> dict:
     entry = {
         "id": build["build_id"],
         "title": build["title"],
@@ -72,14 +87,15 @@ def _schedule_entry_for(build: dict) -> dict:
         "spec_path": _spec_path_for(build["build_id"]),
         "project": build["project"],
     }
-    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "capital_path",
-                      "engine", "notes", "resources"):
-        if build.get(optional) is not None:
-            entry[optional] = build[optional]
+    for key in schedule_keys:
+        if key in ("id", "spec_path") or key in entry:
+            continue
+        if build.get(key) is not None:
+            entry[key] = build[key]
     return entry
 
 
-def _render_spec_item(build: dict, schedule_entry: dict) -> dict:
+def _render_spec_item(build: dict, schedule_entry: dict, persist_keys: frozenset[str]) -> dict:
     item = {
         "build_id": build["build_id"],
         "title": build["title"],
@@ -89,11 +105,11 @@ def _render_spec_item(build: dict, schedule_entry: dict) -> dict:
         "status": build.get("status") or "ready",
         "schedule_entry": schedule_entry,
     }
-    for optional in ("risk_domain", "blast_radius", "reversible", "shadowable", "capital_path",
-                      "program", "tags", "created", "completion_contract", "deployment_intent",
-                      "resources", "review_gate"):
-        if build.get(optional) is not None:
-            item[optional] = build[optional]
+    for key in persist_keys:
+        if key in item or key == "schedule_entry":
+            continue
+        if build.get(key) is not None:
+            item[key] = build[key]
     return item
 
 
@@ -200,6 +216,40 @@ def compose_schedule_document(existing_content: str, new_entry_texts: list[str],
     return prefix + "builds:\n\n" + entry_block + suffix
 
 
+def _filter_context_node_db_collisions(errors: list, new_ids: set) -> list:
+    """Drop adapter DB-collision findings attributed to unchanged siblings.
+
+    The JSON CLI cannot pass authoring_contract's existing_state_lookup=None
+    the way whole_graph_errors_for_new_build does, so validate_graph still
+    resolves live DB state for every graph-context node. A terminal sibling
+    sitting unchanged in the target schedule is preserved authority, not new
+    ID reuse. A finding attributed to a newly proposed id, or with no
+    build_id at all, is kept in full.
+    """
+    return [
+        error for error in errors
+        if not (
+            error.get("code") in _CONTEXT_DB_COLLISION_CODES
+            and error.get("build_id") is not None
+            and error.get("build_id") not in new_ids
+        )
+    ]
+
+
+def _schedule_entry_missing_fields(entry_text: str, entry: dict) -> list[str]:
+    unindented = []
+    for line in entry_text.splitlines():
+        if line.startswith("  - "):
+            unindented.append("- " + line[4:])
+        elif line.startswith("  "):
+            unindented.append(line[2:])
+        else:
+            unindented.append(line)
+    parsed = yaml.safe_load("builds:\n" + "\n".join(unindented) + "\n")
+    rendered_keys = set((parsed.get("builds") or [{}])[0] or {})
+    return [key for key in entry if key not in rendered_keys and entry.get(key) is not None]
+
+
 def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str) -> dict:
     """Derive a typed build dict from an already-written spec.
 
@@ -246,13 +296,13 @@ def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str)
         "status": fm.get("status") or "ready",
         "depends_on": fm.get("depends_on") or [],
     }
-    for optional in (
-        "description", "run_when", "risk_domain", "blast_radius", "reversible", "shadowable",
-        "capital_path", "engine", "notes", "program", "tags", "created", "completion_contract",
-        "deployment_intent", "resources", "review_gate",
-    ):
-        if fm.get(optional) is not None:
-            build[optional] = fm[optional]
+    persist_keys = bo_contract.authoring_field_projection()["spec_persist_keys"]
+    skip = {"build_id", "type", "title"}
+    for key, value in fm.items():
+        if key in skip or value is None or key in build:
+            continue
+        if key in persist_keys:
+            build[key] = value
     return build
 
 
@@ -334,50 +384,62 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     # here -- one less place this repo would have to independently get right.
 
     version_info = bo_contract.check_version()
+    projection = bo_contract.authoring_field_projection()
+    accepted = projection["accepted_input_fields"]
+    schedule_keys = projection["schedule_entry_keys"]
+    persist_keys = projection["spec_persist_keys"]
+    unknown = []
+    for build in normalized_builds:
+        unknown.extend(
+            f"{build['build_id']}.{name}" for name in _unknown_typed_fields(build, accepted)
+        )
+    if unknown:
+        raise BOToolError(
+            "unknown authoring field(s) "
+            f"{unknown} — refusing to guess; live BO adapter source does not name them"
+        )
 
     new_build_ids = {b["build_id"] for b in normalized_builds}
     existing_nodes, schedule_project = _existing_schedule_nodes(schedule_path, new_build_ids)
 
-    schedule_entries = {b["build_id"]: _schedule_entry_for(b) for b in normalized_builds}
-    render_specs = [_render_spec_item(b, schedule_entries[b["build_id"]]) for b in normalized_builds]
+    schedule_entries = {
+        b["build_id"]: _schedule_entry_for(b, schedule_keys) for b in normalized_builds
+    }
+    render_specs = [
+        _render_spec_item(b, schedule_entries[b["build_id"]], persist_keys)
+        for b in normalized_builds
+    ]
 
     rendered = bo_contract.render_graph(render_specs)["rendered"]
 
-    # `resources` and `review_gate` are current spec-frontmatter fields the
-    # adapter's own validate_spec_frontmatter already understands (it runs
-    # resource_resolve.validate_resource_claims_shape / _validate_review_gate_block
-    # against them), but render_spec() doesn't yet accept them as render
-    # parameters, so the adapter's own render_graph silently drops them. Splice
-    # them into the rendered frontmatter with the same generic, semantics-free
-    # YAML field-set helper VaultWriteInput.merge_frontmatter uses -- this adds
-    # no BO validation logic locally; the spliced result is what validate_graph
-    # below (and the eventual write) actually sees, so the adapter still has
-    # the only word on whether the shape is valid.
+    # Adapter render_spec/render_schedule_entry drop fields they do not yet
+    # take as named parameters. Splice any caller-supplied field the live
+    # adapter names back into the rendered artifacts with the same generic
+    # YAML field-set helper already used for resources/review_gate. The
+    # adapter's validate_graph still has the only word on whether the shape
+    # is valid.
     overrides = spec_markdown_overrides or {}
     for b in normalized_builds:
         if b["build_id"] in overrides:
             rendered[b["build_id"]]["spec"] = overrides[b["build_id"]]
         else:
             spec_text = rendered[b["build_id"]]["spec"]
-            for field_name in ("resources", "review_gate"):
-                if b.get(field_name) is not None:
-                    spec_text = update_frontmatter_field(spec_text, field_name, b[field_name], require_existing=False)
-            # Persist depends_on onto the spec so a later schedule-only
-            # activation can recover the scheduling contract instead of
-            # inventing []. Always write the field, including an explicit
-            # empty list.
-            spec_text = update_frontmatter_field(
-                spec_text, "depends_on", b.get("depends_on") or [], require_existing=False,
-            )
+            for field_name in sorted(persist_keys):
+                if field_name == "depends_on":
+                    spec_text = update_frontmatter_field(
+                        spec_text, "depends_on", b.get("depends_on") or [], require_existing=False,
+                    )
+                elif b.get(field_name) is not None:
+                    spec_text = update_frontmatter_field(
+                        spec_text, field_name, b[field_name], require_existing=False,
+                    )
             rendered[b["build_id"]]["spec"] = spec_text
 
-        # `resources` also belongs on the schedule entry itself (the resource-
-        # aware scheduler reads locks from the schedule file, not the spec) --
-        # same rendering gap, same fix, at the schedule_entry fragment layer.
-        if b.get("resources") is not None:
-            rendered[b["build_id"]]["schedule_entry"] = _splice_schedule_entry_field(
-                rendered[b["build_id"]]["schedule_entry"], "resources", b["resources"]
-            )
+        entry = schedule_entries[b["build_id"]]
+        entry_text = rendered[b["build_id"]]["schedule_entry"]
+        for field_name in _schedule_entry_missing_fields(entry_text, entry):
+            entry_text = _splice_schedule_entry_field(entry_text, field_name, entry[field_name])
+        rendered[b["build_id"]]["schedule_entry"] = entry_text
 
     new_nodes = [
         {
@@ -391,9 +453,10 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     ]
 
     result = bo_contract.validate_graph(existing_nodes + new_nodes, mode=mode, new_ids=sorted(new_build_ids))
+    errors = _filter_context_node_db_collisions(result.get("errors", []), new_build_ids)
     return {
-        "ok": bool(result.get("ok", False)),
-        "errors": result.get("errors", []),
+        "ok": not errors,
+        "errors": errors,
         "warnings": result.get("warnings", []),
         "nodes": new_nodes,
         "rendered": rendered,

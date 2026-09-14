@@ -281,3 +281,23 @@ def test_real_validate_graph_rejects_unknown_project():
     result = bo_contract.validate_graph([node], mode="strict_new")
     assert result["ok"] is False
     assert any(e["code"] == "unknown_project" for e in result["errors"])
+
+
+@pytest.mark.skipif(not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host")
+def test_authoring_field_projection_derives_current_schema_fields_from_adapter():
+    bo_contract._authoring_fields_cache = None
+    projection = bo_contract.authoring_field_projection()
+    accepted = projection["accepted_input_fields"]
+    for field in (
+        "goal_id", "goal_root_build_id", "goal_completion", "work_role",
+        "engine", "codex_model", "codex_reasoning_effort", "review_policy",
+        "resources", "review_gate", "adviser_authority",
+    ):
+        assert field in accepted, field
+    assert "not_a_real_bo_field" not in accepted
+    assert projection["schedule_entry_keys"] >= {
+        "engine", "work_role", "codex_model", "codex_reasoning_effort", "resources",
+    }
+    assert bo_contract.CONSUMER_SCHEMA_VERSION == 6
+    version = bo_contract.check_version()
+    assert version["min_supported_schema_version"] <= 6 <= version["schema_version"]

@@ -15,6 +15,7 @@ responsible for turning that into a fail-closed response.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import logging
@@ -260,6 +261,150 @@ def validate_graph(nodes: list[dict], mode: str = "strict_new", config_override:
     if new_ids is not None:
         payload["new_ids"] = list(new_ids)
     return _invoke(payload, timeout=timeout)
+
+
+# Tool-owned identity/body keys that shaped the typed MCP payload. They are
+# never "unknown BO fields"; schedule identity keys `id`/`spec_path` are
+# derived, not caller-supplied.
+_TOOL_OWNED_INPUT_FIELDS = frozenset({
+    "build_id", "title", "body_markdown", "description", "run_when",
+    "depends_on", "status",
+})
+_DERIVED_SCHEDULE_KEYS = frozenset({"id", "spec_path"})
+_RENDER_PARAM_ALIASES = {"completion_contract_block": "completion_contract"}
+
+_authoring_fields_cache: dict | None = None
+
+
+def _ast_string_tuple(node: ast.AST) -> tuple[str, ...]:
+    if not isinstance(node, ast.Tuple):
+        raise ValueError("expected a tuple of string literals")
+    values = []
+    for elt in node.elts:
+        if not isinstance(elt, ast.Constant) or not isinstance(elt.value, str):
+            raise ValueError("expected string literals in adapter field tuple")
+        values.append(elt.value)
+    return tuple(values)
+
+
+def _function_named(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise ValueError(f"adapter is missing function {name!r}")
+
+
+def _attr_get_literals(func: ast.FunctionDef, attr_names: set[str]) -> set[str]:
+    """Collect `"field"` from `name.get("field")` for the given attribute names."""
+    found: set[str] = set()
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call) or len(node.args) < 1:
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "get":
+            continue
+        if not isinstance(node.func.value, ast.Name) or node.func.value.id not in attr_names:
+            continue
+        key = node.args[0]
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            found.add(key.value)
+    return found
+
+
+def authoring_field_projection() -> dict:
+    """Derive the live adapter's authoring field names from its source.
+
+    Vault MCP must not keep a hand-copied optional-field registry that can
+    silently lag schema-v15/16/17. The authoritative names are the adapter's
+    own `_SPEC_FRONTMATTER_KEY_ORDER`, `_SCHEDULE_ENTRY_KEY_ORDER`,
+    `render_spec` parameters, and the `fm.get`/`entry.get` keys its
+    validators already consult. Raises BOContractError if that source cannot
+    be trusted -- callers fail closed rather than guessing.
+    """
+    global _authoring_fields_cache
+    if _authoring_fields_cache is not None:
+        return _authoring_fields_cache
+
+    path = pathlib.Path(config.BO_AUTHORING_CONTRACT_PATH)
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+    except FileNotFoundError as e:
+        raise BOContractError("adapter_missing", f"authoring contract adapter not found at {path}") from e
+    except (OSError, SyntaxError) as e:
+        raise BOContractError(
+            "adapter_bad_output",
+            f"failed to parse authoring contract adapter source at {path}: {e}",
+        ) from e
+
+    spec_keys: tuple[str, ...] | None = None
+    schedule_keys: tuple[str, ...] | None = None
+    for node in tree.body:
+        targets = []
+        value = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name):
+                continue
+            try:
+                if target.id == "_SPEC_FRONTMATTER_KEY_ORDER":
+                    spec_keys = _ast_string_tuple(value)
+                elif target.id == "_SCHEDULE_ENTRY_KEY_ORDER":
+                    schedule_keys = _ast_string_tuple(value)
+            except ValueError as e:
+                raise BOContractError(
+                    "adapter_bad_output",
+                    f"authoring contract adapter field tuple {target.id} is not a string literal tuple: {e}",
+                ) from e
+    if not spec_keys or not schedule_keys:
+        raise BOContractError(
+            "adapter_bad_output",
+            "authoring contract adapter source is missing _SPEC_FRONTMATTER_KEY_ORDER "
+            "or _SCHEDULE_ENTRY_KEY_ORDER -- refusing to guess field names",
+        )
+
+    try:
+        render_spec = _function_named(tree, "render_spec")
+    except ValueError as e:
+        raise BOContractError("adapter_bad_output", str(e)) from e
+
+    render_params = []
+    for arg in list(render_spec.args.args) + list(render_spec.args.kwonlyargs):
+        mapped = _RENDER_PARAM_ALIASES.get(arg.arg, arg.arg)
+        if mapped not in ("self", "cls"):
+            render_params.append(mapped)
+
+    validator_fields = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            validator_fields |= _attr_get_literals(node, {"fm", "entry"})
+
+    accepted = set(_TOOL_OWNED_INPUT_FIELDS)
+    accepted.update(spec_keys)
+    accepted.update(schedule_keys)
+    accepted.update(render_params)
+    accepted.update(validator_fields)
+    accepted -= _DERIVED_SCHEDULE_KEYS
+    accepted.discard("type")
+    accepted.discard("completion_contract_block")
+
+    projection = {
+        "accepted_input_fields": frozenset(accepted),
+        "spec_frontmatter_keys": frozenset(spec_keys),
+        "schedule_entry_keys": frozenset(schedule_keys),
+        "render_spec_params": frozenset(render_params),
+        "spec_persist_keys": frozenset(
+            (accepted - {"title", "body_markdown", "description", "run_when"}) | {"depends_on"}
+        ),
+    }
+    _authoring_fields_cache = projection
+    return projection
 
 
 def render_graph(specs: list[dict], timeout: float | None = None) -> dict:
