@@ -647,16 +647,21 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
     description=(
         "Read-only Build Orchestrator preflight: validate a proposed build graph (one or more typed build "
         "specs plus the existing schedule they would be appended to) against the authoritative BO authoring "
-        "contract. Never writes anything. Returns ok/errors/warnings plus a canonicalized graph (resolved "
-        "spec paths, execution project, dependency edges) so a caller can see exactly what would be created "
-        "before committing to bo_create_build/bo_create_chain."
+        "contract. Accepts current schema-v15/16/17 fields (goal lineage, work_role, Codex model/effort, "
+        "review_policy) and fails closed on unknown or invalid combinations. Unchanged terminal siblings "
+        "in the target schedule are graph context, not new-ID reuse. Never writes anything. Returns "
+        "ok/errors/warnings plus a canonicalized graph (resolved spec paths, execution project, "
+        "dependency edges) so a caller can see exactly what would be created before committing to "
+        "bo_create_build/bo_create_chain."
     ),
     annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
     """Validate a proposed Build Orchestrator build graph without writing anything."""
     inp = BOValidateBuildGraphInput(builds=builds, schedule_path=schedule_path, mode=mode)
-    return _bo_validate_build_graph([b.model_dump() for b in inp.builds], inp.schedule_path, inp.mode)
+    return _bo_validate_build_graph(
+        [b.model_dump(exclude_none=True) for b in inp.builds], inp.schedule_path, inp.mode
+    )
 
 
 @tool_gate(
@@ -671,14 +676,16 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
         "validates strict_new (compat_existing is a read-only audit mode, not selectable here). "
         "Delegates all BO schema/project/risk/dependency rules to the authoring-contract adapter; "
         "fails closed (no writes) if that adapter is unavailable or reports a mismatched schema or "
-        "contract version."
+        "contract version. Current goal/routing fields are projected through the adapter rather than "
+        "a local field allowlist; unknown names and invalid engine/model/effort combinations fail closed. "
+        "An unchanged closed sibling in the target schedule does not count as terminal-ID reuse."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 def bo_create_build(build: dict, schedule_path: str) -> str:
     """Create one new Build Orchestrator build (spec file + schedule entry)."""
     inp = BOCreateBuildInput(build=build, schedule_path=schedule_path)
-    return _bo_create_build(inp.build.model_dump(), inp.schedule_path)
+    return _bo_create_build(inp.build.model_dump(exclude_none=True), inp.schedule_path)
 
 
 @tool_gate(
@@ -698,7 +705,7 @@ def bo_create_build(build: dict, schedule_path: str) -> str:
 def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
     """Create a multi-build chain (specs + schedule entries) in one activation."""
     inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path)
-    return _bo_create_chain([b.model_dump() for b in inp.builds], inp.schedule_path)
+    return _bo_create_chain([b.model_dump(exclude_none=True) for b in inp.builds], inp.schedule_path)
 
 
 @tool_gate(

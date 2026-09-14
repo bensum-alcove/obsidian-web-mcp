@@ -219,3 +219,81 @@ def test_real_mixed_project_on_existing_schedule_fails_closed(seeded_schedule):
     assert any(e["code"] == "mixed_project_schedule" for e in result.get("errors", [])), result
     assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-mixed.md").exists()
     assert sched_path.read_text() == original
+
+
+def test_real_goal_and_codex_routing_fields_round_trip(seeded_schedule):
+    build_id = "scratch-real-e2e-v17-fields"
+    build = _build(
+        build_id,
+        engine="codex",
+        work_role="executor",
+        codex_model="gpt-5.6-sol",
+        codex_reasoning_effort="high",
+        goal_id="scratch-real-e2e-v17-goal",
+        goal_root_build_id=build_id,
+        goal_completion=False,
+    )
+    validated = json.loads(bo.bo_validate_build_graph([build], SCHEDULE_PATH))
+    assert validated["ok"] is True, validated
+    created = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert created["ok"] is True, created
+    spec = frontmatter.loads(
+        (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
+    )
+    assert spec.metadata["goal_id"] == "scratch-real-e2e-v17-goal"
+    assert spec.metadata["goal_root_build_id"] == build_id
+    assert spec.metadata["goal_completion"] is False
+    assert spec.metadata["work_role"] == "executor"
+    assert spec.metadata["engine"] == "codex"
+    assert spec.metadata["codex_model"] == "gpt-5.6-sol"
+    assert spec.metadata["codex_reasoning_effort"] == "high"
+    entries = schedule_builds_from_content(
+        (seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml").read_text(),
+        source_name=SCHEDULE_PATH,
+    )
+    entry = next(e for e in entries if e["id"] == build_id)
+    assert entry["engine"] == "codex"
+    assert entry["work_role"] == "executor"
+    assert entry["codex_model"] == "gpt-5.6-sol"
+    assert entry["codex_reasoning_effort"] == "high"
+
+
+def test_real_invalid_engine_effort_combination_fails_closed(seeded_schedule):
+    build = _build(
+        "scratch-real-e2e-v17-badcombo",
+        engine="cursor",
+        codex_reasoning_effort="high",
+    )
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert any(
+        e["code"] == "codex_reasoning_effort_requires_codex_engine"
+        for e in result.get("errors", [])
+    ), result
+    assert not (
+        seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-v17-badcombo.md"
+    ).exists()
+
+
+def test_real_incomplete_goal_lineage_fails_closed(seeded_schedule):
+    build = _build("scratch-real-e2e-v17-badgoal", goal_id="only-one-goal-field")
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert any(e["code"] == "incomplete_goal_authority" for e in result.get("errors", [])), result
+    assert not (
+        seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-v17-badgoal.md"
+    ).exists()
+
+
+def test_real_unknown_codex_model_fails_closed(seeded_schedule):
+    build = _build(
+        "scratch-real-e2e-v17-badmodel",
+        engine="codex",
+        codex_model="not-a-real-codex-model",
+    )
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is False
+    assert any(e["code"] == "unknown_codex_model" for e in result.get("errors", [])), result
+    assert not (
+        seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-v17-badmodel.md"
+    ).exists()
