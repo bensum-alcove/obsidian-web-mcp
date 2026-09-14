@@ -266,6 +266,7 @@ from __future__ import annotations
 import logging
 import os
 import posixpath
+import re
 from dataclasses import dataclass, field
 
 from . import bo_contract
@@ -529,6 +530,96 @@ def _nodes_for_schedule_builds(builds: list[dict], schedule_path: str, schedule_
     return nodes
 
 
+def _raw_schedule_entry_blocks(content: str, builds: list[dict]) -> list[str] | None:
+    """Return the exact source block for each parsed block-style build entry.
+
+    Semantic parsing remains exclusively owned by the canonical BO parser;
+    this helper only pairs its already-parsed entries with source spans so the
+    guard can prove that an entry's bytes were preserved.  Unsupported source
+    shapes (for example a flow-style non-empty sequence) return ``None`` and
+    therefore receive no compatibility bypass.
+    """
+    builds_key = re.search(r"(?m)^builds\s*:[^\r\n]*(?:\r?\n|$)", content)
+    if builds_key is None:
+        return None
+
+    tail = content[builds_key.end():]
+    markers = list(re.finditer(r"(?m)^([ \t]*)-\s+", tail))
+    if not markers:
+        return [] if not builds else None
+
+    entry_indent = markers[0].group(1)
+    entry_markers = [marker for marker in markers if marker.group(1) == entry_indent]
+    if len(entry_markers) != len(builds):
+        return None
+
+    blocks: list[str] = []
+    for index, marker in enumerate(entry_markers):
+        start = builds_key.end() + marker.start()
+        end = (
+            builds_key.end() + entry_markers[index + 1].start()
+            if index + 1 < len(entry_markers)
+            else len(content)
+        )
+        blocks.append(content[start:end].rstrip("\r\n"))
+    return blocks
+
+
+def _byte_identical_schedule_entry_ids(
+    old_content: str | None,
+    new_content: str,
+    old_builds: list[dict] | None,
+    new_builds: list[dict],
+) -> set:
+    """IDs whose one old and one new schedule entries are byte-identical.
+
+    Duplicate IDs are deliberately ineligible: an unchanged old occurrence
+    plus a newly appended occurrence with the same terminal ID is genuine ID
+    reuse, not unchanged graph context.
+    """
+    if old_content is None or old_builds is None:
+        return set()
+    old_blocks = _raw_schedule_entry_blocks(old_content, old_builds)
+    new_blocks = _raw_schedule_entry_blocks(new_content, new_builds)
+    if old_blocks is None or new_blocks is None:
+        return set()
+
+    old_by_id: dict[object, list[tuple[dict, str]]] = {}
+    new_by_id: dict[object, list[tuple[dict, str]]] = {}
+    for entry, block in zip(old_builds, old_blocks):
+        if isinstance(entry, dict):
+            old_by_id.setdefault(entry.get("id"), []).append((entry, block))
+    for entry, block in zip(new_builds, new_blocks):
+        if isinstance(entry, dict):
+            new_by_id.setdefault(entry.get("id"), []).append((entry, block))
+
+    unchanged = set()
+    for build_id, old_matches in old_by_id.items():
+        new_matches = new_by_id.get(build_id, [])
+        if (
+            build_id is not None
+            and len(old_matches) == 1
+            and len(new_matches) == 1
+            and old_matches[0][0] == new_matches[0][0]
+            and old_matches[0][1] == new_matches[0][1]
+        ):
+            unchanged.add(build_id)
+    return unchanged
+
+
+def _drop_unchanged_terminal_context_errors(
+    errors: list[dict], unchanged_ids: set, allowed_codes: set[str],
+) -> list[dict]:
+    """Drop only terminal-state findings proven to target unchanged entries."""
+    return [
+        error for error in errors
+        if not (
+            error.get("code") in allowed_codes
+            and error.get("build_id") in unchanged_ids
+        )
+    ]
+
+
 def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     if ctx.old_content is not None and ctx.old_content == ctx.new_content:
         return []  # true no-op write
@@ -547,6 +638,10 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
             "builds: list -- rejecting rather than allowing an unparseable rewrite through",
         )]
 
+    old_builds = schedule_builds_from_content(ctx.old_content, source_name=ctx.path) if ctx.old_content else None
+    unchanged_ids = _byte_identical_schedule_entry_ids(
+        ctx.old_content, ctx.new_content, old_builds, new_builds,
+    )
     issues: list[ValidationIssue] = []
 
     # 1. Bound-row preservation / terminal-entry-edit preflight. Runs
@@ -557,7 +652,12 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
         preflight_result = bo_contract.preflight_schedule_rewrite(ctx.path, new_builds, mode="compat_existing")
     except bo_contract.BOContractError as e:
         return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-    issues.extend(_errors_to_issues("bo-guard-schedule-rewrite", preflight_result.get("errors", [])))
+    preflight_errors = _drop_unchanged_terminal_context_errors(
+        preflight_result.get("errors", []),
+        unchanged_ids,
+        {"terminal_schedule_entry_edit"},
+    )
+    issues.extend(_errors_to_issues("bo-guard-schedule-rewrite", preflight_errors))
 
     # 2. Whole-resulting-graph validation: every entry that will exist in the
     #    file after this write, each paired with its on-disk spec content --
@@ -569,7 +669,6 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     # can make this return None, which is the pre-existing "no prior builds
     # to diff against" degradation.
     schedule_project = _schedule_project_from_content(ctx.new_content)
-    old_builds = schedule_builds_from_content(ctx.old_content, source_name=ctx.path) if ctx.old_content else None
     old_by_id = {b.get("id"): b for b in (old_builds or []) if isinstance(b, dict)}
     new_ids = sorted({
         entry.get("id") for entry in new_builds
@@ -582,7 +681,12 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     except bo_contract.BOContractError as e:
         issues.append(ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e)))
         return issues
-    issues.extend(_errors_to_issues("bo-guard-schedule-graph", graph_result.get("errors", [])))
+    graph_errors = _drop_unchanged_terminal_context_errors(
+        graph_result.get("errors", []),
+        unchanged_ids,
+        {"terminal_id_reuse"},
+    )
+    issues.extend(_errors_to_issues("bo-guard-schedule-graph", graph_errors))
 
     return issues
 

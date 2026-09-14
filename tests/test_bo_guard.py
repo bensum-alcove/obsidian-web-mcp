@@ -217,6 +217,112 @@ def test_valid_schedule_append_has_no_issues(monkeypatch):
     assert result.issues == []
 
 
+def _terminal_finding(code, build_id="existing-build"):
+    return {"code": code, "message": f"{build_id} is terminal", "build_id": build_id}
+
+
+def test_schedule_append_allows_byte_identical_terminal_sibling(monkeypatch):
+    monkeypatch.setattr(
+        bo_contract,
+        "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [_terminal_finding("terminal_schedule_entry_edit")],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        bo_contract,
+        "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [_terminal_finding("terminal_id_reuse")],
+            "warnings": [],
+        },
+    )
+
+    result = bo_guard.evaluate_content(
+        WriteContext(
+            path=SCHEDULE_PATH,
+            old_content=VALID_SCHEDULE_OLD,
+            new_content=VALID_SCHEDULE_NEW,
+            tool="vault_write",
+        )
+    )
+
+    assert result.issues == []
+
+
+def test_schedule_rewrite_rejects_mutated_terminal_sibling(monkeypatch):
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(
+        bo_contract,
+        "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [_terminal_finding("terminal_schedule_entry_edit")],
+            "warnings": [],
+        },
+    )
+    mutated = VALID_SCHEDULE_NEW.replace("    title: t\n", "    title: changed\n", 1)
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=mutated, tool="vault_write")
+    )
+
+    assert any("[terminal_schedule_entry_edit]" in issue.message for issue in result.issues)
+    assert result.blocked
+
+
+def test_schedule_rewrite_rejects_new_entry_reusing_terminal_id(monkeypatch):
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(
+        bo_contract,
+        "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": True, "errors": [], "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        bo_contract,
+        "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [_terminal_finding("terminal_id_reuse")],
+            "warnings": [],
+        },
+    )
+    reused = VALID_SCHEDULE_OLD + VALID_SCHEDULE_OLD.split("builds:\n", 1)[1]
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=reused, tool="vault_write")
+    )
+
+    assert any("[terminal_id_reuse]" in issue.message for issue in result.issues)
+    assert result.blocked
+
+
+def test_schedule_rewrite_rejects_removed_terminal_sibling(monkeypatch):
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    monkeypatch.setattr(
+        bo_contract,
+        "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [_terminal_finding("terminal_schedule_entry_edit")],
+            "warnings": [],
+        },
+    )
+    removed = VALID_SCHEDULE_NEW.replace(VALID_SCHEDULE_OLD, VALID_SCHEDULE_OLD.split("builds:\n", 1)[0] + "builds:\n")
+
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=removed, tool="vault_write")
+    )
+
+    assert any("[terminal_schedule_entry_edit]" in issue.message for issue in result.issues)
+    assert result.blocked
+
+
 def test_whole_graph_validation_runs_for_a_schedule_rewrite(monkeypatch):
     """B2: the resulting graph (not just bound-row preservation) must be
     validated for every rewrite, including mixed-project/duplicate-id-style
