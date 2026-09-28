@@ -158,12 +158,24 @@ VAULT_MUTATION_LEDGER_BACKUP_COUNT = int(os.environ.get("VAULT_MUTATION_LEDGER_B
 # a subprocess (shell=False, JSON stdin/stdout) rather than re-encoding BO schema
 # rules in this repo -- see bo_contract.py. Absent/wrong-version/failing adapter
 # means those tools fail closed (no schedule activation), by design.
-BO_AUTHORING_CONTRACT_PATH = os.environ.get(
-    "BO_AUTHORING_CONTRACT_PATH",
-    os.path.expanduser("~/build-orchestrator/authoring_contract.py"),
-)
+#
+# Empty (the default) means: resolve the path dynamically, at every call, from
+# the live serving BO release's directory -- see
+# bo_contract.resolve_authoring_contract_path(). A hard-coded/vendored path
+# here previously went stale relative to the actual deployed orchestrator
+# after a BO deploy (vault-mcp-bo-adapter-live-contract-2026-09-28: reported
+# schema v21 and rejected v22's model_probe_authority while live BO was
+# already on v22). Set this only to pin an explicit path (e.g. in tests).
+BO_AUTHORING_CONTRACT_PATH = os.environ.get("BO_AUTHORING_CONTRACT_PATH", "")
 BO_AUTHORING_CONTRACT_PYTHON = os.environ.get("BO_AUTHORING_CONTRACT_PYTHON", "python3")
 BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS = float(os.environ.get("BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS", "15"))
+
+# Trusted supervisord.conf used to resolve the live serving BO release's
+# directory (the orchestrator program's own `directory=`) -- the same trusted
+# conf.d tree BS Control's completion_contract.py resolves restricted-service
+# directories from. Overridable for tests only; production relies on the
+# default path.
+BO_SUPERVISORD_CONFIG_PATH = os.environ.get("BO_SUPERVISORD_CONFIG_PATH", "")
 
 # Build Orchestrator path-mutation guard mode: "off" | "shadow" (default) | "enforce".
 # Independent of VAULT_WRITE_CONTRACT_MODE above -- this guard is specific to
