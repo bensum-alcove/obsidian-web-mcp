@@ -37,6 +37,8 @@ def test_invoke_success(monkeypatch):
 def test_invoke_uses_shell_false_and_argv(monkeypatch):
     captured = {}
 
+    monkeypatch.setattr(config, "BO_AUTHORING_CONTRACT_PATH", "/fake/authoring_contract.py")
+
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["kwargs"] = kwargs
@@ -45,7 +47,7 @@ def test_invoke_uses_shell_false_and_argv(monkeypatch):
     monkeypatch.setattr(bo_contract.subprocess, "run", fake_run)
     bo_contract._invoke({"op": "version"})
     assert captured["kwargs"]["shell"] is False
-    assert captured["cmd"] == [config.BO_AUTHORING_CONTRACT_PYTHON, config.BO_AUTHORING_CONTRACT_PATH]
+    assert captured["cmd"] == [config.BO_AUTHORING_CONTRACT_PYTHON, "/fake/authoring_contract.py"]
     assert isinstance(captured["cmd"], list)
 
 
@@ -252,7 +254,14 @@ def test_preflight_source_schedule_payload_shape(monkeypatch):
 
 # --- real end-to-end smoke tests against the actual CLI, if present ---
 
-_ADAPTER_PRESENT = Path(config.BO_AUTHORING_CONTRACT_PATH).exists()
+def _adapter_present() -> bool:
+    try:
+        return Path(bo_contract.resolve_authoring_contract_path()).exists()
+    except bo_contract.BOContractError:
+        return False
+
+
+_ADAPTER_PRESENT = _adapter_present()
 
 
 @pytest.mark.skipif(not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host")

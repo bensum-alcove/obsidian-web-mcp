@@ -11,11 +11,19 @@ from pathlib import Path
 import frontmatter
 import pytest
 
-from obsidian_vault_mcp import config
+from obsidian_vault_mcp import bo_contract
 from obsidian_vault_mcp.bo_guard import schedule_builds_from_content
 from obsidian_vault_mcp.tools import build_orchestrator as bo
 
-_ADAPTER_PRESENT = Path(config.BO_AUTHORING_CONTRACT_PATH).exists()
+
+def _adapter_present() -> bool:
+    try:
+        return Path(bo_contract.resolve_authoring_contract_path()).exists()
+    except bo_contract.BOContractError:
+        return False
+
+
+_ADAPTER_PRESENT = _adapter_present()
 pytestmark = pytest.mark.skipif(
     not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host"
 )

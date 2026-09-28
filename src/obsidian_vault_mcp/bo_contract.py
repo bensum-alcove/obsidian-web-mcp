@@ -16,9 +16,12 @@ responsible for turning that into a fail-closed response.
 from __future__ import annotations
 
 import ast
+import configparser
+import glob
 import importlib.util
 import json
 import logging
+import os
 import pathlib
 import subprocess
 from dataclasses import dataclass
@@ -50,9 +53,10 @@ class BOContractError(Exception):
     """Raised whenever the authoring-contract adapter cannot be trusted.
 
     `code` is one of: adapter_missing, adapter_timeout, adapter_bad_output,
-    adapter_error, version_mismatch. Never raised for a normal validation
-    failure (unknown project, dependency cycle, etc) -- those come back as a
-    structured `{"ok": False, "errors": [...]}` result, not an exception.
+    adapter_error, adapter_unresolved, version_mismatch. Never raised for a
+    normal validation failure (unknown project, dependency cycle, etc) --
+    those come back as a structured `{"ok": False, "errors": [...]}` result,
+    not an exception.
     """
 
     code: str
@@ -62,13 +66,100 @@ class BOContractError(Exception):
         return f"[{self.code}] {self.message}"
 
 
+_DEFAULT_SUPERVISORD_CONFIG_PATH = os.path.expanduser("~/.config/supervisor/supervisord.conf")
+_ORCHESTRATOR_PROGRAM_SECTION = "program:orchestrator"
+
+
+def _supervisord_config_candidates() -> list[str]:
+    candidates = []
+    if config.BO_SUPERVISORD_CONFIG_PATH:
+        candidates.append(config.BO_SUPERVISORD_CONFIG_PATH)
+    candidates.append(_DEFAULT_SUPERVISORD_CONFIG_PATH)
+    return candidates
+
+
+def _resolve_live_orchestrator_directory() -> str:
+    """Resolve the live serving BO release's directory from the trusted
+    supervisord conf.d tree -- the orchestrator program's own `directory=`,
+    the same source BS Control's completion_contract.py trusts for
+    restricted-service directory lookups. Never the adapter's own reported
+    version, never a hard-coded release SHA, never a vendored copy.
+
+    Raises BOContractError(code="adapter_unresolved") on anything missing,
+    ambiguous or unparseable -- there is no stale-copy fallback.
+    """
+    base_config = next((p for p in _supervisord_config_candidates() if os.path.isfile(p)), None)
+    if not base_config:
+        raise BOContractError("adapter_unresolved", "no trusted supervisord.conf found")
+
+    base_parser = configparser.ConfigParser(strict=False)
+    try:
+        base_parser.read(base_config)
+    except configparser.Error as e:
+        raise BOContractError("adapter_unresolved", f"unparseable {base_config}: {e}") from e
+    if not base_parser.has_option("include", "files"):
+        raise BOContractError("adapter_unresolved", f"no [include] files= in {base_config}")
+    pattern = base_parser.get("include", "files").strip()
+    if not os.path.isabs(pattern):
+        pattern = os.path.join(os.path.dirname(base_config), pattern)
+    conf_files = sorted(glob.glob(pattern))
+    if not conf_files:
+        raise BOContractError("adapter_unresolved", f"no conf.d files matched {pattern!r}")
+
+    matches = []
+    for path in conf_files:
+        parser = configparser.ConfigParser(strict=False)
+        try:
+            parser.read(path)
+        except configparser.Error:
+            continue
+        if parser.has_section(_ORCHESTRATOR_PROGRAM_SECTION):
+            matches.append((path, parser))
+
+    if len(matches) != 1:
+        raise BOContractError(
+            "adapter_unresolved",
+            f"expected exactly one conf.d section [{_ORCHESTRATOR_PROGRAM_SECTION}], "
+            f"found {len(matches)}",
+        )
+    match_path, parser = matches[0]
+    if not parser.has_option(_ORCHESTRATOR_PROGRAM_SECTION, "directory"):
+        raise BOContractError(
+            "adapter_unresolved",
+            f"no directory= configured for [{_ORCHESTRATOR_PROGRAM_SECTION}] in {match_path}",
+        )
+    directory = parser.get(_ORCHESTRATOR_PROGRAM_SECTION, "directory").strip()
+    if not directory:
+        raise BOContractError(
+            "adapter_unresolved",
+            f"empty directory= for [{_ORCHESTRATOR_PROGRAM_SECTION}] in {match_path}",
+        )
+    return directory
+
+
+def resolve_authoring_contract_path() -> str:
+    """Resolve the authoring_contract.py path to invoke, fresh on every call.
+
+    An explicit config.BO_AUTHORING_CONTRACT_PATH (env var, or a test's
+    monkeypatch) always wins. Otherwise resolves the live serving BO
+    release's directory dynamically (_resolve_live_orchestrator_directory)
+    so this adapter cannot lag a BO deploy the way a hard-coded or vendored
+    path could -- see vault-mcp-bo-adapter-live-contract-2026-09-28.
+    """
+    override = config.BO_AUTHORING_CONTRACT_PATH
+    if override:
+        return override
+    directory = _resolve_live_orchestrator_directory()
+    return os.path.join(directory, "authoring_contract.py")
+
+
 def _invoke(payload: dict, timeout: float | None = None) -> dict:
     """Run one JSON request through the authoring_contract.py CLI.
 
     shell=False, argument vector only -- never string-interpolated into a shell.
     """
     timeout = timeout if timeout is not None else config.BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS
-    cmd = [config.BO_AUTHORING_CONTRACT_PYTHON, config.BO_AUTHORING_CONTRACT_PATH]
+    cmd = [config.BO_AUTHORING_CONTRACT_PYTHON, resolve_authoring_contract_path()]
 
     try:
         result = subprocess.run(
@@ -117,26 +208,32 @@ def _invoke(payload: dict, timeout: float | None = None) -> dict:
 
 
 _schedule_parser_module = None
+_schedule_parser_path = None
 
 
 def _schedule_parser():
     """Lazily load the BO repo's own `contract.py` module by file path,
-    resolved next to BO_AUTHORING_CONTRACT_PATH (both ship from the same BO
-    checkout). `contract.py` is deliberately dependency-free -- "Pure stdlib
-    + PyYAML, no dependency on db.py, vault_client.py, or any MCP tool" per
-    its own docstring, precisely so it can be loaded standalone by a second
-    consumer (it already is, by the signer) -- so this is a reference to the
-    one canonical implementation, not a vendored duplicate that could drift
-    from it (BL5-1, opus-review-bo-authoring-contract-v5: a second,
+    resolved next to the live authoring contract path (both ship from the
+    same BO checkout). `contract.py` is deliberately dependency-free -- "Pure
+    stdlib + PyYAML, no dependency on db.py, vault_client.py, or any MCP tool"
+    per its own docstring, precisely so it can be loaded standalone by a
+    second consumer (it already is, by the signer) -- so this is a reference
+    to the one canonical implementation, not a vendored duplicate that could
+    drift from it (BL5-1, opus-review-bo-authoring-contract-v5: a second,
     independently-written schedule parser previously disagreed with this one
     on 56% of the real deployed schedule corpus). Raises BOContractError
     (adapter_missing) if the module cannot be found/loaded; never silently
     falls back to a local re-implementation.
+
+    Cached per resolved path -- a BO deploy that changes the live release
+    directory invalidates the cache on the next call instead of serving a
+    module loaded from a now-superseded release.
     """
-    global _schedule_parser_module
-    if _schedule_parser_module is not None:
+    global _schedule_parser_module, _schedule_parser_path
+    resolved_path = resolve_authoring_contract_path()
+    if _schedule_parser_module is not None and _schedule_parser_path == resolved_path:
         return _schedule_parser_module
-    contract_path = pathlib.Path(config.BO_AUTHORING_CONTRACT_PATH).with_name("contract.py")
+    contract_path = pathlib.Path(resolved_path).with_name("contract.py")
     spec = importlib.util.spec_from_file_location("_bo_schedule_contract", contract_path)
     if spec is None or spec.loader is None:
         raise BOContractError("adapter_missing", f"BO schedule contract parser not found at {contract_path}")
@@ -148,6 +245,7 @@ def _schedule_parser():
             "adapter_missing", f"failed to load BO schedule contract parser at {contract_path}: {e}",
         ) from e
     _schedule_parser_module = module
+    _schedule_parser_path = resolved_path
     return module
 
 
@@ -274,6 +372,7 @@ _DERIVED_SCHEDULE_KEYS = frozenset({"id", "spec_path"})
 _RENDER_PARAM_ALIASES = {"completion_contract_block": "completion_contract"}
 
 _authoring_fields_cache: dict | None = None
+_authoring_fields_cache_path: str | None = None
 
 
 def _ast_string_tuple(node: ast.AST) -> tuple[str, ...]:
@@ -319,12 +418,20 @@ def authoring_field_projection() -> dict:
     `render_spec` parameters, and the `fm.get`/`entry.get` keys its
     validators already consult. Raises BOContractError if that source cannot
     be trusted -- callers fail closed rather than guessing.
+
+    Cached per resolved path -- a BO deploy that changes the live release
+    directory invalidates the cache on the next call instead of serving a
+    projection derived from a now-superseded release (this is exactly the
+    staleness vault-mcp-bo-adapter-live-contract-2026-09-28 fixed: a
+    hard-coded path here previously kept reporting schema v21 and rejecting
+    v22's model_probe_authority after live BO had already moved to v22).
     """
-    global _authoring_fields_cache
-    if _authoring_fields_cache is not None:
+    global _authoring_fields_cache, _authoring_fields_cache_path
+    resolved_path = resolve_authoring_contract_path()
+    if _authoring_fields_cache is not None and _authoring_fields_cache_path == resolved_path:
         return _authoring_fields_cache
 
-    path = pathlib.Path(config.BO_AUTHORING_CONTRACT_PATH)
+    path = pathlib.Path(resolved_path)
     try:
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
@@ -404,6 +511,7 @@ def authoring_field_projection() -> dict:
         ),
     }
     _authoring_fields_cache = projection
+    _authoring_fields_cache_path = resolved_path
     return projection
 
 
