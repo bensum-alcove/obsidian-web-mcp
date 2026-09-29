@@ -6,6 +6,7 @@ isolation) by proving the real wiring actually works.
 """
 
 import json
+import re
 from pathlib import Path
 
 import frontmatter
@@ -102,36 +103,69 @@ def test_real_create_preserves_authored_checkout_policy(seeded_schedule):
 
 
 @pytest.mark.parametrize(
-    ("kind", "expected"),
+    ("kind", "intent", "contract_kind", "role", "expected"),
     [
-        ("implementation", "Source and test edits within this build's scope are allowed and required"),
-        ("reviewer", "Do not create, modify, delete, rename, or move any file"),
-        ("deploy", "Do not edit source or test files"),
+        ("deferred-derived", "deferred", None, "executor", "implementation"),
+        ("deferred-explicit", "deferred", "push", "executor", "implementation"),
+        ("required-derived", "required", None, "executor", "implementation"),
+        ("required-explicit", "required", "push-deploy", "executor", "implementation"),
+        ("required-deploy-only", "required", "deploy-only", "executor", "deploy"),
+        ("not-applicable-derived", "not_applicable", None, "executor", "read-only"),
+        ("not-applicable-explicit", "not_applicable", "push", "executor", "implementation"),
+        ("reviewer", "not_applicable", None, "reviewer", "read-only"),
     ],
 )
-def test_real_create_uses_build_type_checkout_default(seeded_schedule, kind, expected):
+def test_real_create_uses_build_type_checkout_default(
+    seeded_schedule, kind, intent, contract_kind, role, expected,
+):
     build_id = f"scratch-real-e2e-policy-{kind}"
-    fields = {
-        "implementation": {
-            "deployment_intent": "not_applicable", "work_role": "executor",
-            "completion_contract": {
-                "assertions": [
-                    {"type": "git_pushed", "push_required": True,
-                     "head_matches": f"origin/candidate/{build_id}"},
-                    {"type": "summary_valid"},
-                    {"type": "checkout_no_new_dirt"},
-                ],
-                "waivers": [],
-            },
-        },
-        "reviewer": {"deployment_intent": "not_applicable", "work_role": "reviewer"},
-        "deploy": {"deployment_intent": "required", "work_role": "executor"},
-    }[kind]
+    fields = {"deployment_intent": intent, "work_role": role}
+    if contract_kind:
+        assertions = [{"type": "summary_valid"}, {"type": "checkout_no_new_dirt"}]
+        if contract_kind in ("push", "push-deploy"):
+            assertions.insert(0, {"type": "git_pushed", "push_required": True,
+                                  "head_matches": f"origin/candidate/{build_id}"})
+        if contract_kind in ("push-deploy", "deploy-only"):
+            assertions.append({"type": "deployment_status_ok"})
+        fields["completion_contract"] = {
+            "assertions": assertions,
+            "waivers": ([{"assertion": "git_pushed", "reason": "deploy-only stage"}]
+                        if contract_kind == "deploy-only" else []),
+        }
     result = json.loads(bo.bo_create_build(_build(build_id, **fields), SCHEDULE_PATH))
     assert result["ok"] is True, result
     stored = (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
     assert stored.count("## Checkout write policy") == 1
-    assert expected in stored
+    expected_text = {
+        "implementation": "Source and test edits within this build's scope are allowed and required",
+        "read-only": "Do not create, modify, delete, rename, or move any file",
+        "deploy": "Do not edit source or test files",
+    }[expected]
+    assert expected_text in stored
+    if expected == "implementation":
+        assert "Do not create, modify, delete, rename, or move any file" not in stored
+        assert "Do not edit source or test files" not in stored
+    contract = frontmatter.loads(stored).metadata["completion_contract"]
+    if kind in ("deferred-derived", "required-derived"):
+        assert not result["warnings"]
+        assert any(a.get("type") == "git_pushed" and a.get("push_required") is True
+                   for a in contract["assertions"])
+
+
+@pytest.mark.parametrize("heading", [
+    "# Checkout Write Policy", "## CHECKOUT WRITE POLICY",
+    "### Checkout write policy", "#### checkout write policy",
+])
+def test_real_create_keeps_heading_variant_without_duplicate(seeded_schedule, heading):
+    build_id = "scratch-real-e2e-heading-" + str(len(heading))
+    body = f"Do the thing.\n\n{heading}\n\n- Keep authored bytes.  \n\n## Next heading\nContinue."
+    result = json.loads(bo.bo_create_build(_build(
+        build_id, body_markdown=body, work_role="reviewer", deployment_intent="not_applicable",
+    ), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    stored = (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
+    assert len(re.findall(r"(?im)^#{1,4} +checkout write policy *$", stored)) == 1
+    assert f"{heading}\n\n- Keep authored bytes.  \n\n" in stored
 
 
 def test_real_rejects_unknown_project_with_no_writes(seeded_schedule):

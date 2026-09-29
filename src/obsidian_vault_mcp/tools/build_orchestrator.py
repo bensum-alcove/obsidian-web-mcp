@@ -41,9 +41,10 @@ logger = logging.getLogger(__name__)
 REQUIRED_BUILD_FIELDS = ("build_id", "title", "body_markdown", "tier", "project")
 _BUILDS_KEY_RE = re.compile(r"^(builds\s*:)", re.MULTILINE)
 _SPEC_HEADING_RE = re.compile(r"^#\s+(?:.+?\s+[—-]\s+)?(.+)\s*$", re.MULTILINE)
-_CHECKOUT_POLICY_RE = re.compile(
-    r"(?ms)^##[ \t]+Checkout write policy[ \t]*\r?$.*?(?=^##[ \t]+|\Z)"
+_CHECKOUT_POLICY_HEADING_RE = re.compile(
+    r"^(#{1,4})[ \t]+Checkout write policy[ \t]*\r?$", re.IGNORECASE | re.MULTILINE,
 )
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,4})[ \t]+", re.MULTILINE)
 _SUMMARY_INSTRUCTION = (
     "Write a summary to /tmp/cc-summary-{build_id}.txt where the FIRST LINE is exactly: "
     "{build_id}.\nThen on following lines: status (pass/fail), files changed, test results."
@@ -141,55 +142,97 @@ def _render_spec_item(build: dict, schedule_entry: dict, persist_keys: frozenset
     return item
 
 
-def _policy_section_for(build: dict) -> str:
-    """Choose only the checkout default; BO remains the schema authority."""
-    if build.get("deployment_intent") == "required":
-        template = _DEPLOY_POLICY
-    else:
-        contract = build.get("completion_contract") or {}
-        assertions = (contract.get("assertions") or []) if isinstance(contract, dict) else []
-        waivers = (contract.get("waivers") or []) if isinstance(contract, dict) else []
-        push_required = any(
-            isinstance(item, dict) and item.get("type") == "git_pushed"
-            and item.get("push_required") is True
-            and not any(
-                isinstance(waiver, dict)
-                and waiver.get("assertion") in ("git_pushed", index)
-                for waiver in waivers
+def _policy_span_at(body: str, heading: re.Match) -> tuple[int, int]:
+    level = len(heading.group(1))
+    for following in _MARKDOWN_HEADING_RE.finditer(body, heading.end()):
+        if len(following.group(1)) <= level:
+            return heading.start(), following.start()
+    return heading.start(), len(body)
+
+
+def _checkout_policy_span(body: str) -> tuple[int, int] | None:
+    """Find a policy section through the next heading at its level or above."""
+    heading = _CHECKOUT_POLICY_HEADING_RE.search(body)
+    return _policy_span_at(body, heading) if heading else None
+
+
+def _policy_section_for(build: dict, contract: dict) -> tuple[str, str | None]:
+    """Choose from BO's rendered contract; return any authoring warning."""
+    assertions = contract.get("assertions") or [] if isinstance(contract, dict) else []
+    waivers = contract.get("waivers") or [] if isinstance(contract, dict) else []
+    waived_push = any(
+        isinstance(waiver, dict) and (
+            waiver.get("assertion") == "git_pushed"
+            or (
+                isinstance(waiver.get("assertion"), int)
+                and 0 <= waiver["assertion"] < len(assertions)
+                and isinstance(assertions[waiver["assertion"]], dict)
+                and assertions[waiver["assertion"]].get("type") == "git_pushed"
             )
-            for index, item in enumerate(assertions)
         )
-        role = build.get("work_role")
-        template = (
-            _IMPLEMENTATION_POLICY if role in ("executor", "mechanical") and push_required
-            else _READ_ONLY_POLICY
+        for waiver in waivers
+    )
+    push_required = any(
+        isinstance(item, dict) and item.get("type") == "git_pushed"
+        and item.get("push_required") is True
+        and not waived_push
+        and not any(
+            isinstance(waiver, dict) and waiver.get("assertion") == index
+            for waiver in waivers
         )
-    return template.format(build_id=build["build_id"])
+        for index, item in enumerate(assertions)
+    )
+    deployment_assertions = {
+        "deployment_status_ok", "sha_deployed", "supervisor_program_running",
+        "http_health", "deployed_build_attestation",
+    }
+    has_deployment = any(
+        isinstance(item, dict) and item.get("type") in deployment_assertions
+        for item in assertions
+    )
+    role = build.get("work_role")
+    warning = None
+    if role not in ("executor", "mechanical"):
+        template = _READ_ONLY_POLICY
+    elif waived_push and has_deployment:
+        template = _DEPLOY_POLICY
+    elif waived_push:
+        template = _READ_ONLY_POLICY
+    elif push_required:
+        template = _IMPLEMENTATION_POLICY
+    else:
+        template = _IMPLEMENTATION_POLICY
+        warning = "Checkout write policy is ambiguous; confirm whether this build should edit source."
+    return template.format(build_id=build["build_id"]), warning
 
 
-def _body_with_checkout_policy(build: dict) -> tuple[str, str]:
+def _body_with_checkout_policy(build: dict) -> tuple[str, str | None]:
     """Keep an authored policy verbatim, or add the build-type default."""
     body = build["body_markdown"]
-    policy = _CHECKOUT_POLICY_RE.search(body)
+    policy = _checkout_policy_span(body)
     if policy:
         if "Write a summary to /tmp/cc-summary-" not in body:
             instruction = _SUMMARY_INSTRUCTION.format(build_id=build["build_id"])
-            body = body[:policy.start()] + instruction + "\n\n" + body[policy.start():]
-        return body, policy.group()
+            body = body[:policy[0]] + instruction + "\n\n" + body[policy[0]:]
+        return body, build["body_markdown"][policy[0]:policy[1]]
     if "Write a summary to /tmp/cc-summary-" not in body:
         body = body.rstrip() + "\n\n" + _SUMMARY_INSTRUCTION.format(build_id=build["build_id"])
-    section = _policy_section_for(build)
-    return body.rstrip() + "\n\n" + section, section
+    section = _READ_ONLY_POLICY.format(build_id=build["build_id"])
+    return body.rstrip() + "\n\n" + section, None
 
 
 def _restore_checkout_policy(spec_text: str, section: str, build_id: str) -> str:
     """Undo BO's read-only replacement without changing its YAML rendering."""
-    match = _CHECKOUT_POLICY_RE.search(spec_text)
+    headings = list(_CHECKOUT_POLICY_HEADING_RE.finditer(spec_text))
+    for duplicate in reversed(headings[1:]):
+        start, end = _policy_span_at(spec_text, duplicate)
+        spec_text = spec_text[:start].rstrip() + "\n" + spec_text[end:]
+    match = _checkout_policy_span(spec_text)
     if not match:
         raise bo_contract.BOContractError(
             "adapter_bad_output", f"rendered spec {build_id!r} has no checkout write policy",
         )
-    return spec_text[:match.start()] + section + spec_text[match.end():]
+    return spec_text[:match[0]] + section + spec_text[match[1]:]
 
 
 def _splice_schedule_entry_field(entry_text: str, field_name: str, value) -> str:
@@ -500,12 +543,27 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     # adapter's validate_graph still has the only word on whether the shape
     # is valid.
     overrides = spec_markdown_overrides or {}
+    policy_warnings = []
     for b in normalized_builds:
         if b["build_id"] in overrides:
             rendered[b["build_id"]]["spec"] = overrides[b["build_id"]]
         else:
+            section = policy_sections[b["build_id"]]
+            if section is None:
+                rendered_contract = frontmatter.loads(rendered[b["build_id"]]["spec"]).metadata.get(
+                    "completion_contract"
+                )
+                section, warning = _policy_section_for(
+                    b, rendered_contract if rendered_contract is not None
+                    else b.get("completion_contract") or {},
+                )
+                if warning:
+                    policy_warnings.append({
+                        "code": "checkout_policy_ambiguous", "build_id": b["build_id"],
+                        "message": warning,
+                    })
             spec_text = _restore_checkout_policy(
-                rendered[b["build_id"]]["spec"], policy_sections[b["build_id"]], b["build_id"],
+                rendered[b["build_id"]]["spec"], section, b["build_id"],
             )
             for field_name in sorted(persist_keys):
                 if field_name == "depends_on":
@@ -540,7 +598,7 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     return {
         "ok": not errors,
         "errors": errors,
-        "warnings": result.get("warnings", []),
+        "warnings": result.get("warnings", []) + policy_warnings,
         "nodes": new_nodes,
         "rendered": rendered,
         "version_info": version_info,
@@ -725,6 +783,7 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
         "contract_version": prep["version_info"].get("contract_version"),
         "schedule_path": schedule_path,
         "created": created,
+        "warnings": prep["warnings"],
         "activation": {"schedule_path": schedule_path, "size": size, "created_new_file": is_new},
     })
 

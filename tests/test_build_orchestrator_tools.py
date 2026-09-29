@@ -156,10 +156,10 @@ def test_authored_checkout_policy_survives_bo_replacement(monkeypatch, seeded_sc
         for item in specs:
             bid = item["build_id"]
             spec = result["rendered"][bid]["spec"]
-            match = bo._CHECKOUT_POLICY_RE.search(spec)
+            match = bo._checkout_policy_span(spec)
             assert match is not None
             result["rendered"][bid]["spec"] = (
-                spec[:match.start()] + bo._READ_ONLY_POLICY.format(build_id=bid) + spec[match.end():]
+                spec[:match[0]] + bo._READ_ONLY_POLICY.format(build_id=bid) + spec[match[1]:]
             )
         return result
 
@@ -203,7 +203,9 @@ def test_missing_checkout_policy_gets_build_type_default(
         "reviewer": {"work_role": "reviewer", "deployment_intent": "not_applicable"},
         "waived": {"work_role": "executor", "deployment_intent": "not_applicable",
                    "completion_contract": {**_PUSH_CONTRACT, "waivers": [{"assertion": "git_pushed"}]}},
-        "deploy": {"work_role": "executor", "deployment_intent": "required"},
+        "deploy": {"work_role": "executor", "deployment_intent": "required",
+                   "completion_contract": {"assertions": [{"type": "deployment_status_ok"}],
+                                           "waivers": [{"assertion": "git_pushed"}]}},
     }[kind]
     build = _build(f"policy-{kind}", **fields)
     result = json.loads(
@@ -214,6 +216,21 @@ def test_missing_checkout_policy_gets_build_type_default(
     stored = _stored_spec(seeded_schedule, build["build_id"])
     assert stored.count("## Checkout write policy") == 1
     assert expected in stored
+
+
+def test_ambiguous_executor_policy_warns_in_tool_result(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    build = _build("policy-ambiguous", work_role="executor", deployment_intent="not_applicable",
+                   completion_contract={"assertions": [{"type": "summary_valid"}], "waivers": []})
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    assert result["warnings"] == [{
+        "code": "checkout_policy_ambiguous", "build_id": "policy-ambiguous",
+        "message": "Checkout write policy is ambiguous; confirm whether this build should edit source.",
+    }]
+    assert "Source and test edits within this build's scope are allowed and required" in (
+        _stored_spec(seeded_schedule, "policy-ambiguous")
+    )
 
 
 def test_activate_existing_spec_keeps_policy_bytes(monkeypatch, seeded_schedule):
