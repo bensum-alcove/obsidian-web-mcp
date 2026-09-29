@@ -41,6 +41,34 @@ logger = logging.getLogger(__name__)
 REQUIRED_BUILD_FIELDS = ("build_id", "title", "body_markdown", "tier", "project")
 _BUILDS_KEY_RE = re.compile(r"^(builds\s*:)", re.MULTILINE)
 _SPEC_HEADING_RE = re.compile(r"^#\s+(?:.+?\s+[—-]\s+)?(.+)\s*$", re.MULTILINE)
+_CHECKOUT_POLICY_RE = re.compile(
+    r"(?ms)^##[ \t]+Checkout write policy[ \t]*\r?$.*?(?=^##[ \t]+|\Z)"
+)
+_SUMMARY_INSTRUCTION = (
+    "Write a summary to /tmp/cc-summary-{build_id}.txt where the FIRST LINE is exactly: "
+    "{build_id}.\nThen on following lines: status (pass/fail), files changed, test results."
+)
+_READ_ONLY_POLICY = """## Checkout write policy
+
+- Do not create, modify, delete, rename, or move any file inside the project checkout, including reports, notes, temporary exports, caches, lockfiles, or generated analysis artifacts.
+- Write build output only to `~/.build-orchestrator/pending-logs/{build_id}-output.md`, the declared BS Brain target, and `/tmp/cc-summary-{build_id}.txt`.
+- Capture the initial Git dirty-path baseline before analysis and re-check it before writing the summary.
+- If this builder accidentally creates an untracked report, preserve its bytes in the pending-log area and remove only that builder-created checkout copy before summary. Never use `git clean` or touch pre-existing dirt.
+"""
+_IMPLEMENTATION_POLICY = """## Checkout write policy
+
+- Source and test edits within this build's scope are allowed and required. Commit them in the isolated checkout and push only to the candidate ref declared by this build.
+- Keep reports, notes, temporary exports, caches, and generated analysis artifacts out of the project checkout; write output only to the declared pending log, BS Brain target, and summary file.
+- Capture the initial Git dirty-path baseline before work and re-check it before writing the summary. Preserve pre-existing dirt and leave no new uncommitted changes.
+- Never use `git clean`.
+"""
+_DEPLOY_POLICY = """## Checkout write policy
+
+- Do not edit source or test files. Make only the git and release writes required by this build's deploy steps.
+- Keep reports, notes, temporary exports, caches, and generated analysis artifacts out of the project checkout; write output only to the declared pending log, BS Brain target, and summary file.
+- Capture the initial Git dirty-path baseline before work and re-check it before writing the summary. Preserve pre-existing dirt.
+- Never use `git clean`.
+"""
 # DB-collision codes the adapter applies to every node it is given, including
 # unchanged historical siblings included only as graph context. Same client-side
 # filter shape as bo_guard HI5-3: keep the finding when it names a newly
@@ -111,6 +139,57 @@ def _render_spec_item(build: dict, schedule_entry: dict, persist_keys: frozenset
         if build.get(key) is not None:
             item[key] = build[key]
     return item
+
+
+def _policy_section_for(build: dict) -> str:
+    """Choose only the checkout default; BO remains the schema authority."""
+    if build.get("deployment_intent") == "required":
+        template = _DEPLOY_POLICY
+    else:
+        contract = build.get("completion_contract") or {}
+        assertions = (contract.get("assertions") or []) if isinstance(contract, dict) else []
+        waivers = (contract.get("waivers") or []) if isinstance(contract, dict) else []
+        push_required = any(
+            isinstance(item, dict) and item.get("type") == "git_pushed"
+            and item.get("push_required") is True
+            and not any(
+                isinstance(waiver, dict)
+                and waiver.get("assertion") in ("git_pushed", index)
+                for waiver in waivers
+            )
+            for index, item in enumerate(assertions)
+        )
+        role = build.get("work_role")
+        template = (
+            _IMPLEMENTATION_POLICY if role in ("executor", "mechanical") and push_required
+            else _READ_ONLY_POLICY
+        )
+    return template.format(build_id=build["build_id"])
+
+
+def _body_with_checkout_policy(build: dict) -> tuple[str, str]:
+    """Keep an authored policy verbatim, or add the build-type default."""
+    body = build["body_markdown"]
+    policy = _CHECKOUT_POLICY_RE.search(body)
+    if policy:
+        if "Write a summary to /tmp/cc-summary-" not in body:
+            instruction = _SUMMARY_INSTRUCTION.format(build_id=build["build_id"])
+            body = body[:policy.start()] + instruction + "\n\n" + body[policy.start():]
+        return body, policy.group()
+    if "Write a summary to /tmp/cc-summary-" not in body:
+        body = body.rstrip() + "\n\n" + _SUMMARY_INSTRUCTION.format(build_id=build["build_id"])
+    section = _policy_section_for(build)
+    return body.rstrip() + "\n\n" + section, section
+
+
+def _restore_checkout_policy(spec_text: str, section: str, build_id: str) -> str:
+    """Undo BO's read-only replacement without changing its YAML rendering."""
+    match = _CHECKOUT_POLICY_RE.search(spec_text)
+    if not match:
+        raise bo_contract.BOContractError(
+            "adapter_bad_output", f"rendered spec {build_id!r} has no checkout write policy",
+        )
+    return spec_text[:match.start()] + section + spec_text[match.end():]
 
 
 def _splice_schedule_entry_field(entry_text: str, field_name: str, value) -> str:
@@ -405,10 +484,12 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     schedule_entries = {
         b["build_id"]: _schedule_entry_for(b, schedule_keys) for b in normalized_builds
     }
-    render_specs = [
-        _render_spec_item(b, schedule_entries[b["build_id"]], persist_keys)
-        for b in normalized_builds
-    ]
+    policy_sections = {}
+    render_specs = []
+    for b in normalized_builds:
+        item = _render_spec_item(b, schedule_entries[b["build_id"]], persist_keys)
+        item["body_markdown"], policy_sections[b["build_id"]] = _body_with_checkout_policy(b)
+        render_specs.append(item)
 
     rendered = bo_contract.render_graph(render_specs)["rendered"]
 
@@ -423,7 +504,9 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
         if b["build_id"] in overrides:
             rendered[b["build_id"]]["spec"] = overrides[b["build_id"]]
         else:
-            spec_text = rendered[b["build_id"]]["spec"]
+            spec_text = _restore_checkout_policy(
+                rendered[b["build_id"]]["spec"], policy_sections[b["build_id"]], b["build_id"],
+            )
             for field_name in sorted(persist_keys):
                 if field_name == "depends_on":
                     spec_text = update_frontmatter_field(

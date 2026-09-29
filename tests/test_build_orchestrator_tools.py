@@ -11,6 +11,7 @@ absent from this host.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,95 @@ def test_create_build_writes_spec_then_schedule(monkeypatch, seeded_schedule):
     assert "id: scratch-1" in schedule_content
     assert result["created"][0]["spec_path"] == "Personal/Build Orchestrator/specs/scratch-1.md"
     assert result["activation"]["schedule_path"] == SCHEDULE_PATH
+
+
+_PUSH_CONTRACT = {"assertions": [{"type": "git_pushed", "push_required": True}]}
+
+
+def _stored_spec(vault, build_id):
+    return (vault / "Personal/Build Orchestrator/specs" / f"{build_id}.md").read_text()
+
+
+@pytest.mark.parametrize("tool", ["build", "chain"])
+def test_authored_checkout_policy_survives_bo_replacement(monkeypatch, seeded_schedule, tool):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    original_render = _fake_render_graph
+
+    def replacing_render(specs, timeout=None):
+        result = original_render(specs, timeout=timeout)
+        for item in specs:
+            bid = item["build_id"]
+            spec = result["rendered"][bid]["spec"]
+            match = bo._CHECKOUT_POLICY_RE.search(spec)
+            assert match is not None
+            result["rendered"][bid]["spec"] = (
+                spec[:match.start()] + bo._READ_ONLY_POLICY.format(build_id=bid) + spec[match.end():]
+            )
+        return result
+
+    monkeypatch.setattr(bo_contract, "render_graph", replacing_render)
+    authored = "## Checkout write policy\n\n- Source edits allowed and required.  \n- Keep  spacing.\n\n"
+    body = "Work.\n\n" + authored + "## Next heading\nFurther work."
+    build = _build("policy-authored", body_markdown=body, work_role="executor",
+                   deployment_intent="not_applicable", completion_contract=_PUSH_CONTRACT)
+    result = json.loads(
+        bo.bo_create_build(build, SCHEDULE_PATH) if tool == "build"
+        else bo.bo_create_chain([build], SCHEDULE_PATH)
+    )
+    assert result["ok"] is True, result
+    stored = _stored_spec(seeded_schedule, "policy-authored")
+    assert stored.count("## Checkout write policy") == 1
+    match = re.search(r"(?s)## Checkout write policy.*?(?=## Next heading)", stored)
+    assert match is not None
+    assert match.group() == authored
+
+
+@pytest.mark.parametrize("tool", ["build", "chain"])
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("implementation", "Source and test edits within this build's scope are allowed and required"),
+        ("mechanical", "Source and test edits within this build's scope are allowed and required"),
+        ("reviewer", "Do not create, modify, delete, rename, or move any file"),
+        ("waived", "Do not create, modify, delete, rename, or move any file"),
+        ("deploy", "Do not edit source or test files"),
+    ],
+)
+def test_missing_checkout_policy_gets_build_type_default(
+    monkeypatch, seeded_schedule, tool, kind, expected,
+):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    fields = {
+        "implementation": {"work_role": "executor", "deployment_intent": "not_applicable",
+                           "completion_contract": _PUSH_CONTRACT},
+        "mechanical": {"work_role": "mechanical", "deployment_intent": "not_applicable",
+                       "completion_contract": _PUSH_CONTRACT},
+        "reviewer": {"work_role": "reviewer", "deployment_intent": "not_applicable"},
+        "waived": {"work_role": "executor", "deployment_intent": "not_applicable",
+                   "completion_contract": {**_PUSH_CONTRACT, "waivers": [{"assertion": "git_pushed"}]}},
+        "deploy": {"work_role": "executor", "deployment_intent": "required"},
+    }[kind]
+    build = _build(f"policy-{kind}", **fields)
+    result = json.loads(
+        bo.bo_create_build(build, SCHEDULE_PATH) if tool == "build"
+        else bo.bo_create_chain([build], SCHEDULE_PATH)
+    )
+    assert result["ok"] is True, result
+    stored = _stored_spec(seeded_schedule, build["build_id"])
+    assert stored.count("## Checkout write policy") == 1
+    assert expected in stored
+
+
+def test_activate_existing_spec_keeps_policy_bytes(monkeypatch, seeded_schedule):
+    monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
+    spec_dir = seeded_schedule / "Personal/Build Orchestrator/specs"
+    spec_dir.mkdir(parents=True)
+    spec_path = spec_dir / "scratch-inert.md"
+    original = _inert_spec_markdown() + "\n## Checkout write policy\n\n- Keep exact  bytes.\n"
+    spec_path.write_text(original)
+    result = json.loads(bo.bo_activate_existing_spec("scratch-inert", SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    assert spec_path.read_text() == original
 
 
 def test_create_build_on_existing_empty_flow_list_schedule(monkeypatch, empty_flow_schedule):
@@ -840,4 +930,3 @@ def test_true_terminal_id_reuse_on_new_id_still_fails(monkeypatch, seeded_schedu
     assert result["errors"][0]["build_id"] == "scratch-1"
     assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
     assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
-

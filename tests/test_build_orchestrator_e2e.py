@@ -75,6 +75,65 @@ def test_real_validate_and_create_single_build(seeded_schedule):
     assert "id: scratch-real-e2e-single" in schedule_content
 
 
+def test_real_create_preserves_authored_checkout_policy(seeded_schedule):
+    build_id = "scratch-real-e2e-policy-authored"
+    policy = "## Checkout write policy\n\n- Source edits allowed and required.  \n- Keep  spacing.\n\n"
+    body = "Do the thing.\n\n" + policy + "## Next heading\nContinue."
+    build = _build(
+        build_id, body_markdown=body, deployment_intent="not_applicable",
+        work_role="executor",
+        completion_contract={
+            "assertions": [
+                {"type": "git_pushed", "push_required": True,
+                 "head_matches": f"origin/candidate/{build_id}"},
+                {"type": "summary_valid"},
+                {"type": "checkout_no_new_dirt"},
+            ],
+            "waivers": [],
+        },
+    )
+    result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    stored = (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
+    assert stored.count("## Checkout write policy") == 1
+    assert stored.split("## Checkout write policy", 1)[1].split("## Next heading", 1)[0] == (
+        policy.split("## Checkout write policy", 1)[1]
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("implementation", "Source and test edits within this build's scope are allowed and required"),
+        ("reviewer", "Do not create, modify, delete, rename, or move any file"),
+        ("deploy", "Do not edit source or test files"),
+    ],
+)
+def test_real_create_uses_build_type_checkout_default(seeded_schedule, kind, expected):
+    build_id = f"scratch-real-e2e-policy-{kind}"
+    fields = {
+        "implementation": {
+            "deployment_intent": "not_applicable", "work_role": "executor",
+            "completion_contract": {
+                "assertions": [
+                    {"type": "git_pushed", "push_required": True,
+                     "head_matches": f"origin/candidate/{build_id}"},
+                    {"type": "summary_valid"},
+                    {"type": "checkout_no_new_dirt"},
+                ],
+                "waivers": [],
+            },
+        },
+        "reviewer": {"deployment_intent": "not_applicable", "work_role": "reviewer"},
+        "deploy": {"deployment_intent": "required", "work_role": "executor"},
+    }[kind]
+    result = json.loads(bo.bo_create_build(_build(build_id, **fields), SCHEDULE_PATH))
+    assert result["ok"] is True, result
+    stored = (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
+    assert stored.count("## Checkout write policy") == 1
+    assert expected in stored
+
+
 def test_real_rejects_unknown_project_with_no_writes(seeded_schedule):
     build = _build("scratch-real-e2e-badproj", project="totally-unconfigured-project-xyz")
     result = json.loads(bo.bo_create_build(build, SCHEDULE_PATH))
