@@ -192,7 +192,7 @@ def _policy_section_for(build: dict, contract: dict) -> tuple[str, str | None]:
     )
     role = build.get("work_role")
     warning = None
-    if role not in ("executor", "mechanical"):
+    if role in ("adviser", "reviewer"):
         template = _READ_ONLY_POLICY
     elif waived_push and has_deployment:
         template = _DEPLOY_POLICY
@@ -221,8 +221,24 @@ def _body_with_checkout_policy(build: dict) -> tuple[str, str | None]:
     return body.rstrip() + "\n\n" + section, None
 
 
-def _restore_checkout_policy(spec_text: str, section: str, build_id: str) -> str:
+def _restore_checkout_policy(spec_text: str, section: str, build_id: str,
+                             authored_body: str) -> str:
     """Undo BO's read-only replacement without changing its YAML rendering."""
+    authored_heading = _CHECKOUT_POLICY_HEADING_RE.search(authored_body)
+    if authored_heading:
+        authored_span = _policy_span_at(authored_body, authored_heading)
+        following = authored_body[authored_span[1]:]
+        if re.match(r"^#[ \t]+", following):
+            next_level_two = re.search(r"^##[ \t]+", authored_body[authored_heading.end():], re.MULTILINE)
+            renderer_stop = (authored_heading.end() + next_level_two.start()
+                             if next_level_two else len(authored_body))
+            if authored_span[1] < renderer_stop:
+                heading = following.splitlines()[0]
+                raise bo_contract.BOContractError(
+                    "checkout_policy_level_one_heading",
+                    f"authored checkout policy in {build_id!r} is followed by {heading!r}; "
+                    "the renderer would discard that heading and its content",
+                )
     headings = list(_CHECKOUT_POLICY_HEADING_RE.finditer(spec_text))
     for duplicate in reversed(headings[1:]):
         start, end = _policy_span_at(spec_text, duplicate)
@@ -564,6 +580,7 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
                     })
             spec_text = _restore_checkout_policy(
                 rendered[b["build_id"]]["spec"], section, b["build_id"],
+                b["body_markdown"],
             )
             for field_name in sorted(persist_keys):
                 if field_name == "depends_on":

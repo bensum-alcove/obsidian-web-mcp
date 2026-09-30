@@ -102,6 +102,50 @@ def test_real_create_preserves_authored_checkout_policy(seeded_schedule):
     )
 
 
+def test_real_create_without_work_role_uses_derived_contract(seeded_schedule):
+    mismatches = []
+    for intent, expected in (
+        ("deferred", "implementation"),
+        ("required", "implementation"),
+        ("not_applicable", "read-only"),
+    ):
+        build_id = f"scratch-real-e2e-no-role-{intent.replace('_', '-')}"
+        result = json.loads(bo.bo_create_build(_build(
+            build_id, deployment_intent=intent,
+        ), SCHEDULE_PATH))
+        assert result["ok"] is True, result
+        assert result["warnings"] == []
+        stored = (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").read_text()
+        contract = frontmatter.loads(stored).metadata["completion_contract"]
+        push_required = any(
+            assertion.get("type") == "git_pushed" and assertion.get("push_required") is True
+            for assertion in contract["assertions"]
+        )
+        assert push_required is (expected == "implementation")
+        expected_text = {
+            "implementation": "Source and test edits within this build's scope are allowed and required",
+            "read-only": "Do not create, modify, delete, rename, or move any file",
+        }[expected]
+        if expected_text not in stored:
+            mismatches.append(intent)
+    assert not mismatches, f"wrong checkout policy for: {mismatches}"
+
+
+def test_real_create_rejects_level_one_heading_after_authored_policy(seeded_schedule):
+    build_id = "scratch-real-e2e-policy-appendix"
+    body = (
+        "Do the thing.\n\n## Checkout write policy\n\n- Keep this policy.\n\n"
+        "# Appendix KEEP-ME\n\nKEEP-ME-APPENDIX\n\n## Later\n\nKeep later content."
+    )
+    result = json.loads(bo.bo_create_build(_build(
+        build_id, body_markdown=body, deployment_intent="not_applicable",
+    ), SCHEDULE_PATH))
+    assert result["ok"] is False, result
+    assert result["code"] == "checkout_policy_level_one_heading"
+    assert "Appendix KEEP-ME" in result["error"]
+    assert not (seeded_schedule / f"Personal/Build Orchestrator/specs/{build_id}.md").exists()
+
+
 @pytest.mark.parametrize(
     ("kind", "intent", "contract_kind", "role", "expected"),
     [
