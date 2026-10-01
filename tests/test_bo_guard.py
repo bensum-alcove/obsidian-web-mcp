@@ -345,6 +345,113 @@ def test_whole_graph_validation_runs_for_a_schedule_rewrite(monkeypatch):
     assert any(i.rule_id == "bo-guard-schedule-graph" for i in result.issues)
 
 
+def test_bound_canary_with_matching_probe_authority_has_no_guard_issues(monkeypatch):
+    """bs-brain-guard-canary-authority-fix-v1: the preflight's own per-entry
+    check runs with no model_probe_authority (it only sees the schedule
+    entry, not the spec), so it used to raise unknown_codex_model for a
+    canary model whose spec DOES carry matching authority. The full-graph
+    check (which reads the real spec and authority) finds no problem, so the
+    write must have no issues at all."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [{"code": "unknown_codex_model", "message": "unknown codex_model 'gpt-6.1-sol'", "build_id": "new-build"}],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": True, "errors": [], "warnings": [],
+        },
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=VALID_SCHEDULE_NEW, tool="vault_write")
+    )
+    assert result.issues == []
+
+
+def test_canary_with_missing_or_mismatched_probe_authority_still_rejected(monkeypatch):
+    """The preflight's false unknown_codex_model is dropped, but the
+    full-graph check -- which has the real (missing/mismatched) authority --
+    still raises its own unknown_codex_model and that one must still block."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [{"code": "unknown_codex_model", "message": "unknown codex_model 'gpt-6.1-sol'", "build_id": "new-build"}],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{"code": "unknown_codex_model", "message": "unknown codex_model 'gpt-6.1-sol'", "build_id": "new-build"}],
+            "warnings": [],
+        },
+    )
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=VALID_SCHEDULE_NEW, tool="vault_write")
+    )
+    assert any(i.rule_id == "bo-guard-schedule-graph" and "[unknown_codex_model]" in i.message for i in result.issues)
+    assert not any(i.rule_id == "bo-guard-schedule-rewrite" for i in result.issues)
+
+
+def test_unknown_model_id_not_in_registry_at_all_still_rejected(monkeypatch):
+    """A model id that isn't in the registry at all (not even as a canary)
+    must still be rejected by the full-graph check regardless of the
+    preflight-filter change."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [{"code": "unknown_codex_model", "message": "unknown codex_model 'totally-made-up'", "build_id": "new-build"}],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        bo_contract, "validate_graph",
+        lambda nodes, mode="strict_new", config_override=None, new_ids=None, timeout=None: {
+            "ok": False,
+            "errors": [{"code": "unknown_codex_model", "message": "unknown codex_model 'totally-made-up'", "build_id": "new-build"}],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setenv("BO_PATH_GUARD_MODE", "enforce")
+    with pytest.raises(bo_guard.BOGuardError):
+        bo_guard.enforce(
+            WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=VALID_SCHEDULE_NEW, tool="vault_write")
+        )
+
+
+def test_preflight_filter_keeps_owned_codes_alongside_dropped_unowned_code(monkeypatch):
+    """Direct test of the allowlist itself: a single preflight result mixing
+    an owned bound-row-preservation code with an unowned per-entry code must
+    keep the former and drop the latter."""
+    monkeypatch.setattr(
+        bo_contract, "preflight_schedule_rewrite",
+        lambda schedule_path, new_builds, mode="strict_new", timeout=None: {
+            "ok": False,
+            "errors": [
+                {"code": "schedule_binding_orphaned", "message": "would drop existing-build", "build_id": "existing-build"},
+                {"code": "unknown_codex_model", "message": "unknown codex_model 'gpt-6.1-sol'", "build_id": "new-build"},
+            ],
+            "warnings": [],
+        },
+    )
+    dropped = "---\ntype: schedule\nproject: edge-trading-system\n---\n\n# scratch\n\nbuilds:\n\n" + \
+        "  - id: new-build\n    title: t\n    description: t\n    run_when: x\n    tier: simple\n" + \
+        "    depends_on: []\n    spec_path: Personal/Build Orchestrator/specs/new-build.md\n"
+    result = bo_guard.evaluate_content(
+        WriteContext(path=SCHEDULE_PATH, old_content=VALID_SCHEDULE_OLD, new_content=dropped, tool="vault_write")
+    )
+    rewrite_issues = [i for i in result.issues if i.rule_id == "bo-guard-schedule-rewrite"]
+    assert len(rewrite_issues) == 1
+    assert "[schedule_binding_orphaned]" in rewrite_issues[0].message
+
+
 def test_unparseable_new_schedule_content_is_reject_not_advisory(monkeypatch):
     """B1: an unparseable/malformed rewrite used to be advisory-only, meaning
     an enforce-mode future build could never actually block it. It's now a

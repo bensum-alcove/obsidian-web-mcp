@@ -288,6 +288,22 @@ class BOGuardError(ValueError):
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
 
+# codes `preflight_schedule_rewrite`'s bound-row-preservation loop owns
+# (authoring_contract.py validate_schedule_rewrite, the loop over
+# schedule_bindings_lookup -- not its trailing per-entry validate_schedule_entry
+# call). That per-entry call is reached with no model_probe_authority (the
+# preflight only has the schedule entry, not the spec content), so any other
+# code it produces -- e.g. unknown_codex_model for a canary model whose spec
+# DOES carry matching probe authority -- is a false rejection here. The
+# full-graph check below reads every entry's on-disk spec and calls the same
+# validate_schedule_entry with the real authority, so it already owns every
+# other code correctly; this preflight stage must not duplicate it.
+_PREFLIGHT_SCHEDULE_REWRITE_OWNED_CODES = frozenset({
+    "schedule_binding_orphaned",
+    "terminal_schedule_entry_edit",
+    "frozen_contract_mutation",
+})
+
 # The authoritative freely-mutable-status set is sourced from the adapter's
 # own op=version vocabulary (known_statuses - terminal_statuses -
 # dispatched_statuses), not hardcoded here (codex-review-bo-authoring-
@@ -657,6 +673,16 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
         unchanged_ids,
         {"terminal_schedule_entry_edit"},
     )
+    # Keep only the codes this preflight stage owns (see
+    # _PREFLIGHT_SCHEDULE_REWRITE_OWNED_CODES docstring above) -- any other
+    # code is a per-entry validate_schedule_entry finding reached without
+    # model_probe_authority and would false-reject a bound canary; the
+    # full-graph check in step 2 already re-validates every entry correctly
+    # and owns those codes.
+    preflight_errors = [
+        err for err in preflight_errors
+        if err.get("code") in _PREFLIGHT_SCHEDULE_REWRITE_OWNED_CODES
+    ]
     issues.extend(_errors_to_issues("bo-guard-schedule-rewrite", preflight_errors))
 
     # 2. Whole-resulting-graph validation: every entry that will exist in the
