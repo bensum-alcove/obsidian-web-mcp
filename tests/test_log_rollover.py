@@ -274,3 +274,38 @@ def test_other_logs_get_no_invented_writer_note(rollover, vault_dir):
     head = live.read_text().split("## 2026-11-01")[0]
     assert "Write Rule 13" not in head
     assert "Earlier volumes: [[BS 2nd Brain/_log-2026-09-01-to-2026-09-01]]." in head
+
+
+# --- timezone: the vault and its cron run on Brisbane time ---------------------
+
+def test_vault_today_uses_brisbane_not_utc(rollover):
+    from datetime import datetime, timezone
+
+    # 2026-11-01 08:00 AEST is still 2026-10-31 in UTC.
+    now = datetime(2026, 10, 31, 22, 0, tzinfo=timezone.utc)
+    assert rollover.vault_today(now) == date(2026, 11, 1)
+    # And 2026-10-31 23:00 AEST (13:00 UTC) is still October.
+    assert rollover.vault_today(datetime(2026, 10, 31, 13, 0, tzinfo=timezone.utc)) == date(2026, 10, 31)
+
+
+def test_monthly_roll_at_0800_aest_on_the_1st_uses_november(rollover, vault_dir):
+    from datetime import datetime, timezone
+
+    p = _write(vault_dir, LOG, _log_text())  # entries from Aug-Oct
+    now = datetime(2026, 10, 31, 22, 0, tzinfo=timezone.utc)  # 2026-11-01 08:00 AEST
+
+    results = rollover.run(mode="monthly", apply=True, now=now)
+
+    assert results[0]["action"] == "rolled"  # the month check saw November, not October
+    new = p.read_text()
+    assert "## 2026-11-01 — Log rolled over" in new
+    assert 'created: "2026-11-01"' in new
+
+
+def test_monthly_roll_in_utc_terms_would_have_waited(rollover, vault_dir):
+    from datetime import datetime, timezone
+
+    _write(vault_dir, LOG, "---\ntype: changelog\n---\n# Log\n\n## 2026-10-02 — only October\nbody\n")
+    # 2026-10-31 20:00 UTC = 2026-11-01 06:00 AEST: a Brisbane-time cron on the 1st must roll the October volume.
+    results = rollover.run(mode="monthly", apply=False, now=datetime(2026, 10, 31, 20, 0, tzinfo=timezone.utc))
+    assert results[0]["action"] == "dry-run"

@@ -36,14 +36,30 @@ import hashlib
 import json
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from obsidian_vault_mcp import bounded_files, config, vault  # noqa: E402
+
+# The vault and its crons run on Brisbane time (no daylight saving, so UTC+10 is a safe fallback).
+try:
+    VAULT_TZ = ZoneInfo("Australia/Brisbane")
+except ZoneInfoNotFoundError:  # pragma: no cover - minimal container without tzdata
+    VAULT_TZ = timezone(timedelta(hours=10), "AEST")
+
+
+def vault_today(now: datetime | None = None) -> date:
+    """Today's date in the vault's timezone (a naive ``now`` is taken as UTC)."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(VAULT_TZ).date()
+
 
 DATE_HEADING_RE = re.compile(r"^#{1,3}\s+(\d{4}-\d{2}-\d{2})\b", re.MULTILINE)
 H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
@@ -79,7 +95,7 @@ def _volume_span(text: str, mtime: float) -> tuple[date, date]:
                 pass
     if fallback:
         return min(fallback), max(fallback)
-    d = datetime.fromtimestamp(mtime, tz=timezone.utc).date()
+    d = datetime.fromtimestamp(mtime, tz=VAULT_TZ).date()
     return d, d
 
 
@@ -263,8 +279,9 @@ def _apply_with_retry(plan: dict, mode: str, today: date) -> dict | None:
     return None
 
 
-def run(mode: str = "if-due", apply: bool = False, today: date | None = None) -> list[dict]:
-    today = today or datetime.now(timezone.utc).date()
+def run(mode: str = "if-due", apply: bool = False, today: date | None = None,
+        now: datetime | None = None) -> list[dict]:
+    today = today or vault_today(now)
     results = []
     for rel in bounded_files.existing_logs(config.VAULT_PATH):
         if Path(rel).name.lower() == "hot.md":  # defensive: hot.md is never rolled
