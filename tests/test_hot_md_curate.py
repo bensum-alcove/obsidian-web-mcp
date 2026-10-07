@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -357,7 +358,9 @@ def test_recent_mtime_cron_retry_applies_and_does_not_notify_before_retry(
     assert failures == []
     assert notifications == []
     assert "- shipped exact block 0" not in target.read_text()
-    assert "- shipped exact block 0" in (tmp_path / "hot-archive/2026-09.md").read_text()
+    assert "- shipped exact block 0" in (
+        tmp_path / f"hot-archive/{datetime.now():%Y-%m}.md"
+    ).read_text()
 
 
 def test_second_apply_is_idempotent_and_archive_is_lossless(curate, tmp_path, monkeypatch):
@@ -475,7 +478,9 @@ def test_routine_final_findings_and_review_due_send_zero_telegram(
 
     assert curate.main() == 0
     assert sent == []
-    report = (tmp_path / "BS 2nd Brain/Alcove/Infrastructure/hot-md-reports/2026-09-09.md").read_text()
+    report = (
+        tmp_path / f"BS 2nd Brain/Alcove/Infrastructure/hot-md-reports/{datetime.now():%Y-%m-%d}.md"
+    ).read_text()
     assert "OVER-BUDGET-AT-FLOOR" in report
     assert "STALE-BLOCKER: finished-blocker" in report
     assert "RESOLVED: finished-item" in report
