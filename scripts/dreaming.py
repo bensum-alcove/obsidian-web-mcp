@@ -732,13 +732,17 @@ def pass_archive_candidates(vault_path: Path, md_files: list[str], now: datetime
 
 
 def pass_hot_md_budget(vault_path: Path, md_files: list[str]) -> list[dict]:
+    """hot.md files over their Write Rule 21 budget (body chars vs ``char_budget``).
+
+    Same measure as section 7 (``bounded_files.hot_md_status``), so the two sections never disagree.
+    """
     flagged = []
     for rel in md_files:
         if Path(rel).name.lower() != "hot.md":
             continue
-        size = len(_read(vault_path, rel))
-        if size > HOT_MD_BUDGET_CHARS:
-            flagged.append({"path": rel, "chars": size, "budget": HOT_MD_BUDGET_CHARS})
+        status = bounded_files.hot_md_status(_read(vault_path, rel))
+        if status["over_budget"]:
+            flagged.append({"path": rel, "chars": status["chars"], "budget": status["budget"]})
     return flagged
 
 
@@ -978,9 +982,9 @@ def build_report(
     lines += ["", "## 4. hot.md budget"]
     if hot_md_flags:
         for f in hot_md_flags:
-            lines.append(f"- `{f['path']}` — {f['chars']} chars (budget {f['budget']})")
+            lines.append(f"- `{f['path']}` — {f['chars']} chars (budget {f['budget']}; body, frontmatter excluded)")
     else:
-        lines.append(f"All hot.md files under the {HOT_MD_BUDGET_CHARS}-char budget.")
+        lines.append(f"All hot.md files within their char budget (default {HOT_MD_BUDGET_CHARS}; body only).")
 
     lines += ["", "## 5. Near-duplicate detection"]
     title_matches = near_dups.get("title_matches", [])
@@ -1058,9 +1062,13 @@ def build_report(
     for c in archive_candidates[:20]:
         lines.append(f"- [ ] Consider archiving `{c['path']}` ({c['age_days']}d old, {c['status']})")
         action_count += 1
+    # One proposed action per hot.md: section 7 (when present) already covers everything
+    # section 4 flags, so section 4's trim line is only used when section 7 is absent.
+    rewrite_paths = {h["path"] for h in bounded["hot"] if h["flagged"]} if bounded is not None else set()
     for f in hot_md_flags:
-        lines.append(f"- [ ] Trim `{f['path']}` ({f['chars']} chars, budget {HOT_MD_BUDGET_CHARS})")
-        action_count += 1
+        if f["path"] not in rewrite_paths:
+            lines.append(f"- [ ] Trim `{f['path']}` ({f['chars']} chars, budget {f['budget']})")
+            action_count += 1
     if bounded is not None:
         for h in bounded["hot"]:
             if h["flagged"]:

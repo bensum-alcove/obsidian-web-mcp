@@ -236,6 +236,32 @@ def test_report_includes_bounded_section_and_actions_without_editing(dreaming, t
         assert p.read_bytes() == data
 
 
+def test_sections_4_and_7_agree_on_hot_md_budget_and_propose_one_action(dreaming, tmp_path, monkeypatch):
+    # 20 frontmatter lines + a 4,300-char body: over 5,000 chars whole-file, under budget by the Rule 21 measure.
+    fm = "---\n" + "".join(f"k{i}: value-{i:030d}\n" for i in range(20)) + "---\n"
+    (tmp_path / "Under").mkdir()
+    (tmp_path / "Under" / "hot.md").write_text(fm + "# Hot\n" + "x" * 4300)
+    assert len((tmp_path / "Under" / "hot.md").read_text()) > dreaming.HOT_MD_BUDGET_CHARS
+    # A genuinely over-budget file with a diary heading is flagged by both sections.
+    (tmp_path / "Over").mkdir()
+    (tmp_path / "Over" / "hot.md").write_text("# Hot\n\n## 2026-10-07 diary\n" + "y" * 6000)
+    monkeypatch.setattr(dreaming, "VAULT_PATH", tmp_path)
+    monkeypatch.setattr(dreaming, "VAULT_NAME", "bs-brain")
+    monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+
+    md_files = dreaming.list_md_files(tmp_path)
+    assert [f["path"] for f in dreaming.pass_hot_md_budget(tmp_path, md_files)] == ["Over/hot.md"]
+    bounded = {h["path"]: h["over_budget"] for h in dreaming.pass_bounded_files(tmp_path, md_files)["hot"]}
+    assert bounded == {"Under/hot.md": False, "Over/hot.md": True}
+
+    report = dreaming.run().read_text()
+    section4 = report.split("## 4. hot.md budget")[1].split("## 5.")[0]
+    assert "Under/hot.md" not in section4 and "Over/hot.md" in section4
+    actions = report.split("## Proposed actions")[1]
+    hot_actions = [ln for ln in actions.splitlines() if ln.startswith(("- [ ] Trim", "- [ ] Rewrite"))]
+    assert len(hot_actions) == 1 and "Over/hot.md" in hot_actions[0]  # one action for the file, not Trim and Rewrite
+
+
 def test_build_report_without_bounded_keeps_existing_sections(dreaming):
     now = datetime(2026, 7, 10, tzinfo=timezone.utc)
     report = dreaming.build_report(
