@@ -51,6 +51,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from obsidian_vault_mcp import config  # noqa: E402
 from obsidian_vault_mcp import vault_lock  # noqa: E402
+from obsidian_vault_mcp import bounded_files  # noqa: E402
 from obsidian_vault_mcp.frontmatter_safe import (  # noqa: E402
     FrontmatterError,
     update_frontmatter_field,
@@ -741,6 +742,33 @@ def pass_hot_md_budget(vault_path: Path, md_files: list[str]) -> list[dict]:
     return flagged
 
 
+def pass_bounded_files(vault_path: Path, md_files: list[str]) -> dict:
+    """Write Rule 21 watch: every hot.md vs its budget, every append-only log vs rollover size.
+
+    Report-only -- reads files, never edits them.
+    """
+    hot = []
+    for rel in md_files:
+        if Path(rel).name.lower() != "hot.md":
+            continue
+        status = bounded_files.hot_md_status(_read(vault_path, rel))
+        status["path"] = rel
+        status["flagged"] = status["over_budget"] or status["diary_headings"] > 0
+        hot.append(status)
+    logs = []
+    for rel in bounded_files.APPEND_ONLY_LOGS:
+        full = vault_path / rel
+        if full.is_file():
+            entry = bounded_files.log_status(full.stat().st_size)
+        elif rel in bounded_files.REQUIRED_LOGS:
+            entry = {"bytes": None, "rollover_due": False, "missing": True}
+        else:
+            continue
+        entry["path"] = rel
+        logs.append(entry)
+    return {"hot": hot, "logs": logs}
+
+
 BO_SPECS_DIR = "Personal/Build Orchestrator/specs"
 BO_BUILD_LOGS_DIR = "Personal/Build Orchestrator/build-logs"
 BO_AUTO_DATE_PREFIX_RE = re.compile(r"^auto-\d{8}-")
@@ -894,6 +922,7 @@ def build_report(
     hot_md_flags: list[dict],
     near_dups: dict,
     contradiction: dict | None,
+    bounded: dict | None = None,
 ) -> str:
     broken_links = broken_links_result["broken"]
     suppressed_count = broken_links_result["suppressed_count"]
@@ -995,6 +1024,32 @@ def build_report(
             else:
                 lines.append("No candidate contradictions found.")
 
+    if bounded is not None:
+        lines += ["", "## 7. Bounded files (Write Rule 21)"]
+        lines.append("hot.md files (size excludes frontmatter):")
+        if not bounded["hot"]:
+            lines.append("- none found")
+        for h in bounded["hot"]:
+            flags = []
+            if h["over_budget"]:
+                flags.append("OVER BUDGET")
+            if h["diary_headings"]:
+                flags.append(f"{h['diary_headings']} dated diary heading(s)")
+            suffix = f" — FLAG: {', '.join(flags)}" if flags else ""
+            lines.append(f"- `{h['path']}` — {h['chars']} / {h['budget']} chars{suffix}")
+        lines.append("")
+        lines.append(
+            f"Append-only logs (rollover due at {bounded_files.LOG_ROLLOVER_BYTES // 1000}KB):"
+        )
+        if not bounded["logs"]:
+            lines.append("- none found")
+        for lg in bounded["logs"]:
+            if lg.get("missing"):
+                lines.append(f"- `{lg['path']}` — not found in this vault")
+                continue
+            suffix = " — FLAG: rollover due" if lg["rollover_due"] else ""
+            lines.append(f"- `{lg['path']}` — {lg['bytes']} bytes{suffix}")
+
     lines += ["", "## Proposed actions"]
     action_count = 0
     for b in broken_links[:20]:
@@ -1006,6 +1061,15 @@ def build_report(
     for f in hot_md_flags:
         lines.append(f"- [ ] Trim `{f['path']}` ({f['chars']} chars, budget {HOT_MD_BUDGET_CHARS})")
         action_count += 1
+    if bounded is not None:
+        for h in bounded["hot"]:
+            if h["flagged"]:
+                lines.append(f"- [ ] Rewrite `{h['path']}` as compiled truth (Write Rule 21)")
+                action_count += 1
+        for lg in bounded["logs"]:
+            if lg["rollover_due"]:
+                lines.append(f"- [ ] Roll over `{lg['path']}` (Write Rule 21; scripts/log-rollover.py)")
+                action_count += 1
     for tm in title_matches[:10]:
         lines.append(f"- [ ] Review same-title notes: {', '.join(f'`{p}`' for p in tm['files'])}")
         action_count += 1
@@ -1302,9 +1366,11 @@ def run(autofix: bool = False) -> Path:
     near_dups = pass_near_duplicates(VAULT_PATH, md_files)
     contradiction = pass_contradiction_lint_sunday(VAULT_PATH, VAULT_NAME, now)
     entities = pass_entity_index(VAULT_PATH, VAULT_NAME, md_files)
+    bounded = pass_bounded_files(VAULT_PATH, md_files)
 
     report = build_report(
-        VAULT_NAME, now, reconcile, broken_links, archive_candidates, hot_md_flags, near_dups, contradiction
+        VAULT_NAME, now, reconcile, broken_links, archive_candidates, hot_md_flags, near_dups, contradiction,
+        bounded,
     )
 
     out_path = report_path_for(VAULT_PATH, VAULT_NAME, now)

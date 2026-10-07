@@ -178,6 +178,73 @@ def test_run_writes_report_and_entities_json_leaves_content_untouched(dreaming, 
         assert p.stat().st_mtime == before[p]
 
 
+# --- Write Rule 21 bounded-files section ------------------------------------
+
+def _rule21_vault(tmp_path, dreaming):
+    infra = tmp_path / "BS 2nd Brain" / "Alcove" / "Infrastructure"
+    infra.mkdir(parents=True)
+    (infra / "hot.md").write_text(
+        "---\nchar_budget: 100\n---\n# Hot\n\n## 2026-10-07 ~10:40 \u2014 diary\nsmall\n"
+    )
+    (tmp_path / "Other").mkdir()
+    (tmp_path / "Other" / "hot.md").write_text("# Clean\n\nCompiled truth only.\n")
+    (tmp_path / "Big").mkdir()
+    (tmp_path / "Big" / "hot.md").write_text("x" * (dreaming.HOT_MD_BUDGET_CHARS + 1))
+    (infra / "infrastructure-changelog.md").write_bytes(b"a" * 900_000)
+    (tmp_path / "BS 2nd Brain" / "_log.md").write_bytes(b"a" * 1000)
+    return tmp_path
+
+
+def test_bounded_files_flags_hot_md_and_logs(dreaming, tmp_path):
+    vault = _rule21_vault(tmp_path, dreaming)
+    md_files = dreaming.list_md_files(vault)
+    result = dreaming.pass_bounded_files(vault, md_files)
+
+    hot = {h["path"]: h for h in result["hot"]}
+    infra = hot["BS 2nd Brain/Alcove/Infrastructure/hot.md"]
+    assert infra["budget"] == 100 and infra["diary_headings"] == 1 and infra["flagged"]
+    assert not hot["Other/hot.md"]["flagged"]
+    assert hot["Other/hot.md"]["budget"] == dreaming.HOT_MD_BUDGET_CHARS
+    assert hot["Big/hot.md"]["over_budget"] and hot["Big/hot.md"]["flagged"]
+
+    logs = {lg["path"]: lg for lg in result["logs"]}
+    assert logs["BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md"]["rollover_due"]
+    assert not logs["BS 2nd Brain/_log.md"]["rollover_due"]
+
+
+def test_bounded_files_reports_missing_required_logs(dreaming, tmp_path):
+    result = dreaming.pass_bounded_files(tmp_path, [])
+    missing = {lg["path"] for lg in result["logs"] if lg.get("missing")}
+    assert missing == set(dreaming.bounded_files.REQUIRED_LOGS)
+
+
+def test_report_includes_bounded_section_and_actions_without_editing(dreaming, tmp_path, monkeypatch):
+    vault = _rule21_vault(tmp_path, dreaming)
+    monkeypatch.setattr(dreaming, "VAULT_PATH", vault)
+    monkeypatch.setattr(dreaming, "VAULT_NAME", "bs-brain")
+    monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+    before = {p: p.read_bytes() for p in vault.rglob("*.md")}
+
+    out_path = dreaming.run()
+    report = out_path.read_text()
+
+    assert "## 7. Bounded files (Write Rule 21)" in report
+    assert "OVER BUDGET" in report and "dated diary heading" in report
+    assert "FLAG: rollover due" in report
+    assert "Roll over `BS 2nd Brain/Alcove/Infrastructure/infrastructure-changelog.md`" in report
+    for p, data in before.items():
+        assert p.read_bytes() == data
+
+
+def test_build_report_without_bounded_keeps_existing_sections(dreaming):
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    report = dreaming.build_report(
+        "bs-brain", now, {"status": "skipped", "reason": "x"}, {"broken": [], "suppressed_count": 0},
+        [], [], {"title_matches": [], "embedding_matches": [], "suspect_lines": []}, None,
+    )
+    assert "## 4. hot.md budget" in report and "## 7." not in report
+
+
 # --- Entity index -----------------------------------------------------------
 
 def test_generate_aliases_single_person(dreaming):
