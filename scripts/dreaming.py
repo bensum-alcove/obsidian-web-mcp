@@ -764,7 +764,9 @@ def pass_bounded_files(vault_path: Path, md_files: list[str]) -> dict:
         full = vault_path / rel
         if full.is_file():
             entry = bounded_files.log_status(full.stat().st_size)
-        elif rel in bounded_files.REQUIRED_LOGS:
+        elif rel in bounded_files.REQUIRED_LOGS and (vault_path / Path(rel).parts[0]).is_dir():
+            # Required logs belong to the vault that holds their top-level folder (BS 2nd Brain/ ...);
+            # only there is a missing one worth reporting. Other vaults never get a permanent "not found".
             entry = {"bytes": None, "rollover_due": False, "missing": True}
         else:
             continue

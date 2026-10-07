@@ -212,10 +212,34 @@ def test_bounded_files_flags_hot_md_and_logs(dreaming, tmp_path):
     assert not logs["BS 2nd Brain/_log.md"]["rollover_due"]
 
 
-def test_bounded_files_reports_missing_required_logs(dreaming, tmp_path):
-    result = dreaming.pass_bounded_files(tmp_path, [])
+def test_bounded_files_reports_a_missing_required_log_only_in_the_vault_that_owns_it(dreaming, tmp_path):
+    bs = tmp_path / "bs"
+    (bs / "BS 2nd Brain").mkdir(parents=True)
+    result = dreaming.pass_bounded_files(bs, [])
     missing = {lg["path"] for lg in result["logs"] if lg.get("missing")}
     assert missing == set(dreaming.bounded_files.REQUIRED_LOGS)
+
+
+def test_bounded_files_has_no_not_found_lines_in_other_vaults(dreaming, tmp_path):
+    for name in ("cb", "alcove"):
+        vault = tmp_path / name
+        vault.mkdir()
+        (vault / "hot.md").write_text("# Hot\n")
+        result = dreaming.pass_bounded_files(vault, dreaming.list_md_files(vault))
+        assert result["logs"] == []
+
+
+def test_cb_and_alcove_reports_carry_no_not_found_log_lines(dreaming, tmp_path, monkeypatch):
+    for name in ("cb-brain", "alcove-brain"):
+        vault = tmp_path / name
+        vault.mkdir()
+        (vault / "hot.md").write_text("# Hot\n")
+        monkeypatch.setattr(dreaming, "VAULT_PATH", vault)
+        monkeypatch.setattr(dreaming, "VAULT_NAME", name)
+        monkeypatch.setattr(dreaming.ss, "SEMANTIC_AVAILABLE", False)
+        report = dreaming.run().read_text()
+        assert "not found in this vault" not in report
+        assert "- none found" in report.split("Append-only logs")[1]
 
 
 def test_report_includes_bounded_section_and_actions_without_editing(dreaming, tmp_path, monkeypatch):
