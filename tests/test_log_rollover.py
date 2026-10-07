@@ -1,6 +1,7 @@
 """Tests for scripts/log-rollover.py -- scheduled Write Rule 21 log rollover (dry-run by default)."""
 
 import hashlib
+import re
 import importlib.util
 from datetime import date
 from pathlib import Path
@@ -176,3 +177,100 @@ def test_never_touches_hot_md_and_skips_missing_logs(rollover, vault_dir):
     assert {r["path"] for r in results} == {LOG2}
     assert hot.read_bytes() == hot_before
     assert log2.read_bytes() == log2_before
+
+
+# --- new volume matches the 2026-10-07 hand roll ------------------------------
+
+INFRA = "BS 2nd Brain/Alcove/Infrastructure"
+PREV_VOLUME = f"{INFRA}/infrastructure-changelog-2026-09-08-to-2026-10-06"
+OLDEST_VOLUME = f"{INFRA}/infrastructure-changelog-through-2026-09-07"
+LIVE_NOTE = (
+    "> Reverse-chronological: newest entry directly below this note. Insert with `vault_str_replace` "
+    "anchored on the current newest heading; never `vault_write` or `vault_append` this file "
+    "(Write Rule 13). Rolled over monthly or at 500KB, whichever comes first (Write Rule 21)."
+)
+# Header of the live infrastructure-changelog.md as rolled by hand on 2026-10-07 (entries trimmed).
+LIVE_CHANGELOG = f"""---
+continued_from: {PREV_VOLUME}.md
+created: '2026-10-07'
+read_policy: section-only
+type: infrastructure-changelog
+updated: '2026-10-07'
+last_edited_by: Claude (Anthropic)
+last_edited_via: Claude.ai with BS Brain MCP
+last_edit_note: '2026-10-07: monthly rollover (Write Rule 21). Previous volume moved byte-for-byte; this file starts empty apart from the rollover entry.'
+---
+
+# Infrastructure changelog
+
+{LIVE_NOTE} Earlier volumes: [[{PREV_VOLUME}]], [[{OLDEST_VOLUME}]].
+
+## 2026-10-07 — G-fixes deploy v3: release a61c637
+**Status:** executed
+
+## 2026-10-07 — Brain housekeeping: hot.md compiled truth, changelog rollover, Write Rule 21
+**Status:** executed
+"""
+
+
+def _header(text):
+    """(frontmatter dict, preamble text) of a log volume: everything before its first dated entry."""
+    meta, body = bounded_files.split_frontmatter(text)
+    head = body[: bounded_files.DIARY_HEADING_RE.search(body).start()]
+    return meta, head
+
+
+def test_new_volume_header_matches_the_live_hand_roll(rollover, vault_dir):
+    live = _write(vault_dir, LOG, LIVE_CHANGELOG)
+    _write(vault_dir, f"{PREV_VOLUME}.md", "---\ncontinued_from: " + OLDEST_VOLUME + ".md\n---\n# Infrastructure changelog\n")
+    _write(vault_dir, f"{OLDEST_VOLUME}.md", "# Infrastructure changelog\n")
+
+    results = rollover.run(mode="monthly", apply=True, today=date(2026, 11, 1))
+    assert results[0]["action"] == "rolled"
+    rolled_target = f"{INFRA}/infrastructure-changelog-2026-10-07-to-2026-10-07"
+
+    live_meta, live_head = _header(LIVE_CHANGELOG)
+    new_meta, new_head = _header(live.read_text())
+
+    # Frontmatter: the same keys the hand roll set, pointing at the volume just rolled.
+    assert new_meta["continued_from"] == f"{rolled_target}.md"
+    assert new_meta["read_policy"] == live_meta["read_policy"]
+    assert new_meta["type"] == live_meta["type"]
+    assert {"created", "updated", "last_edit_note"} <= set(new_meta)
+
+    # Body header: identical writer note (Rule 13 guidance kept), and *all* earlier volumes linked.
+    def split_note(head):
+        note, _, links = head.partition(" Earlier volumes:")
+        return note.strip(), re.findall(r"\[\[([^\]]+)\]\]", links)
+
+    live_note, live_links = split_note(live_head)
+    new_note, new_links = split_note(new_head)
+    assert "never `vault_write` or `vault_append` this file (Write Rule 13)" in new_note
+    assert new_note.replace("# Infrastructure changelog", "").strip() == live_note.replace("# Infrastructure changelog", "").strip()
+    assert new_links == [rolled_target, PREV_VOLUME, OLDEST_VOLUME]
+    assert new_links[1:] == live_links
+
+
+def test_volume_without_a_writer_note_gets_the_changelog_default_and_full_chain(rollover, vault_dir):
+    # The 2026-09-08 volume had no note at all; its continued_from chain still yields every earlier volume.
+    text = (
+        f"---\ncontinued_from: {OLDEST_VOLUME}.md\nread_policy: section-only\ntype: infrastructure-changelog\n---\n"
+        "# Infrastructure changelog\n\n## 2026-10-06 — Newest\nbody\n\n## 2026-09-08 — Oldest\nbody\n"
+    )
+    live = _write(vault_dir, LOG, text)
+    _write(vault_dir, f"{OLDEST_VOLUME}.md", "# Infrastructure changelog\n")
+
+    rollover.run(mode="monthly", apply=True, today=date(2026, 10, 7))
+
+    new = live.read_text()
+    assert "(Write Rule 13)" in new and "never `vault_write` or `vault_append` this file" in new
+    links = re.findall(r"\[\[([^\]]+)\]\]", new.split("## 2026-10-07")[0])
+    assert links == [f"{INFRA}/infrastructure-changelog-2026-09-08-to-2026-10-06", OLDEST_VOLUME]
+
+
+def test_other_logs_get_no_invented_writer_note(rollover, vault_dir):
+    live = _write(vault_dir, LOG2, "---\ntype: log\n---\n# Log\n\n## 2026-09-01 — entry\nbody\n")
+    rollover.run(mode="monthly", apply=True, today=TODAY)
+    head = live.read_text().split("## 2026-11-01")[0]
+    assert "Write Rule 13" not in head
+    assert "Earlier volumes: [[BS 2nd Brain/_log-2026-09-01-to-2026-09-01]]." in head

@@ -87,26 +87,97 @@ def _quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+FIRST_ENTRY_RE = re.compile(r"^##\s+\d{4}-\d{2}-\d{2}\b", re.MULTILINE)
+EARLIER_RE = re.compile(r"Earlier volumes?:\s*((?:\[\[[^\]]+\]\][,\s]*)+)\.?")
+WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+MAX_PREAMBLE_CHARS = 2000
+MAX_CHAIN_DEPTH = 50
+
+# Writer note for a log whose old volume carried none (the 2026-09-08 changelog
+# volume had no note; the 2026-10-07 hand roll added this one).
+DEFAULT_WRITER_NOTES = {
+    "infrastructure-changelog.md": (
+        "> Reverse-chronological: newest entry directly below this note. Insert with `vault_str_replace` "
+        "anchored on the current newest heading; never `vault_write` or `vault_append` this file "
+        "(Write Rule 13). Rolled over monthly or at 500KB, whichever comes first (Write Rule 21)."
+    ),
+}
+
+
+def _link_target(rel: str) -> str:
+    return rel[:-3] if rel.endswith(".md") else rel
+
+
+def _preamble(body: str) -> str:
+    """The writer note between the H1 and the first dated entry; '' if the volume has none."""
+    h1 = H1_RE.search(body)
+    first = FIRST_ENTRY_RE.search(body)
+    if not h1 or not first or first.start() < h1.end():
+        return ""
+    return body[h1.end():first.start()].strip()[:MAX_PREAMBLE_CHARS]
+
+
+def _earlier_volumes(rolled_rel: str, text: str, meta: dict, preamble: str) -> list[str]:
+    """Link targets for every earlier volume, newest first: the volume being rolled,
+    then those already linked in its preamble, then the rest of its continued_from chain."""
+    seen: list[str] = []
+
+    def add(target: str) -> None:
+        if target and target not in seen:
+            seen.append(target)
+
+    add(_link_target(rolled_rel))
+    for m in EARLIER_RE.finditer(preamble):
+        for t in WIKILINK_RE.findall(m.group(1)):
+            add(t)
+    prev = meta.get("continued_from")
+    for _ in range(MAX_CHAIN_DEPTH):
+        if not isinstance(prev, str) or not prev:
+            break
+        add(_link_target(prev))
+        try:
+            prev_text, _md = vault.read_file(prev)
+        except Exception:
+            break
+        prev = bounded_files.split_frontmatter(prev_text)[0].get("continued_from")
+    return seen
+
+
+def _writer_note(rel: str, preamble: str, earlier: list[str]) -> str:
+    """The old volume's note (or the log's default), with its 'Earlier volumes' list brought up to date."""
+    note = preamble or DEFAULT_WRITER_NOTES.get(Path(rel).name, "")
+    links = ", ".join(f"[[{t}]]" for t in earlier)
+    if EARLIER_RE.search(note):
+        return EARLIER_RE.sub(lambda _m: f"Earlier volumes: {links}.", note, count=1)
+    sentence = f"Earlier volumes: {links}."
+    if not note:
+        return f"> {sentence}"
+    return f"{note} {sentence}" if note.lstrip().startswith(">") and "\n" not in note else f"{note}\n> {sentence}"
+
+
 def _new_volume(rel: str, rolled_rel: str, text: str, meta: dict, size: int, revision: str,
                 first: date, last: date, today: date) -> str:
     _, body = bounded_files.split_frontmatter(text)
     h1 = H1_RE.search(body)
     title = h1.group(1) if h1 else Path(rel).stem
-    lines = ["---"]
+    preamble = _preamble(body)
+    note = _writer_note(rel, preamble, _earlier_volumes(rolled_rel, text, meta, preamble))
+    lines = ["---", f"continued_from: {_quote(rolled_rel)}", f"created: {_quote(today.isoformat())}"]
+    if meta.get("read_policy") is not None:
+        lines.append(f"read_policy: {_quote(str(meta['read_policy']))}")
     if isinstance(meta.get("type"), str):
         lines.append(f"type: {_quote(meta['type'])}")
     if isinstance(meta.get("tags"), list):
         lines.append(f"tags: {json.dumps([str(t) for t in meta['tags']], ensure_ascii=False)}")
-    if meta.get("read_policy") is not None:
-        lines.append(f"read_policy: {_quote(str(meta['read_policy']))}")
     lines += [
-        f"continued_from: {_quote(rolled_rel)}",
-        f"created: {_quote(today.isoformat())}",
         f"updated: {_quote(today.isoformat())}",
+        'last_edited_by: "log-rollover (scripts/log-rollover.py)"',
+        f"last_edit_note: {_quote(f'{today.isoformat()}: rollover (Write Rule 21). Previous volume copied byte-for-byte; this file starts empty apart from the rollover entry.')}",
         "---",
+        "",
         f"# {title}",
         "",
-        f"Earlier entries: [[{rolled_rel[:-3] if rolled_rel.endswith('.md') else rolled_rel}]].",
+        note,
         "",
         f"## {today.isoformat()} — Log rolled over",
         f"The previous volume ({first.isoformat()} to {last.isoformat()}, {size} bytes, "
