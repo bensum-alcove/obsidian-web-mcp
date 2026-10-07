@@ -19,7 +19,7 @@ from pathlib import Path
 
 import frontmatter as fm_lib
 
-from .. import config
+from .. import bounded_files, config
 from ..utils import sanitize_for_json, SafeJSONEncoder
 from .search import (
     _search_ripgrep,
@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
 STALE_DAYS = 45
-_HOT_MD_MAX_BYTES = 3072
 _ANSWER_CONTEXT_MAX_HOT = 3
 _SUPERSEDED_STATUSES = {"superseded", "deprecated", "archived"}
 
@@ -597,6 +596,13 @@ def _covers_match_count(covers: list[str], result_paths: list[str]) -> int:
     return sum(1 for rp in result_paths if any(rp.startswith(p) for p in prefixes))
 
 
+def _truncate_to_budget(text: str, budget: int) -> str:
+    """Keep the frontmatter and the first ``budget`` characters of the body."""
+    _, body = bounded_files.split_frontmatter(text)
+    start = text.find(body) if body else -1
+    return text[: max(start, 0) + budget]
+
+
 def vault_answer_context(question: str, top_k: int = 6) -> str:
     """One-call pre-flight bundle: vault_query(question) + up to 3 hot.md files + staleness warnings.
 
@@ -605,6 +611,15 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
     first; (2) a hot.md sharing a top-level folder with the top results; (3) the
     rest. Each returned hot entry carries ``selected_by`` (``covers``,
     ``shared_folder`` or ``fallback``) so mis-selection is visible.
+
+    Eligibility follows the Write Rule 21 budget (body characters vs frontmatter
+    ``char_budget``, default ``config.HOT_MD_BUDGET_CHARS``), not file size. An
+    over-budget hot.md that ``covers:`` the results is still returned, truncated
+    to the budget, with ``over_budget`` in ``warnings``; an over-budget hot.md
+    chosen by any other rule is left out, with a ``hot_skipped_over_budget`` warning.
+
+    Known limitation (documented behaviour): ``covers:`` is read from each
+    hot.md's own frontmatter only; there is no inheritance between hot.md files.
     """
     try:
         query_result = json.loads(vault_query(question, top_k=top_k))
@@ -617,12 +632,6 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
         result_paths = [r["path"] for r in results if r.get("path")]
         hot_candidates = []
         for hot_path in _find_hot_md_files():
-            try:
-                size = hot_path.stat().st_size
-            except OSError:
-                continue
-            if size > _HOT_MD_MAX_BYTES:
-                continue
             rel = str(hot_path.relative_to(config.VAULT_PATH))
             covers_hits = _covers_match_count(_hot_md_covers(hot_path), result_paths)
             shares_folder = _top_level_folder(rel) in top_folders
@@ -637,18 +646,38 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
         # covers: match first (most matched results first), then shared top-level folder.
         rule_rank = {"covers": 0, "shared_folder": 1, "fallback": 2}
         hot_candidates.sort(key=lambda x: (rule_rank[x[0]], -x[1], x[2]))
-        selected = hot_candidates[:_ANSWER_CONTEXT_MAX_HOT]
 
         hot_files = []
-        for rule, _, rel, hot_path in selected:
+        hot_warnings = []
+        for rule, _, rel, hot_path in hot_candidates:
+            if len(hot_files) >= _ANSWER_CONTEXT_MAX_HOT:
+                break
             try:
                 content = hot_path.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
-                content = None
                 logger.warning("vault_answer_context: failed reading %s: %s", rel, e)
-            hot_files.append({"path": rel, "content": content, "selected_by": rule})
+                hot_files.append({"path": rel, "content": None, "selected_by": rule})
+                continue
+            status = bounded_files.hot_md_status(content)
+            if status["over_budget"]:
+                if rule != "covers":
+                    hot_warnings.append({
+                        "path": rel,
+                        "reason": "hot_skipped_over_budget",
+                        "detail": f"{status['chars']} chars > budget {status['budget']}; not selected by covers",
+                    })
+                    continue
+                content = _truncate_to_budget(content, status["budget"])
+                hot_warnings.append({
+                    "path": rel,
+                    "reason": "over_budget",
+                    "detail": f"{status['chars']} chars > budget {status['budget']}; returned truncated",
+                })
+                hot_files.append({"path": rel, "content": content, "selected_by": rule, "truncated": True})
+            else:
+                hot_files.append({"path": rel, "content": content, "selected_by": rule})
 
-        warnings = []
+        warnings = list(hot_warnings)
         for r in results:
             if r.get("stale"):
                 warnings.append({

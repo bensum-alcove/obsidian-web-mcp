@@ -327,15 +327,123 @@ def test_vault_answer_context_without_covers_uses_shared_folder(vault_dir):
     assert {h["path"]: h["selected_by"] for h in result["hot"]}["Other/hot.md"] == "fallback"
 
 
-def test_vault_answer_context_skips_oversized_hot_md(vault_dir):
+REAL_PERSONAL_HOT = """---
+type: hot-cache
+format: compiled-truth
+char_budget: 5000
+timeline: Personal/hot-timeline/hot-timeline-through-2026-10-07.md
+tags:
+- hot-cache
+- personal
+- session-state
+updated: '2026-10-07'
+---
+
+# Personal — Current State
+
+> **Compiled truth only** (`BS 2nd Brain/_SCHEMA.md` Write Rule 21). Rewrite in place; no dated diary entries.
+
+## Where current state actually lives
+- **Build Orchestrator** (specs and logs are filed under `Personal/Build Orchestrator/`): live state is in `BS 2nd Brain/Alcove/Infrastructure/hot.md`. Don't use this page for BO state.
+- **MahMah's Estate:** `BS 2nd Brain/MahMahs Estate/hot.md`.
+
+## Personal matters in flight
+- Nothing recorded yet.
+"""
+
+
+def _realistic_infra_hot(body_chars: int, char_budget: int | None = None) -> str:
+    """Infrastructure hot.md shaped like the live one: covers: frontmatter, long compiled-truth body."""
+    fm = ["---", "type: hot-cache", "format: compiled-truth"]
+    if char_budget is not None:
+        fm.append(f"char_budget: {char_budget}")
+    fm += [
+        "covers:",
+        "- Personal/Build Orchestrator/",
+        "- BS 2nd Brain/Alcove/Infrastructure/",
+        "tags:",
+        "- hot-cache",
+        "- infrastructure",
+        "---",
+        "",
+    ]
+    body = "# Infrastructure — Current State\n\n## Build Orchestrator\n"
+    line = "- Live state item: build chain, deploy gate and next operator action recorded here.\n"
+    while len(body) < body_chars:
+        body += line
+    return "\n".join(fm) + body[:body_chars]
+
+
+def _build_realistic_bo_fixture(vault_dir, infra_text):
+    bo = vault_dir / "Personal" / "Build Orchestrator" / "specs"
+    bo.mkdir(parents=True)
+    (bo / "bo-harness-final-v2.md").write_text(
+        "bo-harness-final-v2 cc-guard-mod-v2 bo-goal-hygiene-v1 current state and next action\n"
+        "bo_action verbs list retry_review review_transport_exhausted operator recovery\n"
+    )
+    (vault_dir / "Personal" / "hot.md").write_text(REAL_PERSONAL_HOT)
+    infra = vault_dir / "BS 2nd Brain" / "Alcove" / "Infrastructure"
+    infra.mkdir(parents=True)
+    (infra / "hot.md").write_text(infra_text)
+
+
+WITNESS_QUESTIONS = [
+    "bo-harness-final-v2 cc-guard-mod-v2 bo-goal-hygiene-v1 current state and next action",
+    "bo_action verbs list retry_review review_transport_exhausted operator recovery",
+]
+
+
+@pytest.mark.parametrize("question", WITNESS_QUESTIONS)
+def test_vault_answer_context_realistic_5kb_infra_hot_md_selected_by_covers(vault_dir, question):
+    # ~5.3KB on disk (over the old 3,072-byte cap) but under the 5,000-char Rule 21 budget.
+    text = _realistic_infra_hot(body_chars=4850)
+    assert 5000 < len(text.encode()) < 5600
+    _build_realistic_bo_fixture(vault_dir, text)
+
+    result = json.loads(query_tool.vault_answer_context(question))
+    hot = result["hot"]
+    assert hot[0]["path"] == "BS 2nd Brain/Alcove/Infrastructure/hot.md"
+    assert hot[0]["selected_by"] == "covers"
+    assert hot[0]["content"] == text
+    assert "truncated" not in hot[0]
+    assert not [w for w in result["warnings"] if w["reason"] == "over_budget"]
+
+
+@pytest.mark.parametrize("question", WITNESS_QUESTIONS)
+def test_vault_answer_context_over_budget_covers_hot_md_is_truncated_not_dropped(vault_dir, question):
+    text = _realistic_infra_hot(body_chars=7000)
+    _build_realistic_bo_fixture(vault_dir, text)
+
+    result = json.loads(query_tool.vault_answer_context(question))
+    hot = result["hot"]
+    assert hot[0]["path"] == "BS 2nd Brain/Alcove/Infrastructure/hot.md"
+    assert hot[0]["selected_by"] == "covers"
+    assert hot[0]["truncated"] is True
+    assert hot[0]["content"].startswith("---\n")
+    assert len(hot[0]["content"]) < len(text)
+    assert text.startswith(hot[0]["content"])
+    warnings = [w for w in result["warnings"] if w["reason"] == "over_budget"]
+    assert [w["path"] for w in warnings] == ["BS 2nd Brain/Alcove/Infrastructure/hot.md"]
+
+
+def test_vault_answer_context_honours_frontmatter_char_budget(vault_dir):
+    # 4,000-char body is under the default budget but over this file's own budget.
+    _build_realistic_bo_fixture(vault_dir, _realistic_infra_hot(body_chars=4000, char_budget=1000))
+    result = json.loads(query_tool.vault_answer_context(WITNESS_QUESTIONS[0]))
+    assert result["hot"][0]["truncated"] is True
+    assert any(w["reason"] == "over_budget" for w in result["warnings"])
+
+
+def test_vault_answer_context_over_budget_non_covers_hot_md_is_skipped_with_warning(vault_dir):
     skills_dir = vault_dir / "Skills"
     skills_dir.mkdir()
-    (skills_dir / "hot.md").write_text("x" * (query_tool._HOT_MD_MAX_BYTES + 100))
+    (skills_dir / "hot.md").write_text("x" * 6000)
     (skills_dir / "answer-marker.md").write_text("answer-context-unique-marker content\n")
 
     result = json.loads(query_tool.vault_answer_context("answer-context-unique-marker"))
-    hot_paths = [h["path"] for h in result["hot"]]
-    assert "Skills/hot.md" not in hot_paths
+    assert "Skills/hot.md" not in [h["path"] for h in result["hot"]]
+    skipped = [w for w in result["warnings"] if w["reason"] == "hot_skipped_over_budget"]
+    assert [w["path"] for w in skipped] == ["Skills/hot.md"]
 
 
 def test_vault_answer_context_warns_on_stale_result(vault_dir):
