@@ -6,12 +6,13 @@ prints what it would do. ``--apply`` is a deliberate, separate operator step.
 
 What a roll does (the same steps done by hand on 2026-10-07):
   1. Read the current log and its revision.
-  2. Move it byte-for-byte to ``<name>-<first-date>-to-<last-date>.md`` with
-     ``expected_revision`` (so a write landing mid-roll aborts the roll).
-  3. Create a fresh volume at the original path carrying ``continued_from``,
-     the same ``read_policy``, and a first entry recording the move.
-  If step 3 fails the moved volume is moved back, so the log is never left
-  missing.
+  2. Copy it byte-for-byte to ``<name>-<first-date>-to-<last-date>.md``.
+  3. Swap the live path to a fresh volume (``continued_from``, the same
+     preamble and ``read_policy``, a first entry recording the move) in one
+     atomic, revision-guarded replace.
+  The live path is never missing: an append during a roll either lands in the
+  old volume before the swap (the swap is refused and the roll retried) or in
+  the new volume after it. A failed roll leaves the original untouched.
 
 Which logs, and when:
   --mode if-due   (default) roll logs at or above the rollover size
@@ -135,19 +136,60 @@ def plan_roll(rel: str, mode: str, today: date) -> dict:
 
 
 def apply_roll(plan: dict, today: date) -> None:
+    """Roll one log without the live path ever being missing or a bare fragment.
+
+    1. Write the old volume's bytes to ``rolled_path`` (a copy; the live file is
+       untouched and still takes appends).
+    2. Replace the live path with the new volume in one atomic swap guarded by
+       ``expected_revision``. ``vault.write_file_atomic`` does the check and the
+       replace under the same per-path lock ``vault_append`` takes, so an append
+       either landed before the swap (the revision no longer matches, the swap is
+       refused and the roll is abandoned with the original intact) or lands after
+       it, in the new volume.
+    3. If the swap fails for any reason, remove the copy; the original was never
+       moved, so there is nothing to restore.
+    """
     rel, rolled_rel = plan["path"], plan["rolled_path"]
     meta, _ = bounded_files.split_frontmatter(plan["text"])
     new_text = _new_volume(
         rel, rolled_rel, plan["text"], meta, plan["size"], plan["revision"],
         plan["first"], plan["last"], today,
     )
-    vault.move_path(rel, rolled_rel, expected_revision=plan["revision"], actor="log-rollover")
+    vault.write_file_atomic(
+        rolled_rel, plan["text"], tool="log-rollover", actor="log-rollover", expected_revision="absent",
+    )
     try:
-        vault.write_file_atomic(rel, new_text, tool="log-rollover", actor="log-rollover", expected_revision="absent")
-    except Exception:
-        # Put the log back rather than leave the live path empty.
-        vault.move_path(rolled_rel, rel, expected_revision=plan["revision"], actor="log-rollover")
+        vault.write_file_atomic(
+            rel, new_text, tool="log-rollover", actor="log-rollover", expected_revision=plan["revision"],
+        )
+    except BaseException:
+        try:
+            vault.delete_path(rolled_rel, expected_revision=plan["revision"], actor="log-rollover")
+        except Exception:
+            pass  # the original is intact either way; a stray copy is harmless and reported by the raise
         raise
+
+
+# A roll abandoned because an append landed mid-roll is retried against the new content.
+ROLL_ATTEMPTS = 3
+
+
+def _apply_with_retry(plan: dict, mode: str, today: date) -> dict | None:
+    """Apply a roll; if an append landed mid-roll, re-plan and try again.
+
+    Returns the plan that was applied, or None if the retry found the log no longer due.
+    """
+    for attempt in range(ROLL_ATTEMPTS):
+        try:
+            apply_roll(plan, today)
+            return plan
+        except vault.RevisionConflictError:
+            if attempt == ROLL_ATTEMPTS - 1:
+                raise
+            plan = plan_roll(plan["path"], mode, today)
+            if not plan["due"]:
+                return None
+    return None
 
 
 def run(mode: str = "if-due", apply: bool = False, today: date | None = None) -> list[dict]:
@@ -172,7 +214,11 @@ def run(mode: str = "if-due", apply: bool = False, today: date | None = None) ->
             entry["action"] = "dry-run"
         else:
             try:
-                apply_roll(plan, today)
+                plan = _apply_with_retry(plan, mode, today)
+                if plan is None:
+                    results.append({"path": rel, "action": "not-due", "size": entry["size"]})
+                    continue
+                entry.update(rolled_path=plan["rolled_path"], size=plan["size"], reasons=plan["reasons"])
                 entry["action"] = "rolled"
                 entry["sha256"] = hashlib.sha256(
                     (config.VAULT_PATH / plan["rolled_path"]).read_bytes()

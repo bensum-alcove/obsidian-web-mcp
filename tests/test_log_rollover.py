@@ -101,18 +101,69 @@ def test_revision_conflict_aborts_before_anything_moves(rollover, vault_dir):
     assert [f.name for f in p.parent.iterdir()] == [p.name]
 
 
-def test_failed_new_volume_write_restores_original(rollover, vault_dir, monkeypatch):
+def test_failed_swap_leaves_original_intact_and_removes_the_copy(rollover, vault_dir, monkeypatch):
     p = _write(vault_dir, LOG, _log_text(bounded_files.LOG_ROLLOVER_BYTES))
     before = p.read_bytes()
+    real = rollover.vault.write_file_atomic
 
-    def boom(*a, **k):
-        raise OSError("disk full")
+    def fail_swap(rel, *a, **k):
+        if rel == LOG:
+            raise OSError("disk full")
+        return real(rel, *a, **k)
 
-    monkeypatch.setattr(rollover.vault, "write_file_atomic", boom)
+    monkeypatch.setattr(rollover.vault, "write_file_atomic", fail_swap)
     results = rollover.run(mode="if-due", apply=True, today=TODAY)
     assert results[0]["action"] == "error"
     assert p.read_bytes() == before
     assert [f.name for f in p.parent.iterdir()] == [p.name]
+
+
+def test_concurrent_append_during_apply_is_never_lost_and_path_never_missing(rollover, vault_dir, monkeypatch):
+    """Witness: a vault_append landing between the copy and the swap."""
+    from obsidian_vault_mcp.tools import write as write_tool
+
+    p = _write(vault_dir, LOG, _log_text(bounded_files.LOG_ROLLOVER_BYTES))
+    real = rollover.vault.write_file_atomic
+    marker = "## 2026-10-08 — concurrent append marker"
+    seen = {"calls": 0, "missing": False, "appended": False}
+
+    def write_with_racing_append(rel, *a, **k):
+        seen["calls"] += 1
+        if not p.exists():
+            seen["missing"] = True
+        if rel != LOG and not seen["appended"]:
+            # The copy is about to be written; an append lands on the live log right after it.
+            out = real(rel, *a, **k)
+            write_tool.vault_append(LOG, f"\n{marker}\n")
+            seen["appended"] = True
+            return out
+        out = real(rel, *a, **k)
+        if not p.exists():
+            seen["missing"] = True
+        return out
+
+    monkeypatch.setattr(rollover.vault, "write_file_atomic", write_with_racing_append)
+    results = rollover.run(mode="if-due", apply=True, today=TODAY)
+
+    assert seen["appended"] and not seen["missing"]
+    assert results[0]["action"] == "rolled"
+    rolled = list(p.parent.glob("infrastructure-changelog-*.md"))
+    assert len(rolled) == 1
+    # The racing append landed in exactly one place: the old volume (retry re-planned against it).
+    assert rolled[0].read_text().count(marker) + p.read_text().count(marker) == 1
+    assert rolled[0].read_text().count(marker) == 1
+    assert p.read_text().startswith("---\n") and "continued_from:" in p.read_text()
+
+
+def test_append_after_apply_lands_in_new_volume(rollover, vault_dir):
+    from obsidian_vault_mcp.tools import write as write_tool
+
+    p = _write(vault_dir, LOG, _log_text(bounded_files.LOG_ROLLOVER_BYTES))
+    rollover.run(mode="if-due", apply=True, today=TODAY)
+    write_tool.vault_append(LOG, "\n## 2026-11-02 — after the roll\n")
+    assert "after the roll" in p.read_text()
+    rolled = next(p.parent.glob("infrastructure-changelog-2026-*.md"))
+    assert "after the roll" not in rolled.read_text()
 
 
 def test_never_touches_hot_md_and_skips_missing_logs(rollover, vault_dir):
