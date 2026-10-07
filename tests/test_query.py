@@ -281,6 +281,52 @@ def test_vault_answer_context_bundles_matching_hot_md(vault_dir):
     assert "Skills/hot.md" in hot_paths
 
 
+def _build_bo_fixture(vault_dir):
+    bo = vault_dir / "Personal" / "Build Orchestrator" / "specs"
+    bo.mkdir(parents=True)
+    (bo / "bo-harness-final-v2.md").write_text(
+        "bo-harness-final-v2 cc-guard-mod-v2 bo-goal-hygiene-v1 current state and next action\n"
+        "bo_action verbs list retry_review review_transport_exhausted operator recovery\n"
+    )
+    (vault_dir / "Personal" / "hot.md").write_text(
+        "# Personal hot\nBuild Orchestrator live state lives in Infrastructure/hot.md.\n"
+    )
+    infra = vault_dir / "BS 2nd Brain" / "Alcove" / "Infrastructure"
+    infra.mkdir(parents=True)
+    (infra / "hot.md").write_text(
+        "---\ncovers:\n- Personal/Build Orchestrator/\n- BS 2nd Brain/Alcove/Infrastructure/\n---\n# Infra hot\n"
+    )
+
+
+@pytest.mark.parametrize("question", [
+    "bo-harness-final-v2 cc-guard-mod-v2 bo-goal-hygiene-v1 current state and next action",
+    "bo_action verbs list retry_review review_transport_exhausted operator recovery",
+])
+def test_vault_answer_context_covers_outranks_shared_folder(vault_dir, question):
+    _build_bo_fixture(vault_dir)
+    result = json.loads(query_tool.vault_answer_context(question))
+    hot = result["hot"]
+    assert hot[0]["path"] == "BS 2nd Brain/Alcove/Infrastructure/hot.md"
+    assert hot[0]["selected_by"] == "covers"
+    by_path = {h["path"]: h["selected_by"] for h in hot}
+    assert by_path["Personal/hot.md"] == "shared_folder"
+
+
+def test_vault_answer_context_without_covers_uses_shared_folder(vault_dir):
+    skills_dir = vault_dir / "Skills"
+    skills_dir.mkdir()
+    (skills_dir / "hot.md").write_text("Hot context for Skills.\n")
+    (skills_dir / "answer-marker.md").write_text("answer-context-unique-marker content\n")
+    other = vault_dir / "Other"
+    other.mkdir()
+    (other / "hot.md").write_text("Other hot.\n")
+
+    result = json.loads(query_tool.vault_answer_context("answer-context-unique-marker"))
+    assert result["hot"][0]["path"] == "Skills/hot.md"
+    assert result["hot"][0]["selected_by"] == "shared_folder"
+    assert {h["path"]: h["selected_by"] for h in result["hot"]}["Other/hot.md"] == "fallback"
+
+
 def test_vault_answer_context_skips_oversized_hot_md(vault_dir):
     skills_dir = vault_dir / "Skills"
     skills_dir.mkdir()

@@ -630,7 +630,8 @@ def vault_query(
     name="vault_answer_context",
     description=(
         "One-call brain-first pre-flight bundle: runs vault_query(question) and adds up to 3 relevant "
-        "hot.md files (preferring ones sharing a top-level folder with the top results) plus a warnings "
+        "hot.md files (preferring ones whose frontmatter `covers:` path prefixes match the top results, then ones "
+        "sharing a top-level folder; each hot entry reports `selected_by`) plus a warnings "
         "list flagging stale or superseded results. Replaces a manual vault_query + hot.md read + "
         "staleness check sequence with a single call."
     ),

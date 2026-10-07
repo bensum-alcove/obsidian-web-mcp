@@ -577,8 +577,35 @@ def _frontmatter_status(full_path: Path) -> str:
         return ""
 
 
+def _hot_md_covers(hot_path: Path) -> list[str]:
+    """Return the vault path prefixes a hot.md claims via frontmatter ``covers:``."""
+    try:
+        post = fm_lib.loads(hot_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+    raw = (post.metadata or {}).get("covers")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(c).strip() for c in raw if str(c).strip()]
+
+
+def _covers_match_count(covers: list[str], result_paths: list[str]) -> int:
+    """Number of result paths that fall under any of the covered prefixes."""
+    prefixes = [c if c.endswith("/") else c + "/" for c in covers]
+    return sum(1 for rp in result_paths if any(rp.startswith(p) for p in prefixes))
+
+
 def vault_answer_context(question: str, top_k: int = 6) -> str:
-    """One-call pre-flight bundle: vault_query(question) + up to 3 hot.md files + staleness warnings."""
+    """One-call pre-flight bundle: vault_query(question) + up to 3 hot.md files + staleness warnings.
+
+    hot.md selection order: (1) a hot.md whose frontmatter ``covers:`` (a list of
+    vault path prefixes whose state it owns) matches the top results, most matches
+    first; (2) a hot.md sharing a top-level folder with the top results; (3) the
+    rest. Each returned hot entry carries ``selected_by`` (``covers``,
+    ``shared_folder`` or ``fallback``) so mis-selection is visible.
+    """
     try:
         query_result = json.loads(vault_query(question, top_k=top_k))
         if "error" in query_result:
@@ -587,6 +614,7 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
         results = query_result.get("results", [])
         top_folders = {_top_level_folder(r["path"]) for r in results if r.get("path")}
 
+        result_paths = [r["path"] for r in results if r.get("path")]
         hot_candidates = []
         for hot_path in _find_hot_md_files():
             try:
@@ -596,21 +624,29 @@ def vault_answer_context(question: str, top_k: int = 6) -> str:
             if size > _HOT_MD_MAX_BYTES:
                 continue
             rel = str(hot_path.relative_to(config.VAULT_PATH))
+            covers_hits = _covers_match_count(_hot_md_covers(hot_path), result_paths)
             shares_folder = _top_level_folder(rel) in top_folders
-            hot_candidates.append((shares_folder, rel, hot_path))
+            if covers_hits:
+                rule = "covers"
+            elif shares_folder:
+                rule = "shared_folder"
+            else:
+                rule = "fallback"
+            hot_candidates.append((rule, covers_hits, rel, hot_path))
 
-        # Prefer hot.md files sharing a top-level folder with the top results.
-        hot_candidates.sort(key=lambda x: not x[0])
+        # covers: match first (most matched results first), then shared top-level folder.
+        rule_rank = {"covers": 0, "shared_folder": 1, "fallback": 2}
+        hot_candidates.sort(key=lambda x: (rule_rank[x[0]], -x[1], x[2]))
         selected = hot_candidates[:_ANSWER_CONTEXT_MAX_HOT]
 
         hot_files = []
-        for _, rel, hot_path in selected:
+        for rule, _, rel, hot_path in selected:
             try:
                 content = hot_path.read_text(encoding="utf-8", errors="replace")
             except OSError as e:
                 content = None
                 logger.warning("vault_answer_context: failed reading %s: %s", rel, e)
-            hot_files.append({"path": rel, "content": content})
+            hot_files.append({"path": rel, "content": content, "selected_by": rule})
 
         warnings = []
         for r in results:
