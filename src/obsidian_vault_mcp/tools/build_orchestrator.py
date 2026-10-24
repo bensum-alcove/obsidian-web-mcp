@@ -675,12 +675,22 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     schedule activation write is performed.
     """
     try:
-        with vault_lock.registry_lock():
-            return _activate_locked(builds, schedule_path, tool_name,
-                                    write_new_specs=write_new_specs,
-                                    spec_markdown_overrides=spec_markdown_overrides,
-                                    dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
-                                    create_schedule=create_schedule)
+        for attempt in range(3):
+            inputs = authoring_transaction.capture_inputs()
+            # Adapter sources are mutable read dependencies too. Do not reuse
+            # path-only syntax/field caches across a fresh preparation pass.
+            bo_contract._authoring_fields_cache = None
+            bo_contract._schedule_parser_module = None
+            try:
+                return _activate_locked(builds, schedule_path, tool_name,
+                                        write_new_specs=write_new_specs,
+                                        spec_markdown_overrides=spec_markdown_overrides,
+                                        dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
+                                        create_schedule=create_schedule, inputs=inputs)
+            except authoring_transaction.PreparationChanged:
+                if attempt == 2:
+                    raise
+        raise ValueError("authoring inputs did not stabilize")
     except (ValueError, OSError, bo_contract.BOContractError) as exc:
         return json.dumps({"ok": False, "activated": False, "error": str(exc),
                            **({"code": exc.code} if isinstance(exc, bo_contract.BOContractError) else {})})
@@ -688,7 +698,12 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
 
 def _activate_locked(builds, schedule_path, tool_name, *, write_new_specs=True,
                      spec_markdown_overrides=None, dry_run=False, receipt=None,
-                     template_metadata=None, create_schedule=False):
+                     template_metadata=None, create_schedule=False, inputs=None):
+    if not write_new_specs:
+        for bid, expected in (spec_markdown_overrides or {}).items():
+            current, _ = read_file(_spec_path_for(bid))
+            if current != expected:
+                raise authoring_transaction.PreparationChanged('existing spec changed before preparation')
     try:
         prep = _prepare_graph(
             builds, schedule_path, "strict_new",
@@ -798,8 +813,10 @@ def _activate_locked(builds, schedule_path, tool_name, *, write_new_specs=True,
     try:
         warnings = authoring_transaction.commit(
             files, schedule_path=schedule_path, expected_revision=schedule_meta["revision"],
-            tool=tool_name, result=result, receipt=receipt, dry_run=dry_run,
+            tool=tool_name, result=result, receipt=receipt, dry_run=dry_run, inputs=inputs,
         )
+    except authoring_transaction.PreparationChanged:
+        raise
     except (ValueError, OSError, bo_contract.BOContractError) as exc:
         payload = {"ok": False, "error": str(exc), "activated": False, "orphaned_specs": []}
         if isinstance(exc, RevisionConflictError):
@@ -810,6 +827,8 @@ def _activate_locked(builds, schedule_path, tool_name, *, write_new_specs=True,
     if dry_run:
         result.update(dry_run=True, activated=False, rendered=prep["rendered"],
                       schedule_content=new_schedule_content)
+    if not dry_run:
+        warnings.extend(authoring_transaction.refresh(files))
     result["warnings"].extend(warnings)
     return json.dumps(result)
 
@@ -901,6 +920,13 @@ def bo_author_feature(feature_id: str, title: str, project: str, what_this_means
             policy = _IMPLEMENTATION_POLICY.format(build_id=feature_id)
             builds[0]["body_markdown"] = (builds[0]["body_markdown"][:span[0]] + policy
                                            + builds[0]["body_markdown"][span[1]:])
+            body = builds[0]["body_markdown"]
+            required = {"What this means", "Start gate", "Probes", "Scope", "Proof",
+                        "Out of scope", "Output", "Checkout write policy"}
+            headings = set(re.findall(r"(?m)^## (.+)$", body))
+            policies = re.findall(r"(?im)^#{1,6}[ \t]+Checkout write policy[ \t]*$", body)
+            if not required <= headings or len(policies) != 1 or policy not in body:
+                raise ValueError("rendered formula lost required sections or its role-correct checkout policy")
             result = json.loads(_activate(builds, schedule_path, "bo_author_feature", dry_run=dry_run,
                                          receipt=receipt, template_metadata=provenance,
                                          create_schedule=True))

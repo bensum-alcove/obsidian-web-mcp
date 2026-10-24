@@ -686,22 +686,32 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
         and len(set(new_id_list)) == len(new_id_list)
         and set(old_ids) <= unchanged_ids
     )
+    if ctx.old_content is not None and ctx.new_content.startswith(ctx.old_content):
+        suffix = ctx.new_content[len(ctx.old_content):]
+        if suffix.strip() and (len(new_id_list) > len(old_ids) or re.search(r"(?m)^ *-\s+", suffix)):
+            try:
+                from ruamel.yaml import YAML
+                loader = YAML(typ='safe')
+                loader.allow_duplicate_keys = False
+                if re.search(r'(?m)^(?:---|\.\.\.)[ \t]*(?:#.*)?$', suffix):
+                    raise ValueError('document separators are not build entries')
+                parsed_suffix = loader.load(suffix)
+                canonical = bo_contract.parse_schedule_document('builds:\n' + suffix, source_name=ctx.path)
+                valid_suffix = (
+                    isinstance(parsed_suffix, list) and bool(parsed_suffix)
+                    and all(isinstance(entry, dict) for entry in parsed_suffix)
+                    and canonical == {'builds': parsed_suffix}
+                    and new_builds == (old_builds or []) + parsed_suffix
+                )
+            except Exception:
+                # Parser disagreement or malformed/duplicate/multi-document
+                # YAML never earns the add-only relaxation.
+                valid_suffix = False
+            if not valid_suffix:
+                return [ValidationIssue('bo-guard-schedule-rewrite', 'reject',
+                                        'append suffix must contain only new builds entries')]
+            add_only = add_only and valid_suffix
     issues: list[ValidationIssue] = []
-
-    if old_ids and not add_only:
-        try:
-            statuses = bo_contract.preflight_ids(old_ids).get("results", {})
-            mutable = _freely_mutable_statuses()
-        except bo_contract.BOContractError as e:
-            return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
-        protected = {bid for bid, status in statuses.items()
-                     if status is not None and status not in mutable}
-        preserved_order = [bid for bid in new_id_list if bid in set(old_ids)] == old_ids
-        if protected and (not preserved_order or not protected <= unchanged_ids):
-            issues.append(ValidationIssue(
-                "bo-guard-schedule-rewrite", "reject",
-                "frozen schedule entries must keep their exact bytes and order",
-            ))
 
     # 1. Bound-row preservation / terminal-entry-edit preflight. Runs
     #    regardless of whether this is a brand-new or existing schedule -- a

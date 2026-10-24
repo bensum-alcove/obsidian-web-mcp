@@ -155,6 +155,8 @@ def feature_graph(feature: dict, *, dry_run=False):
     for field in ("title", "what_this_means", "probes", "scope", "proof", "out_of_scope", "commit_prefix"):
         if not isinstance(feature.get(field), str) or not feature[field].strip():
             raise TemplateError(f"{field} must be non-empty text")
+        if re.search(r'(?im)^ {0,3}#{1,6}[ \t]+checkout write policy(?:[ \t]+#+)?[ \t]*$', feature[field]):
+            raise TemplateError(f'{field} contains an unsafe checkout policy heading')
     registry = registry_snapshot()
     models = [m["id"] for m in registry["models"]]
     reviewers = _review_models(registry).get("frontier_review", [])
@@ -210,6 +212,11 @@ def feature_graph(feature: dict, *, dry_run=False):
                                      "require_model_verified":True,"reviewed_sha_must_match":"current_head"}
         common["completion_contract"] = {"assertions":assertions,"waivers": [] if role == "build" else [
             {"assertion":"git_pushed","reason":"Independent read-only review or deployment of an already-pushed exact candidate."}]}
+        required = {'What this means', 'Start gate', 'Probes', 'Scope', 'Proof',
+                    'Out of scope', 'Output', 'Checkout write policy'}
+        headings = re.findall(r'(?m)^## (.+)$', common['body_markdown'])
+        if not required <= set(headings) or headings.count('Checkout write policy') != 1:
+            raise TemplateError('rendered formula omits required sections or has duplicate policy headings')
         builds.append(common)
         provenance[bid] = {"template_version":template["version"],"template_hash":template["hash"]}
     return builds, provenance, warnings

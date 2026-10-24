@@ -469,3 +469,282 @@ vault_lock.atomic_write(Path(sys.argv[1]),b'process write')
         assert target.read_bytes()==b'process write'
     finally:
         if p.poll() is None:p.kill();p.wait()
+
+# Repair-round controls: these exercise behavior, and run on the original API.
+@pytest.mark.parametrize('phase', ['validation', 'index'])
+@pytest.mark.parametrize('process', [False, True])
+def test_slow_preparation_and_index_allow_unrelated_writer(scratch, monkeypatch, phase, process):
+    tx = module('authoring_transaction')
+    entered, release = threading.Event(), threading.Event()
+    def pause():
+        entered.set()
+        assert release.wait(15)
+    if phase == 'validation':
+        original = bo._prepare_graph
+        def prepare(*args, **kwargs):
+            pause()
+            return original(*args, **kwargs)
+        monkeypatch.setattr(bo, '_prepare_graph', prepare)
+    else:
+        monkeypatch.setattr(tx, '_commit_hooks', [lambda paths: pause()])
+    target = scratch / 'Personal/Build Orchestrator/logs/concurrent.md'
+    child = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        author = pool.submit(bo.bo_create_build, _build('slow-author'), S)
+        assert entered.wait(10)
+        try:
+            start = time.monotonic()
+            if process:
+                child = subprocess.Popen([sys.executable, '-c',
+                    'from pathlib import Path;import sys;from obsidian_vault_mcp.vault_lock import atomic_write;atomic_write(Path(sys.argv[1]),b"other writer")', str(target)])
+                child.wait(timeout=5)
+                assert child.returncode == 0
+            else:
+                writer = pool.submit(vault_lock.atomic_write, target, b'other writer')
+                writer.result(timeout=5)
+            assert time.monotonic() - start < 5
+            assert target.read_bytes() == b'other writer'
+        finally:
+            release.set()
+            if child:
+                child.wait(timeout=10)
+        assert json.loads(author.result(timeout=15))['ok']
+    assert target.read_bytes() == b'other writer'
+
+
+def test_namespace_replacement_during_staging_refuses_publication(scratch, monkeypatch):
+    tx = module('authoring_transaction')
+    target = scratch / 'Personal/Build Orchestrator/other.md'
+    target.write_bytes(b'old')
+    original = tx._stage_file
+    def replace(path, data, mode):
+        original(path, data, mode)
+        if path.suffix == '.yaml':
+            temp = target.with_suffix('.replacement')
+            temp.write_bytes(b'other writer bytes')
+            os.replace(temp, target)  # deliberately uncooperating writer
+    monkeypatch.setattr(tx, '_stage_file', replace)
+    r = json.loads(bo.bo_create_build(_build('stale'), S, request_id='stale'))
+    assert not r['ok'], r
+    assert 'namespace changed' in r['error']
+    assert target.read_bytes() == b'other writer bytes'
+    assert not specs(scratch) and (scratch / S).read_text() == SEED
+    assert not list((scratch / 'Personal/Build Orchestrator/.authoring-receipts').glob('*'))
+
+
+def test_registry_lock_excludes_independently_started_path_writer(scratch):
+    # Separate interpreters, pipes as readiness/release events. No inherited
+    # thread gate can accidentally satisfy the cross-process assertion.
+    owner = subprocess.Popen([sys.executable, '-u', '-c',
+        'import sys;from obsidian_vault_mcp.vault_lock import registry_lock\nwith registry_lock():\n print("locked",flush=True);sys.stdin.readline()'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    child = None
+    try:
+        assert owner.stdout.readline().strip() == 'locked'
+        target = scratch / 'process-writer.md'
+        child = subprocess.Popen([sys.executable, '-u', '-c',
+            'import sys;from pathlib import Path;from obsidian_vault_mcp.vault_lock import atomic_write\nprint("ready",flush=True);sys.stdin.readline();atomic_write(Path(sys.argv[1]),b"done")', str(target)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        assert child.stdout.readline().strip() == 'ready'
+        child.stdin.write('go\n'); child.stdin.flush()
+        with pytest.raises(subprocess.TimeoutExpired):
+            child.wait(timeout=.3)
+        assert not target.exists()
+        owner.stdin.write('release\n'); owner.stdin.flush()
+        assert owner.wait(timeout=5) == 0 and child.wait(timeout=5) == 0
+        assert target.read_bytes() == b'done'
+    finally:
+        if owner.poll() is None: owner.kill()
+        owner.wait(timeout=5)
+        if child and child.poll() is None: child.kill()
+        if child: child.wait(timeout=5)
+
+
+def _frozen_context(monkeypatch):
+    from obsidian_vault_mcp.write_contract import WriteContext
+    old = 'builds:\n  - id: a\n    title: A\n  - id: b\n    title: B\n'
+    monkeypatch.setattr(bo_contract, 'parse_schedule_document', bo_contract._schedule_parser().parse_schedule_document)
+    monkeypatch.setattr(bo_contract, 'preflight_schedule_rewrite', lambda *a, **kw: {
+        'errors': [{'code': 'frozen_contract_mutation', 'build_id': 'a', 'message': 'base frozen refusal'}]})
+    monkeypatch.setattr(bo_contract, 'validate_graph', lambda *a, **kw: {'errors': []})
+    return old, lambda new: bo_guard._schedule_rewrite_issues(WriteContext(S, old, new))
+
+
+def test_nonappend_rewrite_keeps_base_frozen_refusal(scratch, monkeypatch):
+    old, issues = _frozen_context(monkeypatch)
+    assert issues(old.replace('title: B', 'title: changed'))
+    assert not issues(old + '  - id: c\n    title: C\n')
+
+
+@pytest.mark.parametrize('suffix', [
+    'project: build-orchestrator\n', 'builds: []\n', 'other: override\n',
+    '---\nproject: build-orchestrator\n', '...\n',
+    '    title: duplicate\n',
+])
+def test_append_suffix_cannot_override_schedule_keys(scratch, monkeypatch, suffix):
+    old, issues = _frozen_context(monkeypatch)
+    assert issues(old + '  - id: c\n    title: C\n' + suffix)
+
+
+@pytest.mark.parametrize('field', ['title','what_this_means','probes','scope','proof','out_of_scope','commit_prefix'])
+@pytest.mark.parametrize('level', [1,2])
+def test_formula_caller_policy_heading_never_deletes_sections(scratch, monkeypatch, field, level):
+    t = module('authoring_templates')
+    monkeypatch.setattr(t, 'registry_snapshot', lambda **kw: fake_registry())
+    before = data_files(scratch)
+    r = json.loads(bo.bo_author_feature(**feature(**{field:'Caller {{ literal }}\n' + '#'*level + ' Checkout write policy\nUnsafe policy'}), dry_run=True))
+    if r['ok']:
+        text = r['rendered']['feature']['spec']
+        for heading in ('What this means','Start gate','Probes','Scope','Proof','Out of scope','Output'):
+            assert '## '+heading+'\n' in text
+        assert text.count('## Checkout write policy') == 1
+        assert 'Source and test edits within this build' in text
+        assert 'Caller {{ literal }}' in text
+    else:
+        assert 'policy heading' in r['error']
+    assert data_files(scratch) == before
+
+
+@pytest.mark.parametrize('change', ['schedule','spec','guard','db','registry'])
+def test_preparation_input_change_cannot_authorize_stale_commit(scratch, monkeypatch, change):
+    tx = module('authoring_transaction')
+    original = bo._prepare_graph
+    spec = scratch / 'Personal/Build Orchestrator/specs/context.md'
+    spec.parent.mkdir(parents=True); spec.write_text('original context')
+    schema = scratch / '_schema_rules.json';schema.write_text('{}')
+    db_path = scratch / 'db/orchestrator.db'; db_path.parent.mkdir(); db_path.write_bytes(b'synthetic metadata fixture')
+    monkeypatch.setenv('BO_TEST_DB_DIR', str(db_path.parent))
+    registry = scratch / 'registry.yaml'; registry.write_text('synthetic metadata fixture')
+    monkeypatch.setenv('BO_MODEL_REGISTRY_PATH', str(registry))
+    calls = 0
+    def prepare(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = original(*args, **kwargs)
+        if calls == 1:
+            target = {'schedule': scratch/S, 'spec': spec, 'guard': schema, 'db': db_path, 'registry': registry}[change]
+            target.write_text(target.read_text()+'\n')
+        else:
+            result['ok'] = False
+            result['errors'] = [{'code':'changed_input_refused'}]
+        return result
+    monkeypatch.setattr(bo, '_prepare_graph', prepare)
+    r = json.loads(bo.bo_create_build(_build('stale-approval'), S))
+    assert not r['ok'], r
+    assert not (spec.parent/'stale-approval.md').exists()
+    assert calls >= 2 or 'changed' in r.get('error', '')
+
+@pytest.mark.parametrize('baseline', ['entry','file'])
+@pytest.mark.parametrize('change', ['pending-reorder','protected-comment','semantic-edit','append-edit','append-reorder'])
+def test_ordinary_rewrite_matches_real_adapter(scratch, monkeypatch, baseline, change):
+    import hashlib
+    monkeypatch.syspath_prepend(str(Path(bo_contract.resolve_authoring_contract_path()).parent))
+    import authoring_contract as ac
+    from obsidian_vault_mcp.write_contract import WriteContext
+    # Use complete real-adapter entry shapes, with one running sibling.
+    entries = [dict(id=bid, title=bid, description='Synthetic entry', run_when='no deps', tier='simple', project='edge-trading-system',
+                    spec_path=f'Personal/Build Orchestrator/specs/{bid}.md', depends_on=[])
+               for bid in ['a','b','c']]
+    old = yaml.safe_dump({'builds': entries}, sort_keys=False)
+    monkeypatch.setattr(bo_contract, 'parse_schedule_document', bo_contract._schedule_parser().parse_schedule_document)
+    if change == 'pending-reorder':
+        new = yaml.safe_dump({'builds': [entries[0], entries[2], entries[1]]}, sort_keys=False)
+    elif change == 'protected-comment':
+        new = old.replace('title: a', 'title: a # harmless comment')
+    elif change in ('semantic-edit','append-edit'):
+        new = old.replace('title: a', 'title: changed')
+    else:
+        new = yaml.safe_dump({'builds': [entries[1],entries[0],entries[2]]}, sort_keys=False)
+    if change.startswith('append-'):
+        new += yaml.safe_dump({'builds': [entries[0] | {'id':'d', 'title':'d', 'spec_path':'Personal/Build Orchestrator/specs/d.md'}]}, sort_keys=False).split('builds:\n', 1)[1]
+    state = dict(id='a', status='running', completion_contract_hash='frozen', source_schedule=S,
+                 schedule_hash=ac._hash_entry(entries[0]) if baseline == 'entry' else hashlib.sha256(old.encode()).hexdigest())
+    monkeypatch.setattr(ac, '_baseline_schedule_text', lambda path: old)
+    def authoritative(path, builds, **kwargs):
+        r = ac.validate_schedule_rewrite(path, builds, mode='compat_existing',
+            existing_state_lookup=lambda bid: state if bid == 'a' else None,
+            schedule_bindings_lookup=lambda path: [state])
+        return {'errors':r.errors}
+    monkeypatch.setattr(bo_contract, 'preflight_schedule_rewrite', authoritative)
+    monkeypatch.setattr(bo_contract, 'preflight_ids', lambda ids, **kw: {'results':{bid:'running' if bid=='a' else 'pending' for bid in ids}})
+    monkeypatch.setattr(bo_guard, '_freely_mutable_statuses', lambda: {'pending'})
+    monkeypatch.setattr(bo_contract, 'validate_graph', lambda *a, **kw: {'errors':[]})
+    issues = bo_guard._schedule_rewrite_issues(WriteContext(S, old, new))
+    base_errors = authoritative(S, bo_guard.schedule_builds_from_content(new))['errors']
+    assert bool(issues) == bool(base_errors), (issues, base_errors)
+    if change in ('semantic-edit','append-edit'):
+        assert any('frozen_contract_mutation' in i.message for i in issues)
+    if change.startswith('append-'):
+        # Even an independently allowed ordinary rewrite cannot use the
+        # add-only exception to suppress a distinct base frozen refusal.
+        monkeypatch.setattr(bo_contract, 'preflight_schedule_rewrite', lambda *a, **kw: {
+            'errors':[{'code':'frozen_contract_mutation','build_id':'a','message':'frozen'}]})
+        assert bo_guard._schedule_rewrite_issues(WriteContext(S, old, new))
+
+
+def test_same_schedule_preparations_in_independent_processes_retry(scratch):
+    script = '''
+import sys,json
+from pathlib import Path
+from pytest import MonkeyPatch
+from tests.test_vault_authoring_speed import configure,S,_build
+from obsidian_vault_mcp.tools import build_orchestrator as bo
+m=MonkeyPatch();configure(m,Path(sys.argv[1]));original=bo._prepare_graph;calls=0
+def prepare(*a,**kw):
+ global calls
+ calls+=1;result=original(*a,**kw)
+ if calls==1: print('prepared',flush=True);sys.stdin.readline()
+ return result
+bo._prepare_graph=prepare
+result=json.loads(bo.bo_create_build(_build(sys.argv[2]),S,request_id=sys.argv[2]))
+print(json.dumps({'result':result,'calls':calls}),flush=True)
+'''
+    children = [subprocess.Popen([sys.executable, '-u', '-c', script, str(scratch), bid],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                for bid in ['process-a','process-b']]
+    try:
+        for child in children: assert child.stdout.readline().strip() == 'prepared'
+        results = []
+        for child in children:
+            child.stdin.write('commit\n');child.stdin.flush()
+            output, _ = child.communicate(timeout=30)
+            assert child.returncode == 0
+            results.append(json.loads(output.strip()))
+        assert all(r['result']['ok'] for r in results), results
+        assert results[1]['calls'] >= 2
+        entries = bo_guard.schedule_builds_from_content((scratch / S).read_text())
+        assert {e['id'] for e in entries} == {'process-a','process-b'}
+        assert len(specs(scratch)) == 2
+        assert len(list((scratch/'Personal/Build Orchestrator/.authoring-receipts').glob('*.json'))) == 2
+    finally:
+        for child in children:
+            if child.poll() is None: child.kill()
+            child.wait(timeout=5)
+
+
+def test_postcommit_index_failure_is_a_warning(scratch, monkeypatch):
+    tx = module('authoring_transaction')
+    def fail(paths): raise OSError('synthetic index failure')
+    monkeypatch.setattr(tx, '_commit_hooks', [fail])
+    r = json.loads(bo.bo_create_build(_build('index-failure'), S, request_id='index-warning'))
+    assert r['ok'] and r['created']
+    assert 'authoring committed; index refresh needs retry' in r['warnings']
+    assert len(specs(scratch)) == 1
+    assert json.loads(bo.bo_create_build(_build('index-failure'), S, request_id='index-warning')) == r
+
+
+def test_formula_checks_required_sections_after_policy_replacement(scratch, monkeypatch):
+    t = module('authoring_templates')
+    monkeypatch.setattr(t, 'registry_snapshot', lambda **kw: fake_registry())
+    template = scratch / t.VAULT_TEMPLATES / 'build.md'
+    template.parent.mkdir(parents=True)
+    raw = (t.DEFAULTS / 'build.md').read_text()
+    # A structurally valid override still must not let the policy splice
+    # remove every safety-bearing section after rendering.
+    raw = raw.replace('## What this means', '# Checkout write policy\nUnexpected policy\n\n## What this means', 1)
+    template.write_text(raw)
+    before = data_files(scratch)
+    r = json.loads(bo.bo_author_feature(**feature(), dry_run=True))
+    assert not r['ok'], r
+    assert 'required sections' in r['error']
+    assert data_files(scratch) == before

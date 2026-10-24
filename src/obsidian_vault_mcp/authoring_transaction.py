@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+import subprocess
 from typing import Callable
 
 from . import bo_contract, bo_guard, config, mutation_ledger, vault_lock
@@ -55,7 +57,8 @@ def _exchange(left: Path, right: Path):
 
 
 def _manifest(root: Path):
-    result = {}
+    info = root.stat()
+    result = {".": (info.st_dev, info.st_ino, info.st_mode)}
     for path in root.rglob("*"):
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
@@ -96,15 +99,121 @@ def read_receipt(request_key: str, payload_hash: str) -> dict | None:
     return record["result"]
 
 
+class PreparationChanged(ValueError):
+    """A read dependency changed; discard the entire preparation and retry."""
+
+
+def _guard_inputs() -> str:
+    """Fingerprint mutable adapter inputs without reading credential values.
+
+    The adapter owns path resolution. Its read-only imports report only a
+    digest of filesystem identities, never configuration/DB contents. DB,
+    WAL and rollback-journal changes invalidate approval conservatively.
+    Source, registry, project config and repository refs/config are included.
+    This is deliberately not a cached DB approval or a new locking protocol.
+    """
+    directory = str(Path(bo_contract.resolve_authoring_contract_path()).resolve().parent)
+    script = r"""
+import sys,os,json,hashlib,subprocess
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import db,model_registry,project_resolve
+root=Path(sys.argv[1]); paths=set(root.rglob('*.py'))
+paths.update([root/'config.yaml',model_registry.registry_path(),model_registry._state_path(),model_registry.DEFAULT_PATH])
+paths.update(Path(str(db.DB_PATH)+suffix) for suffix in ('','-wal','-journal'))
+for project in (project_resolve.load_config().get('projects') or {}).values():
+ repo=project.get('repo_dir')
+ if not repo: continue
+ for option in ('--git-dir','--git-common-dir'):
+  p=subprocess.run(['git','-C',repo,'rev-parse',option],capture_output=True,text=True,timeout=2)
+  if p.returncode: continue
+  git=Path(p.stdout.strip());git=git if git.is_absolute() else Path(repo)/git
+  paths.update(git/name for name in ('HEAD','config','packed-refs','commondir'))
+  paths.update((git/'refs').rglob('*'))
+records=[]
+for path in sorted(paths):
+ try:
+  st=path.stat(); value=(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns,st.st_mode)
+ except FileNotFoundError:value=None
+ records.append((str(path),value))
+print(hashlib.sha256(json.dumps(records).encode()).hexdigest())
+"""
+    response = subprocess.run(
+        [config.BO_AUTHORING_CONTRACT_PYTHON, '-c', script, directory],
+        capture_output=True, text=True, timeout=config.BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
+    )
+    digest = response.stdout.strip()
+    if response.returncode or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+        raise ValueError('cannot bind authoring validation to mutable guard inputs')
+    return digest
+
+
+def capture_inputs():
+    """Exact authority bytes + mutable guard state for one preparation pass.
+
+    Logs and unrelated notes are not authority. They may change freely during
+    preparation and are incorporated into the fresh snapshot under the lock.
+    The final namespace manifest separately protects every staged hardlink.
+    """
+    root = config.VAULT_PATH.resolve()
+    namespace = root / NAMESPACE
+    paths = {root / '_schema_rules.json'}
+    for name in ('specs', 'schedules', 'templates', 'rules'):
+        folder = namespace / name
+        paths.add(folder)
+        paths.update(folder.rglob('*'))
+    # Noncanonical historical spec paths remain read dependencies too.
+    for schedule in (namespace / 'schedules').glob('*.yaml'):
+        builds = bo_guard.schedule_builds_from_content(schedule.read_text(), source_name=str(schedule))
+        for entry in builds or []:
+            if isinstance(entry, dict) and isinstance(entry.get('spec_path'), str):
+                paths.add(vault.resolve_vault_path(entry['spec_path']))
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode())
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError('authoring input contains a symlink')
+            digest.update(str((info.st_ino, info.st_mode)).encode())
+            if path.is_file():
+                digest.update(path.read_bytes())
+        except FileNotFoundError:
+            digest.update(b'absent')
+    from . import write_contract
+    return (digest.hexdigest(), _guard_inputs(),
+            bo_contract.resolve_authoring_contract_path(), config.BO_AUTHORING_CONTRACT_PYTHON,
+            os.environ.get('BO_VAULT_ROOT'), bo_guard.get_mode(),
+            vault._write_contract_mode(), config.MAX_CONTENT_SIZE,
+            tuple(write_contract._CONTENT_REGISTRY.items()),
+            frozenset(write_contract._ENFORCED_RULES))
+
+
+def refresh(files: dict[str, str]) -> list[str]:
+    """Index callbacks follow durable publication and global-lock release."""
+    warnings = []
+    for hook in _commit_hooks:
+        try:
+            hook(list(files))
+        except Exception:
+            logger.exception('authoring committed; index refresh failed')
+            warnings.append('authoring committed; index refresh needs retry')
+    return warnings
+
+
 def commit(files: dict[str, str], *, schedule_path: str, expected_revision: str,
            tool: str, result: dict, receipt: tuple[str, str] | None = None,
-           dry_run: bool = False) -> list[str]:
+           dry_run: bool = False, inputs=None) -> list[str]:
     """Validate the exact staged bytes and atomically publish, or write nothing.
 
-    Caller holds registry_lock through graph preparation, so concurrent calls
-    prepare against the result of their predecessor, rather than losing rows.
-    Dry runs exercise all the same guard checks without staging or receipts.
+    Expensive validation runs outside the global lock. Every result is bound
+    to exact authority bytes and mutable guard inputs, checked again under
+    the existing global lock and immediately before publication. Changed
+    inputs discard preparation; callers retry the full pass outside the lock.
+    Dry runs exercise the same checks without staging, receipts or a lock.
     """
+    inputs = capture_inputs() if inputs is None else inputs
     root = vault.resolve_vault_path(NAMESPACE)
     if root != config.VAULT_PATH.resolve() / NAMESPACE:
         raise ValueError("authoring namespace must not be a symlink alias")
@@ -136,9 +245,19 @@ def commit(files: dict[str, str], *, schedule_path: str, expected_revision: str,
                 vault._enforce_write_contract(ctx)
             if bo_guard.get_mode() != "off":
                 bo_guard.enforce(ctx)
+    if capture_inputs() != inputs:
+        raise PreparationChanged('authoring inputs changed during preparation')
     if dry_run:
         return []
+    with vault_lock.registry_lock():
+        if capture_inputs() != inputs:
+            raise PreparationChanged('authoring inputs changed before staging')
+        return _publish(root, files, originals, tool, result, receipt, inputs)
 
+
+def _publish(root, files, originals, tool, result, receipt, inputs):
+    # All staging, final checks, exchange, durability and receipt publication
+    # remain excluded against both legacy and new cooperating path writers.
     baseline = _manifest(root)
     # A hidden sibling of the vault is outside ALL vault read/search/index
     # paths, including Python search fallbacks that walk hidden directories.
@@ -161,6 +280,8 @@ def commit(files: dict[str, str], *, schedule_path: str, expected_revision: str,
             _sync_dir(Path(directory))
         _sync_dir(root.parent)
         _sync_dir(stage.parent)
+        if capture_inputs() != inputs:
+            raise PreparationChanged('authoring inputs changed during staging')
         if _manifest(root) != baseline:
             raise ValueError("authoring namespace changed during staging; refusing stale snapshot")
         # Also detect an uncooperating target writer immediately before swap.
@@ -195,10 +316,4 @@ def commit(files: dict[str, str], *, schedule_path: str, expected_revision: str,
             result="success", old_hash=vault.compute_revision(originals[relative]),
             new_hash=vault.compute_revision(content.encode()),
         ))
-    for hook in _commit_hooks:
-        try:
-            hook(list(files))
-        except Exception:
-            logger.exception("authoring committed; index refresh failed")
-            warnings.append("authoring committed; index refresh needs retry")
     return warnings
