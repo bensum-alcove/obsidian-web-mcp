@@ -765,6 +765,10 @@ class BOCreateBuildInput(BaseModel):
         ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
     )
 
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    wait: bool = Field(default=True, strict=True)
+    dry_run: bool = Field(default=False, strict=True)
+
 
 class BOCreateChainInput(BaseModel):
     """Structured same-project multi-build chain create, including forward references.
@@ -776,6 +780,33 @@ class BOCreateChainInput(BaseModel):
     schedule_path: str = Field(
         ..., description="Vault-relative path to an EXISTING schedule file to append to", min_length=1, max_length=500
     )
+
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    wait: bool = Field(default=True, strict=True)
+    dry_run: bool = Field(default=False, strict=True)
+
+
+class BOAuthorFeatureInput(BaseModel):
+    """Model-neutral feature formula; routing preferences use BO validation."""
+    model_config = ConfigDict(extra="forbid")
+    feature_id: str = Field(..., min_length=1, max_length=180, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    title: str = Field(..., min_length=1, max_length=300)
+    project: str = Field(..., min_length=1, max_length=200)
+    what_this_means: str = Field(..., min_length=1, max_length=MAX_CONTENT_SIZE)
+    probes: str = Field(..., min_length=1, max_length=MAX_CONTENT_SIZE)
+    scope: str = Field(..., min_length=1, max_length=MAX_CONTENT_SIZE)
+    proof: str = Field(..., min_length=1, max_length=MAX_CONTENT_SIZE)
+    out_of_scope: str = Field(..., min_length=1, max_length=MAX_CONTENT_SIZE)
+    risk_domain: str = Field(..., min_length=1, max_length=100)
+    blast_radius: str = Field(..., min_length=1, max_length=100)
+    reversible: bool = Field(..., strict=True)
+    shadowable: bool = Field(..., strict=True)
+    commit_prefix: str = Field(..., min_length=1, max_length=100)
+    model_preferences: dict | None = None
+    schedule_path: str | None = Field(default=None, min_length=1, max_length=500)
+    request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    wait: bool = Field(default=True, strict=True)
+    dry_run: bool = Field(default=False, strict=True)
 
 
 class BOActivateExistingSpecInput(BaseModel):

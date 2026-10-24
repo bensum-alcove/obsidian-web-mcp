@@ -32,6 +32,7 @@ KNOWN_MUTATION_TOOLS = {
     "vault_batch_str_replace",
     "bo_create_build",
     "bo_create_chain",
+    "bo_author_feature",
     "bo_activate_existing_spec",
 }
 
@@ -50,6 +51,8 @@ KNOWN_READ_TOOLS = {
     "vault_query",
     "vault_answer_context",
     "bo_validate_build_graph",
+    "bo_authoring_job",
+    "bo_authoring_context",
     "vault_semantic_search",
     "vault_read_smart",
 }

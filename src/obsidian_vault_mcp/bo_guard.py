@@ -267,6 +267,8 @@ import logging
 import os
 import posixpath
 import re
+import contextlib
+import contextvars
 from dataclasses import dataclass, field
 
 from . import bo_contract
@@ -287,6 +289,17 @@ class BOGuardError(ValueError):
 
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
+_staged_specs = contextvars.ContextVar("bo_staged_specs", default={})
+
+
+@contextlib.contextmanager
+def staged_specs(contents: dict[str, str]):
+    """Private transaction view: guard the exact new specs before publication."""
+    token = _staged_specs.set(contents)
+    try:
+        yield
+    finally:
+        _staged_specs.reset(token)
 
 # codes `preflight_schedule_rewrite`'s bound-row-preservation loop owns
 # (authoring_contract.py validate_schedule_rewrite, the loop over
@@ -462,6 +475,9 @@ def _read_vault_text(relative_path: str) -> str | None:
     anything that resolves outside the vault root.
     """
     from . import config
+
+    if relative_path in _staged_specs.get():
+        return _staged_specs.get()[relative_path]
 
     try:
         full = (config.VAULT_PATH / relative_path).resolve()
@@ -658,7 +674,34 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     unchanged_ids = _byte_identical_schedule_entry_ids(
         ctx.old_content, ctx.new_content, old_builds, new_builds,
     )
+    # Only a literal suffix append can relax frozen *context* findings. A
+    # semantic YAML comparison would miss reordered entries and whitespace.
+    old_ids = [b.get("id") for b in (old_builds or []) if isinstance(b, dict)]
+    new_id_list = [b.get("id") for b in new_builds if isinstance(b, dict)]
+    add_only = bool(
+        ctx.old_content is not None and old_builds is not None
+        and ctx.new_content.startswith(ctx.old_content)
+        and len(new_id_list) > len(old_ids)
+        and new_id_list[:len(old_ids)] == old_ids
+        and len(set(new_id_list)) == len(new_id_list)
+        and set(old_ids) <= unchanged_ids
+    )
     issues: list[ValidationIssue] = []
+
+    if old_ids and not add_only:
+        try:
+            statuses = bo_contract.preflight_ids(old_ids).get("results", {})
+            mutable = _freely_mutable_statuses()
+        except bo_contract.BOContractError as e:
+            return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
+        protected = {bid for bid, status in statuses.items()
+                     if status is not None and status not in mutable}
+        preserved_order = [bid for bid in new_id_list if bid in set(old_ids)] == old_ids
+        if protected and (not preserved_order or not protected <= unchanged_ids):
+            issues.append(ValidationIssue(
+                "bo-guard-schedule-rewrite", "reject",
+                "frozen schedule entries must keep their exact bytes and order",
+            ))
 
     # 1. Bound-row preservation / terminal-entry-edit preflight. Runs
     #    regardless of whether this is a brand-new or existing schedule -- a
@@ -671,7 +714,8 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     preflight_errors = _drop_unchanged_terminal_context_errors(
         preflight_result.get("errors", []),
         unchanged_ids,
-        {"terminal_schedule_entry_edit"},
+        {"terminal_schedule_entry_edit", "frozen_contract_mutation"} if add_only
+        else {"terminal_schedule_entry_edit"},
     )
     # Keep only the codes this preflight stage owns (see
     # _PREFLIGHT_SCHEDULE_REWRITE_OWNED_CODES docstring above) -- any other
@@ -710,7 +754,8 @@ def _schedule_rewrite_issues(ctx: WriteContext) -> list[ValidationIssue]:
     graph_errors = _drop_unchanged_terminal_context_errors(
         graph_result.get("errors", []),
         unchanged_ids,
-        {"terminal_id_reuse"},
+        {"terminal_id_reuse", "frozen_contract_mutation"} if add_only
+        else {"terminal_id_reuse"},
     )
     issues.extend(_errors_to_issues("bo-guard-schedule-graph", graph_errors))
 

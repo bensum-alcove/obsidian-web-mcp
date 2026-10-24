@@ -8,11 +8,8 @@ authoring_contract.py's JSON CLI) -- this module only:
   - shapes typed tool inputs into the adapter's node/spec JSON shape,
   - constructs one valid YAML schedule document (never string-splices an
     entry after a flow-style empty `builds: []`),
-  - enforces the write ordering invariant (validate the whole graph -> write
-    every new spec -> write/replace the schedule last, as the activation
-    boundary), so a pre-schedule failure leaves any already-written spec
-    orphaned (inert -- not referenced by any schedule entry) rather than
-    producing a half-activated graph,
+  - validates and stages every spec and schedule before one atomic namespace
+    publication, with payload-bound retries and optional background jobs,
   - fails closed if the adapter is unavailable or a schema-version mismatch is
     detected (bo_contract.BOContractError) -- never guesses at validity.
 
@@ -24,6 +21,7 @@ to bind one already-written inert spec as the final schedule write only.
 from __future__ import annotations
 
 import json
+import copy
 import logging
 import re
 from pathlib import Path
@@ -31,7 +29,7 @@ from pathlib import Path
 import frontmatter
 import yaml
 
-from .. import bo_contract
+from .. import bo_contract, authoring_jobs, authoring_transaction, vault_lock
 from ..bo_guard import SPECS_PREFIX, schedule_builds_from_content
 from ..frontmatter_safe import update_frontmatter_field
 from ..vault import RevisionConflictError, conflict_payload, read_file, write_file_atomic
@@ -330,7 +328,7 @@ def compose_schedule_document(existing_content: str, new_entry_texts: list[str],
     entry_block = "\n\n".join(fragments) + "\n"
 
     if existing_builds:
-        return existing_content.rstrip("\n") + "\n\n" + entry_block
+        return existing_content + ("" if existing_content.endswith("\n") else "\n") + "\n" + entry_block
 
     match = _BUILDS_KEY_RE.search(existing_content)
     if match is None:
@@ -493,7 +491,8 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
 
 
 def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
-                   spec_markdown_overrides: dict[str, str] | None = None) -> dict:
+                   spec_markdown_overrides: dict[str, str] | None = None,
+                   template_metadata: dict | None = None) -> dict:
     """Shape + render + validate a proposed graph. Never writes anything.
 
     Validates the COMPLETE resulting graph -- every entry already in
@@ -599,6 +598,12 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
             entry_text = _splice_schedule_entry_field(entry_text, field_name, entry[field_name])
         rendered[b["build_id"]]["schedule_entry"] = entry_text
 
+    for bid, fields in (template_metadata or {}).items():
+        for key, value in fields.items():
+            rendered[bid]["spec"] = update_frontmatter_field(
+                rendered[bid]["spec"], key, value, require_existing=False,
+            )
+
     new_nodes = [
         {
             "build_id": b["build_id"],
@@ -655,7 +660,9 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
 
 def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
               write_new_specs: bool = True,
-              spec_markdown_overrides: dict[str, str] | None = None) -> str:
+              spec_markdown_overrides: dict[str, str] | None = None,
+              dry_run: bool = False, receipt=None, template_metadata=None,
+              create_schedule: bool = False) -> str:
     """Shared create/activate path for bo_create_build, bo_create_chain, and
     bo_activate_existing_spec.
 
@@ -668,9 +675,24 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     schedule activation write is performed.
     """
     try:
+        with vault_lock.registry_lock():
+            return _activate_locked(builds, schedule_path, tool_name,
+                                    write_new_specs=write_new_specs,
+                                    spec_markdown_overrides=spec_markdown_overrides,
+                                    dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
+                                    create_schedule=create_schedule)
+    except (ValueError, OSError, bo_contract.BOContractError) as exc:
+        return json.dumps({"ok": False, "activated": False, "error": str(exc),
+                           **({"code": exc.code} if isinstance(exc, bo_contract.BOContractError) else {})})
+
+
+def _activate_locked(builds, schedule_path, tool_name, *, write_new_specs=True,
+                     spec_markdown_overrides=None, dry_run=False, receipt=None,
+                     template_metadata=None, create_schedule=False):
+    try:
         prep = _prepare_graph(
             builds, schedule_path, "strict_new",
-            spec_markdown_overrides=spec_markdown_overrides,
+            spec_markdown_overrides=spec_markdown_overrides, template_metadata=template_metadata,
         )
     except BOToolError as e:
         return json.dumps({"ok": False, "error": str(e), "activated": False})
@@ -703,14 +725,18 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     try:
         schedule_content, schedule_meta = read_file(schedule_path)
     except FileNotFoundError:
-        return json.dumps({
-            "ok": False,
-            "error": (
-                f"schedule_path {schedule_path!r} does not exist -- {tool_name} appends to an "
-                "existing schedule only; it never creates a new schedule file"
-            ),
-            "activated": False,
-        })
+        if create_schedule:
+            schedule_content = "---\nproject: " + builds[0]["project"] + "\n---\n\nbuilds: []\n"
+            schedule_meta = {"revision": "absent"}
+        else:
+            return json.dumps({
+                "ok": False,
+                "error": (
+                    f"schedule_path {schedule_path!r} does not exist -- {tool_name} appends to an "
+                    "existing schedule only; it never creates a new schedule file"
+                ),
+                "activated": False,
+            })
 
     new_ids = [node["build_id"] for node in prep["nodes"]]
     new_entry_texts = [prep["rendered"][node["build_id"]]["schedule_entry"] for node in prep["nodes"]]
@@ -752,71 +778,66 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
                 "activated": False,
             })
 
-    created = []
-    try:
-        if write_new_specs:
-            for node in prep["nodes"]:
-                spec_path = node["schedule_entry"]["spec_path"]
-                write_file_atomic(spec_path, node["spec_markdown"], create_dirs=True, tool=tool_name)
-                created.append({
-                    "build_id": node["build_id"],
-                    "spec_path": spec_path,
-                    "project": node["schedule_entry"].get("project"),
-                    "depends_on": node["schedule_entry"].get("depends_on", []),
-                })
-        else:
-            created = [
-                {
-                    "build_id": node["build_id"],
-                    "spec_path": node["schedule_entry"]["spec_path"],
-                    "project": node["schedule_entry"].get("project"),
-                    "depends_on": node["schedule_entry"].get("depends_on", []),
-                }
-                for node in prep["nodes"]
-            ]
-
-        is_new, size = write_file_atomic(
-            schedule_path, new_schedule_content, create_dirs=False, tool=tool_name,
-            expected_revision=schedule_meta.get("revision"),
-        )
-    except (RevisionConflictError, ValueError, OSError) as e:
-        # Every spec write before this point already landed -- they are orphaned
-        # (inert: no schedule entry references them) rather than a half-activated
-        # graph, since the schedule write is always the last, single operation.
-        logger.error(f"{tool_name} activation failed after {len(created)} spec write(s): {e}")
-        payload = {
-            "ok": False,
-            "error": str(e),
-            "activated": False,
-            "orphaned_specs": [c["spec_path"] for c in created] if write_new_specs else [],
-        }
-        if isinstance(e, RevisionConflictError):
-            payload.update(conflict_payload(e))
-        return json.dumps(payload)
-
-    return json.dumps({
+    created = [
+        {"build_id": node["build_id"], "spec_path": node["schedule_entry"]["spec_path"],
+         "project": node["schedule_entry"].get("project"),
+         "depends_on": node["schedule_entry"].get("depends_on", [])}
+        for node in prep["nodes"]
+    ]
+    result = {
         "ok": True,
         "schema_version": prep["version_info"].get("schema_version"),
         "contract_version": prep["version_info"].get("contract_version"),
-        "schedule_path": schedule_path,
-        "created": created,
-        "warnings": prep["warnings"],
-        "activation": {"schedule_path": schedule_path, "size": size, "created_new_file": is_new},
-    })
+        "schedule_path": schedule_path, "created": created, "warnings": prep["warnings"],
+        "activation": {"schedule_path": schedule_path,
+                       "size": len(new_schedule_content.encode()), "created_new_file": schedule_meta["revision"] == "absent"},
+    }
+    files = {node["schedule_entry"]["spec_path"]: node["spec_markdown"]
+             for node in prep["nodes"]} if write_new_specs else {}
+    files[schedule_path] = new_schedule_content
+    try:
+        warnings = authoring_transaction.commit(
+            files, schedule_path=schedule_path, expected_revision=schedule_meta["revision"],
+            tool=tool_name, result=result, receipt=receipt, dry_run=dry_run,
+        )
+    except (ValueError, OSError, bo_contract.BOContractError) as exc:
+        payload = {"ok": False, "error": str(exc), "activated": False, "orphaned_specs": []}
+        if isinstance(exc, RevisionConflictError):
+            payload.update(conflict_payload(exc))
+        if isinstance(exc, bo_contract.BOContractError):
+            payload["code"] = exc.code
+        return json.dumps(payload)
+    if dry_run:
+        result.update(dry_run=True, activated=False, rendered=prep["rendered"],
+                      schedule_content=new_schedule_content)
+    result["warnings"].extend(warnings)
+    return json.dumps(result)
 
 
-def bo_create_build(build: dict, schedule_path: str) -> str:
-    """Structured single-build create: validate, write the spec, then append the
-    schedule entry as the activation boundary. Always strict_new -- see _activate."""
-    return _activate([build], schedule_path, "bo_create_build")
+def bo_create_build(build: dict, schedule_path: str, request_id: str | None = None,
+                    wait: bool = True, dry_run: bool = False) -> str:
+    """Strict-new, atomic single-build authoring; optional preview/job/replay."""
+    build = copy.deepcopy(build)
+    return authoring_jobs.submit(
+        "bo_create_build", {"build": build, "schedule_path": schedule_path, "dry_run": dry_run},
+        lambda receipt: _activate([build], schedule_path, "bo_create_build", dry_run=dry_run, receipt=receipt),
+        request_id=request_id, wait=wait, dry_run=dry_run,
+    )
 
 
-def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
-    """Structured same-project multi-build chain create, including forward
-    references (a later build's depends_on may name an earlier build in the
-    same request). Validates the whole graph, writes every spec, then appends
-    all schedule entries in one final schedule write. Always strict_new -- see _activate."""
-    return _activate(builds, schedule_path, "bo_create_chain")
+def bo_create_chain(builds: list[dict], schedule_path: str, request_id: str | None = None,
+                    wait: bool = True, dry_run: bool = False) -> str:
+    """Strict-new atomic chain authoring; existing positional inputs unchanged."""
+    builds = copy.deepcopy(builds)
+    return authoring_jobs.submit(
+        "bo_create_chain", {"builds": builds, "schedule_path": schedule_path, "dry_run": dry_run},
+        lambda receipt: _activate(builds, schedule_path, "bo_create_chain", dry_run=dry_run, receipt=receipt),
+        request_id=request_id, wait=wait, dry_run=dry_run,
+    )
+
+
+def bo_authoring_job(job_id: str) -> str:
+    return authoring_jobs.bo_authoring_job(job_id)
 
 
 def bo_activate_existing_spec(build_id: str, schedule_path: str, spec_path: str | None = None) -> str:
@@ -858,3 +879,39 @@ def bo_activate_existing_spec(build_id: str, schedule_path: str, spec_path: str 
         write_new_specs=False,
         spec_markdown_overrides={build_id: spec_markdown},
     )
+
+
+def bo_author_feature(feature_id: str, title: str, project: str, what_this_means: str,
+                      probes: str, scope: str, proof: str, out_of_scope: str,
+                      risk_domain: str, blast_radius: str, reversible: bool, shadowable: bool,
+                      commit_prefix: str, model_preferences: dict | None = None,
+                      schedule_path: str | None = None, request_id: str | None = None,
+                      wait: bool = True, dry_run: bool = False) -> str:
+    """Render and atomically author build → exact-SHA review → gated deployment."""
+    from .. import authoring_templates
+    feature = copy.deepcopy({k:v for k,v in locals().items() if k not in {"authoring_templates", "request_id", "wait"}})
+    schedule_path = schedule_path or f"Personal/Build Orchestrator/schedules/{feature_id}.yaml"
+
+    def operation(receipt):
+        try:
+            builds, provenance, warnings = authoring_templates.feature_graph(feature, dry_run=dry_run)
+            # A vault override cannot restore the historical read-only policy
+            # on an implementation executor. Policy comes from the role here.
+            span = _checkout_policy_span(builds[0]["body_markdown"])
+            policy = _IMPLEMENTATION_POLICY.format(build_id=feature_id)
+            builds[0]["body_markdown"] = (builds[0]["body_markdown"][:span[0]] + policy
+                                           + builds[0]["body_markdown"][span[1]:])
+            result = json.loads(_activate(builds, schedule_path, "bo_author_feature", dry_run=dry_run,
+                                         receipt=receipt, template_metadata=provenance,
+                                         create_schedule=True))
+            result.setdefault("warnings", []).extend(warnings)
+            return json.dumps(result)
+        except (ValueError, OSError, bo_contract.BOContractError) as exc:
+            return json.dumps({"ok":False,"activated":False,"error":str(exc)})
+    return authoring_jobs.submit("bo_author_feature", feature, operation, request_id=request_id,
+                                 wait=wait, dry_run=dry_run)
+
+
+def bo_authoring_context(project: str) -> str:
+    from ..authoring_templates import bo_authoring_context as context
+    return context(project)

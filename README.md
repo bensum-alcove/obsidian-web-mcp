@@ -244,3 +244,37 @@ scripts/
 ## License
 
 MIT -- see [LICENSE](LICENSE).
+
+
+### Build Orchestrator authoring
+
+`bo_create_build` and `bo_create_chain` retain their existing inputs and add
+optional `dry_run`, `request_id`, and `wait` parameters. `dry_run: true` validates
+and renders without writing specs, schedules, jobs or template caches. A repeated
+non-preview `request_id` returns its recorded result; changing the payload is
+refused. `wait: false` returns a job id immediately. Poll `bo_authoring_job` until
+it reports a terminal result before treating the work as activated. A job
+interrupted by a server restart reports `unknown` and is never resumed silently.
+
+`bo_author_feature` takes a feature id, title, project, explanation, probes,
+scope, proof, exclusions, risk fields and commit prefix. It authors a build,
+independent review and machine-gated deploy chain. Routing preferences are
+optional and remain subject to BO's live contract. It accepts an existing
+`schedule_path`, or creates `Personal/Build Orchestrator/schedules/<feature_id>.yaml`.
+`bo_authoring_context(project)` returns generated template versions, live model
+and reviewer registries, required sections and the authoring checklist.
+
+Default formulas live in `src/obsidian_vault_mcp/templates/`. Valid versioned
+vault overrides at `Personal/Build Orchestrator/templates/<name>.md` take
+precedence. Variables use `{{ name }}`; unknown variables, filters, control blocks
+and model literals are rejected. An invalid override uses a hash-verified valid
+last-known-good copy, or the repository default, and reports a warning once per
+invalid revision per server. Fully rendered specs record template version/hash.
+
+Atomic authoring requires Linux `renameat2(RENAME_EXCHANGE)` and a writable,
+same-filesystem vault parent for private staging. It fails closed if unsupported.
+The existing process-shared mutation registry serializes cooperating writers
+while the authoring namespace is published in one directory exchange. All
+existing paths and bytes survive; abandoned crash snapshots outside the vault
+are inert. File search and the frontmatter/semantic indexes see committed specs.
+There is no live deployment or guard-mode change merely from installing this code.

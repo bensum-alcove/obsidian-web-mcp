@@ -42,6 +42,8 @@ TOOL_ACCESS_CLASS: dict[str, AccessClass] = {
     "vault_query": AccessClass.READ,
     "vault_answer_context": AccessClass.READ,
     "bo_validate_build_graph": AccessClass.READ,
+    "bo_authoring_context": AccessClass.READ,
+    "bo_authoring_job": AccessClass.READ,
     "vault_semantic_search": AccessClass.READ,
     "vault_read_smart": AccessClass.READ,
     # --- Mutations ---
@@ -57,6 +59,7 @@ TOOL_ACCESS_CLASS: dict[str, AccessClass] = {
     "vault_batch_str_replace": AccessClass.MUTATION,
     "bo_create_build": AccessClass.MUTATION,
     "bo_create_chain": AccessClass.MUTATION,
+    "bo_author_feature": AccessClass.MUTATION,
     "bo_activate_existing_spec": AccessClass.MUTATION,
 }
 

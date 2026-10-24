@@ -16,6 +16,9 @@ responsible for turning that into a fail-closed response.
 from __future__ import annotations
 
 import ast
+import contextlib
+import contextvars
+import copy
 import configparser
 import glob
 import importlib.util
@@ -29,6 +32,38 @@ from dataclasses import dataclass
 from . import config
 
 logger = logging.getLogger(__name__)
+
+_validation_cache = contextvars.ContextVar("bo_validation_cache", default=None)
+
+
+@contextlib.contextmanager
+def validation_batch(build_ids=()):
+    """Reuse identical read-only checks only within one locked validation pass.
+
+    Never persists DB results across requests or activation boundaries. Bulk
+    identity/binding lookups retain the adapter's semantics for each spec.
+    """
+    token = _validation_cache.set({})
+    try:
+        if build_ids:
+            for op in ("ids", "source_schedule"):
+                response = _invoke({"op": "preflight", "preflight_op": op,
+                                    "build_ids": list(build_ids)})
+                if not isinstance(response.get("results"), dict) or not set(build_ids) <= response["results"].keys():
+                    raise BOContractError("adapter_bad_output", "bulk preflight omitted build identities")
+                for bid in build_ids:
+                    payload = {"op": "preflight", "preflight_op": op, "build_ids": [bid]}
+                    _validation_cache.get()[_cache_key(payload, None)] = {
+                        "results": {bid: response.get("results", {}).get(bid)},
+                    }
+        yield
+    finally:
+        _validation_cache.reset(token)
+
+
+def _cache_key(payload, timeout):
+    return (resolve_authoring_contract_path(), timeout,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 # The SCHEMA_VERSION this file's parsing/field assumptions were last verified
 # against -- NOT an exact-match target. authoring_contract.py's schema_version
@@ -154,6 +189,16 @@ def resolve_authoring_contract_path() -> str:
 
 
 def _invoke(payload: dict, timeout: float | None = None) -> dict:
+    cache = _validation_cache.get()
+    if cache is None:
+        return _invoke_uncached(payload, timeout)
+    key = _cache_key(payload, timeout)
+    if key not in cache:
+        cache[key] = _invoke_uncached(payload, timeout)
+    return copy.deepcopy(cache[key])
+
+
+def _invoke_uncached(payload: dict, timeout: float | None = None) -> dict:
     """Run one JSON request through the authoring_contract.py CLI.
 
     shell=False, argument vector only -- never string-interpolated into a shell.

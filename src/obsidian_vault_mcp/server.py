@@ -94,6 +94,20 @@ async def lifespan(server):
     # Observer lives for process lifetime; atexit handles cleanup
 
 
+def _authoring_committed(paths):
+    if frontmatter_index._observer is not None:
+        frontmatter_index.stop()
+        frontmatter_index.start()
+    if _semantic_started:
+        for path in paths:
+            if path.endswith(".md"):
+                _schedule_reindex(path)
+
+
+from .authoring_transaction import register_commit_hook
+register_commit_hook(_authoring_committed)
+
+
 # Create the MCP server
 mcp = FastMCP(
     "obsidian_web_mcp",
@@ -143,6 +157,9 @@ from .tools.build_orchestrator import (
     bo_validate_build_graph as _bo_validate_build_graph,
     bo_create_build as _bo_create_build,
     bo_create_chain as _bo_create_chain,
+    bo_author_feature as _bo_author_feature,
+    bo_authoring_context as _bo_authoring_context,
+    bo_authoring_job as _bo_authoring_job,
     bo_activate_existing_spec as _bo_activate_existing_spec,
 )
 from .models import (
@@ -173,6 +190,7 @@ from .models import (
     BOValidateBuildGraphInput,
     BOCreateBuildInput,
     BOCreateChainInput,
+    BOAuthorFeatureInput,
     BOActivateExistingSpecInput,
 )
 
@@ -670,7 +688,7 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     description=(
         "Create one new Build Orchestrator build: validates the full proposed graph (including every "
         "pre-existing entry already in schedule_path) against the authoritative BO authoring contract, "
-        "writes the new spec file, then writes a single valid YAML schedule document to schedule_path "
+        "atomically publishes the new spec and complete schedule document to schedule_path "
         "(an EXISTING schedule file -- this tool never creates a new schedule file) as the activation "
         "boundary. Empty `builds: []` schedules are rewritten as a block sequence; non-empty schedules "
         "keep existing bytes and append the new entry. Writes nothing if validation fails. Always "
@@ -683,10 +701,12 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def bo_create_build(build: dict, schedule_path: str) -> str:
+def bo_create_build(build: dict, schedule_path: str, request_id: str | None = None,
+                    wait: bool = True, dry_run: bool = False) -> str:
     """Create one new Build Orchestrator build (spec file + schedule entry)."""
-    inp = BOCreateBuildInput(build=build, schedule_path=schedule_path)
-    return _bo_create_build(inp.build.model_dump(exclude_none=True), inp.schedule_path)
+    inp = BOCreateBuildInput(build=build, schedule_path=schedule_path, request_id=request_id, wait=wait, dry_run=dry_run)
+    return _bo_create_build(inp.build.model_dump(exclude_none=True), inp.schedule_path,
+                            request_id=inp.request_id, wait=inp.wait, dry_run=inp.dry_run)
 
 
 @tool_gate(
@@ -695,18 +715,53 @@ def bo_create_build(build: dict, schedule_path: str) -> str:
         "Create a same-project multi-build chain in Build Orchestrator: validates the WHOLE proposed graph "
         "at once (forward references -- a later build's depends_on may name an earlier build in this same "
         "request -- are allowed, and every pre-existing entry already in schedule_path is included too) "
-        "against the authoring contract, writes every new spec file, then writes a single valid YAML "
-        "schedule document to schedule_path (an EXISTING schedule file) in one final write as the "
+        "against the authoring contract, atomically publishes every spec and a valid YAML "
+        "schedule document to schedule_path (an EXISTING schedule file) in one transaction as the "
         "activation boundary, using the same schedule-document builder as bo_create_build. Writes "
         "nothing if validation fails for any build in the chain. Always validates strict_new (compat_existing "
         "is a read-only audit mode, not selectable here)."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
-def bo_create_chain(builds: list[dict], schedule_path: str) -> str:
+def bo_create_chain(builds: list[dict], schedule_path: str, request_id: str | None = None,
+                    wait: bool = True, dry_run: bool = False) -> str:
     """Create a multi-build chain (specs + schedule entries) in one activation."""
-    inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path)
-    return _bo_create_chain([b.model_dump(exclude_none=True) for b in inp.builds], inp.schedule_path)
+    inp = BOCreateChainInput(builds=builds, schedule_path=schedule_path, request_id=request_id, wait=wait, dry_run=dry_run)
+    return _bo_create_chain([b.model_dump(exclude_none=True) for b in inp.builds], inp.schedule_path,
+                            request_id=inp.request_id, wait=inp.wait, dry_run=inp.dry_run)
+
+
+@tool_gate(
+    name="bo_authoring_job",
+    description="Read a background authoring job result. Queued/running is not activation; restart-interrupted jobs are unknown.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def bo_authoring_job(job_id: str) -> str:
+    return _bo_authoring_job(job_id)
+
+
+@tool_gate(
+    name="bo_authoring_context",
+    description="Generated authoring context under 8 KB: template versions, live registry models/reviewer classes, sections and checklist lines.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def bo_authoring_context(project: str) -> str:
+    return _bo_authoring_context(project)
+
+
+@tool_gate(
+    name="bo_author_feature",
+    description="Render strict versioned build/review/deploy formulas and atomically author a feature. Optional dry_run, request_id, wait=false. No model names in templates.",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+def bo_author_feature(feature_id: str, title: str, project: str, what_this_means: str,
+                      probes: str, scope: str, proof: str, out_of_scope: str,
+                      risk_domain: str, blast_radius: str, reversible: bool, shadowable: bool,
+                      commit_prefix: str, model_preferences: dict | None = None,
+                      schedule_path: str | None = None, request_id: str | None = None,
+                      wait: bool = True, dry_run: bool = False) -> str:
+    inp = BOAuthorFeatureInput(**locals())
+    return _bo_author_feature(**inp.model_dump())
 
 
 @tool_gate(

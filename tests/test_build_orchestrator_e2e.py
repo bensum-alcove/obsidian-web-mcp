@@ -442,3 +442,21 @@ def test_real_unknown_codex_model_fails_closed(seeded_schedule):
     assert not (
         seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-e2e-v17-badmodel.md"
     ).exists()
+
+
+@pytest.mark.parametrize("project", ["obsidian-web-mcp", "build-orchestrator"])
+def test_real_feature_formula_validates_the_full_rendered_chain(seeded_schedule, project):
+    result = json.loads(bo.bo_author_feature(
+        feature_id="scratch-real-feature", title="Real feature formula", project=project,
+        what_this_means="Author one bounded reviewed feature.", probes="Reproduce the witness.",
+        scope="Implement the change.", proof="Run focused tests and mutation checks.",
+        out_of_scope="No unrelated work.", risk_domain="control-plane", blast_radius="subsystem",
+        reversible=True, shadowable=True, commit_prefix="VAS-", dry_run=True,
+    ))
+    assert result["ok"] is True, result
+    assert len(result["rendered"]) == 3
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-feature.md").exists()
+    for rendered in result["rendered"].values():
+        metadata = frontmatter.loads(rendered["spec"]).metadata
+        assert metadata["template_version"] == "1"
+        assert len(metadata["template_hash"]) == 64

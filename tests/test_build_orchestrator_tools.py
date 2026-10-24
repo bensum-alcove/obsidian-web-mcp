@@ -320,27 +320,21 @@ def test_create_build_never_creates_a_new_schedule_file(monkeypatch, vault_dir):
     assert not (vault_dir / "Personal/Build Orchestrator/schedules/brand-new.yaml").exists()
 
 
-def test_partial_failure_leaves_schedule_unactivated_and_specs_orphaned(monkeypatch, seeded_schedule):
-    """Schedule write fails after spec write succeeds -- the spec is an orphan
-    (inert, not referenced by any schedule entry), never a half-activated graph."""
+def test_schedule_staging_failure_leaves_no_visible_specs(monkeypatch, seeded_schedule):
+    """W2: a failed schedule write leaves neither artifact visible."""
+    from obsidian_vault_mcp import authoring_transaction as tx
     monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
-
-    real_write = bo.write_file_atomic
-    call_count = {"n": 0}
-
-    def flaky_write(path, content, **kwargs):
-        call_count["n"] += 1
-        if "schedules" in path:
-            raise ValueError("simulated schedule write failure")
-        return real_write(path, content, **kwargs)
-
-    monkeypatch.setattr(bo, "write_file_atomic", flaky_write)
+    stage = tx._stage_file
+    def flaky_stage(path, data, mode):
+        if "schedules" in path.parts:
+            raise ValueError("simulated schedule staging failure")
+        return stage(path, data, mode)
+    monkeypatch.setattr(tx, "_stage_file", flaky_stage)
     result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
     assert result["ok"] is False
-    assert result["orphaned_specs"] == ["Personal/Build Orchestrator/specs/scratch-1.md"]
-    assert (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()  # orphaned but present
-    schedule_content = (seeded_schedule / "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml").read_text()
-    assert schedule_content == SCHEDULE_SEED  # schedule never activated
+    assert result["orphaned_specs"] == []
+    assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-1.md").exists()
+    assert _schedule_text(seeded_schedule) == SCHEDULE_SEED
 
 
 def test_create_chain_forward_reference_writes_all_specs_and_one_schedule_entry_each(monkeypatch, seeded_schedule):
@@ -610,12 +604,13 @@ def test_adapter_duplicate_id_mixed_project_cycle_and_review_gate_still_fail_clo
 def test_simulated_spec_write_failure_does_not_mutate_schedule(monkeypatch, seeded_schedule):
     monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
 
-    def fail_spec_write(path, content, **kwargs):
-        if "specs" in path:
-            raise OSError("simulated spec write failure")
-        raise AssertionError(f"schedule write must not be attempted after spec failure: {path}")
+    from obsidian_vault_mcp import authoring_transaction as tx
+    def fail_spec_write(path, data, mode):
+        if "specs" in path.parts:
+            raise OSError("simulated spec staging failure")
+        raise AssertionError(f"schedule stage must not be attempted after spec failure: {path}")
 
-    monkeypatch.setattr(bo, "write_file_atomic", fail_spec_write)
+    monkeypatch.setattr(tx, "_stage_file", fail_spec_write)
     result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
     assert result["ok"] is False
     assert result["activated"] is False

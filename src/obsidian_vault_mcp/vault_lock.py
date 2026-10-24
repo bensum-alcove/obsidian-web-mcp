@@ -142,6 +142,70 @@ _registry_fd_lock = threading.Lock()
 _registry_fd: int | None = None
 _registry_fd_path: Path | None = None
 
+# A transaction locks the entire existing byte-range registry, so even older
+# cooperating writers (including pending-log sync) participate without a new
+# protocol. POSIX locks do not exclude threads; this gate supplies that half.
+_transaction_gate = threading.Condition(threading.RLock())
+_transaction_owner: int | None = None
+_active_path_locks = 0
+
+
+@contextlib.contextmanager
+def _thread_gate(exclusive: bool, path, timeout: float):
+    global _transaction_owner, _active_path_locks
+    ident = threading.get_ident()
+    deadline = time.monotonic() + timeout
+    with _transaction_gate:
+        nested = _transaction_owner == ident
+        while not nested and (
+            _transaction_owner is not None or (exclusive and _active_path_locks)
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LockTimeoutError(path, timeout)
+            _transaction_gate.wait(remaining)
+        if not nested:
+            if exclusive:
+                _transaction_owner = ident
+            else:
+                _active_path_locks += 1
+    try:
+        yield nested
+    finally:
+        if not nested:
+            with _transaction_gate:
+                if exclusive:
+                    _transaction_owner = None
+                else:
+                    _active_path_locks -= 1
+                _transaction_gate.notify_all()
+
+
+@contextlib.contextmanager
+def registry_lock(timeout_seconds: float | None = None):
+    """Bounded transaction lock, compatible with every existing path_lock user."""
+    timeout = lock_timeout_seconds() if timeout_seconds is None else timeout_seconds
+    with _thread_gate(True, "authoring transaction", timeout) as nested:
+        if nested:
+            yield
+            return
+        fd = _registry_fd_handle()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, LOCK_REGISTRY_SLOTS, 0)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise LockTimeoutError("authoring transaction", timeout) from None
+                time.sleep(_POLL_INTERVAL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.lockf(fd, fcntl.LOCK_UN, LOCK_REGISTRY_SLOTS, 0)
+
 
 def _registry_fd_handle() -> int:
     """One persistent fd per process for the whole registry file's lifetime.
@@ -162,6 +226,17 @@ def _registry_fd_handle() -> int:
 
 @contextlib.contextmanager
 def path_lock(resolved_path: Path, timeout_seconds: float | None = None):
+    timeout = lock_timeout_seconds() if timeout_seconds is None else timeout_seconds
+    with _thread_gate(False, resolved_path, timeout) as nested:
+        if nested:
+            yield
+        else:
+            with _path_slot_lock(resolved_path, timeout):
+                yield
+
+
+@contextlib.contextmanager
+def _path_slot_lock(resolved_path: Path, timeout_seconds: float | None = None):
     """Acquire a process-shared byte-range lock for one resolved path's slot.
 
     Blocks up to ``timeout_seconds`` (default: ``lock_timeout_seconds()``).
