@@ -42,3 +42,36 @@ def vault_dir(tmp_path, monkeypatch):
     config.VAULT_PATH = Path(str(vault))
 
     yield vault
+
+
+@pytest.fixture(scope="session")
+def _authoring_db_template(tmp_path_factory):
+    """A new synthetic BO schema, never a copy of the live database."""
+    import subprocess
+    from obsidian_vault_mcp import bo_contract, config
+    directory = tmp_path_factory.mktemp('authoring-db-template')
+    script = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+import db
+db._DEBUG_LOG = sys.argv[2]
+db.init_db()
+'''
+    subprocess.run(
+        [config.BO_AUTHORING_CONTRACT_PYTHON, '-c', script,
+         str(Path(bo_contract.resolve_authoring_contract_path()).parent), str(directory/'debug.log')],
+        env=dict(os.environ, PYTEST_CURRENT_TEST='authoring-fixture', BO_TEST_DB_DIR=str(directory)),
+        check=True, capture_output=True, text=True,
+    )
+    return directory / 'orchestrator.db'
+
+
+@pytest.fixture
+def authoring_db(_authoring_db_template, tmp_path, monkeypatch):
+    import shutil
+    directory = tmp_path / 'bo-db'
+    directory.mkdir()
+    target = directory / 'orchestrator.db'
+    shutil.copyfile(_authoring_db_template, target)
+    monkeypatch.setenv('BO_TEST_DB_DIR', str(directory))
+    return target

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures('authoring_db')
+
 from obsidian_vault_mcp import bo_contract, config
 from obsidian_vault_mcp.models import (
     BOActivateExistingSpecInput,

@@ -29,7 +29,7 @@ from pathlib import Path
 import frontmatter
 import yaml
 
-from .. import bo_contract, authoring_jobs, authoring_transaction, vault_lock
+from .. import bo_contract, bo_guard, authoring_jobs, authoring_transaction, vault_lock
 from ..bo_guard import SPECS_PREFIX, schedule_builds_from_content
 from ..frontmatter_safe import update_frontmatter_field
 from ..vault import RevisionConflictError, conflict_payload, read_file, write_file_atomic
@@ -676,11 +676,12 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     """
     try:
         for attempt in range(3):
-            inputs = authoring_transaction.capture_inputs()
+            inputs = authoring_transaction.capture_inputs(builds=builds, schedule_path=schedule_path)
             # Adapter sources are mutable read dependencies too. Do not reuse
             # path-only syntax/field caches across a fresh preparation pass.
             bo_contract._authoring_fields_cache = None
             bo_contract._schedule_parser_module = None
+            bo_guard._freely_mutable_statuses_cache = None
             try:
                 return _activate_locked(builds, schedule_path, tool_name,
                                         write_new_specs=write_new_specs,

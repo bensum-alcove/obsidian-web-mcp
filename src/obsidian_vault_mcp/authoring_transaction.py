@@ -10,6 +10,7 @@ trust boundary; a manifest check detects changes observed before exchange.
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import errno
 import hashlib
 import json
@@ -21,6 +22,8 @@ import stat
 import tempfile
 import subprocess
 from typing import Callable
+
+import frontmatter
 
 from . import bo_contract, bo_guard, config, mutation_ledger, vault_lock
 from . import vault
@@ -103,24 +106,26 @@ class PreparationChanged(ValueError):
     """A read dependency changed; discard the entire preparation and retry."""
 
 
-def _guard_inputs() -> str:
+def _guard_inputs(build_ids=(), schedule_paths=()) -> str:
     """Fingerprint mutable adapter inputs without reading credential values.
 
     The adapter owns path resolution. Its read-only imports report only a
-    digest of filesystem identities, never configuration/DB contents. DB,
-    WAL and rollback-journal changes invalidate approval conservatively.
-    Source, registry, project config and repository refs/config are included.
+    digest, never configuration/DB contents. Only non-secret task columns
+    consumed by the adapter's graph/rewrite checks are selected, for graph
+    identities and rows bound to the affected schedules. Heartbeats, events
+    and unrelated tasks cannot invalidate approval. Source, registry,
+    project config and repository config remain bound; refs are not read by
+    authoring validation and are deliberately excluded.
     This is deliberately not a cached DB approval or a new locking protocol.
     """
     directory = str(Path(bo_contract.resolve_authoring_contract_path()).resolve().parent)
     script = r"""
-import sys,os,json,hashlib,subprocess
+import sys,os,json,hashlib,subprocess,sqlite3
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
 import db,model_registry,project_resolve
 root=Path(sys.argv[1]); paths=set(root.rglob('*.py'))
 paths.update([root/'config.yaml',model_registry.registry_path(),model_registry._state_path(),model_registry.DEFAULT_PATH])
-paths.update(Path(str(db.DB_PATH)+suffix) for suffix in ('','-wal','-journal'))
 for project in (project_resolve.load_config().get('projects') or {}).values():
  repo=project.get('repo_dir')
  if not repo: continue
@@ -128,18 +133,26 @@ for project in (project_resolve.load_config().get('projects') or {}).values():
   p=subprocess.run(['git','-C',repo,'rev-parse',option],capture_output=True,text=True,timeout=2)
   if p.returncode: continue
   git=Path(p.stdout.strip());git=git if git.is_absolute() else Path(repo)/git
-  paths.update(git/name for name in ('HEAD','config','packed-refs','commondir'))
-  paths.update((git/'refs').rglob('*'))
+  paths.update(git/name for name in ('config','commondir'))
 records=[]
 for path in sorted(paths):
  try:
   st=path.stat(); value=(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns,st.st_mode)
  except FileNotFoundError:value=None
  records.append((str(path),value))
-print(hashlib.sha256(json.dumps(records).encode()).hexdigest())
+scope=json.loads(sys.argv[2]); ids=scope['ids']; schedules=scope['schedules']
+# These are authority facts, not operational metadata or credential columns.
+# Keep the adapter's validation semantics authoritative: a changed fact only
+# discards preparation; it never grants permission or filters a refusal.
+columns='id,status,source_schedule,spec_hash,schedule_hash,completion_contract_hash,cc_project,goal_id'
+with sqlite3.connect(Path(db.DB_PATH).resolve().as_uri()+'?mode=ro',uri=True) as conn:
+ conn.execute('PRAGMA query_only=ON')
+ rows=conn.execute('SELECT '+columns+' FROM tasks WHERE id IN ('+','.join('?' for _ in ids)+') OR source_schedule IN ('+','.join('?' for _ in schedules)+') ORDER BY id',ids+schedules).fetchall()
+print(hashlib.sha256(json.dumps([records,rows]).encode()).hexdigest())
 """
     response = subprocess.run(
-        [config.BO_AUTHORING_CONTRACT_PYTHON, '-c', script, directory],
+        [config.BO_AUTHORING_CONTRACT_PYTHON, '-c', script, directory,
+         json.dumps({'ids': sorted(build_ids), 'schedules': sorted(schedule_paths)})],
         capture_output=True, text=True, timeout=config.BO_AUTHORING_CONTRACT_TIMEOUT_SECONDS,
         env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
     )
@@ -149,26 +162,65 @@ print(hashlib.sha256(json.dumps(records).encode()).hexdigest())
     return digest
 
 
-def capture_inputs():
+@dataclass(frozen=True)
+class InputBinding:
+    builds: tuple
+    schedule_path: str | None
+    signature: tuple
+
+    def current(self):
+        return capture_inputs(builds=self.builds, schedule_path=self.schedule_path)
+
+
+def capture_inputs(*, builds=(), schedule_path=None):
     """Exact authority bytes + mutable guard state for one preparation pass.
 
     Logs and unrelated notes are not authority. They may change freely during
     preparation and are incorporated into the fresh snapshot under the lock.
     The final namespace manifest separately protects every staged hardlink.
     """
+    proposed_builds = tuple(builds)
     root = config.VAULT_PATH.resolve()
     namespace = root / NAMESPACE
     paths = {root / '_schema_rules.json'}
+    proposed_ids = {b['build_id'] for b in proposed_builds
+                    if isinstance(b, dict) and isinstance(b.get('build_id'), str)}
+    guard_ids = set(proposed_ids)
+    guard_schedules = {schedule_path} if schedule_path else set()
+    graph_entries = list(proposed_builds)
     for name in ('specs', 'schedules', 'templates', 'rules'):
         folder = namespace / name
         paths.add(folder)
         paths.update(folder.rglob('*'))
     # Noncanonical historical spec paths remain read dependencies too.
-    for schedule in (namespace / 'schedules').glob('*.yaml'):
-        builds = bo_guard.schedule_builds_from_content(schedule.read_text(), source_name=str(schedule))
-        for entry in builds or []:
+    for schedule in (namespace / 'schedules').rglob('*'):
+        if not schedule.is_file():
+            continue
+        entries = bo_guard.schedule_builds_from_content(schedule.read_text(), source_name=str(schedule)) or []
+        relative = str(schedule.relative_to(root))
+        relevant = relative == schedule_path or any(
+            isinstance(entry, dict) and entry.get('id') in proposed_ids for entry in entries)
+        if relevant:
+            guard_schedules.add(relative)
+            graph_entries.extend(entries)
+        for entry in entries:
             if isinstance(entry, dict) and isinstance(entry.get('spec_path'), str):
-                paths.add(vault.resolve_vault_path(entry['spec_path']))
+                spec = vault.resolve_vault_path(entry['spec_path'])
+                paths.add(spec)
+                if relevant and spec.is_file():
+                    graph_entries.append(frontmatter.loads(spec.read_text()).metadata)
+    for entry in graph_entries:
+        if not isinstance(entry, dict):
+            continue
+        for key in ('id', 'build_id', 'goal_root_build_id'):
+            if isinstance(entry.get(key), str):
+                guard_ids.add(entry[key])
+        for key in ('depends_on', 'sequence_after'):
+            value = entry.get(key) or []
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str):
+                        guard_ids.update((item, item.strip()))
     digest = hashlib.sha256()
     for path in sorted(paths):
         digest.update(str(path).encode())
@@ -182,12 +234,13 @@ def capture_inputs():
         except FileNotFoundError:
             digest.update(b'absent')
     from . import write_contract
-    return (digest.hexdigest(), _guard_inputs(),
+    signature = (digest.hexdigest(), _guard_inputs(guard_ids, guard_schedules),
             bo_contract.resolve_authoring_contract_path(), config.BO_AUTHORING_CONTRACT_PYTHON,
             os.environ.get('BO_VAULT_ROOT'), bo_guard.get_mode(),
             vault._write_contract_mode(), config.MAX_CONTENT_SIZE,
             tuple(write_contract._CONTENT_REGISTRY.items()),
             frozenset(write_contract._ENFORCED_RULES))
+    return InputBinding(proposed_builds, schedule_path, signature)
 
 
 def refresh(files: dict[str, str]) -> list[str]:
@@ -245,12 +298,12 @@ def commit(files: dict[str, str], *, schedule_path: str, expected_revision: str,
                 vault._enforce_write_contract(ctx)
             if bo_guard.get_mode() != "off":
                 bo_guard.enforce(ctx)
-    if capture_inputs() != inputs:
+    if inputs.current() != inputs:
         raise PreparationChanged('authoring inputs changed during preparation')
     if dry_run:
         return []
     with vault_lock.registry_lock():
-        if capture_inputs() != inputs:
+        if inputs.current() != inputs:
             raise PreparationChanged('authoring inputs changed before staging')
         return _publish(root, files, originals, tool, result, receipt, inputs)
 
@@ -280,7 +333,7 @@ def _publish(root, files, originals, tool, result, receipt, inputs):
             _sync_dir(Path(directory))
         _sync_dir(root.parent)
         _sync_dir(stage.parent)
-        if capture_inputs() != inputs:
+        if inputs.current() != inputs:
             raise PreparationChanged('authoring inputs changed during staging')
         if _manifest(root) != baseline:
             raise ValueError("authoring namespace changed during staging; refusing stale snapshot")

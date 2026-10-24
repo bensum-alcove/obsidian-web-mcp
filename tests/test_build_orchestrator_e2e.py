@@ -25,9 +25,9 @@ def _adapter_present() -> bool:
 
 
 _ADAPTER_PRESENT = _adapter_present()
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.usefixtures('authoring_db'), pytest.mark.skipif(
     not _ADAPTER_PRESENT, reason="build-orchestrator authoring_contract.py not present on this host"
-)
+)]
 
 SCHEDULE_PATH = "Personal/Build Orchestrator/schedules/2026-W99-scratch.yaml"
 SCHEDULE_SEED = (

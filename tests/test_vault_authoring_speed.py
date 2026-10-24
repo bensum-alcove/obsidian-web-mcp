@@ -13,6 +13,8 @@ import frontmatter
 import pytest
 import yaml
 
+pytestmark = pytest.mark.usefixtures('authoring_db')
+
 from obsidian_vault_mcp import bo_contract, bo_guard, config, vault_lock
 from obsidian_vault_mcp.tools import build_orchestrator as bo
 from tests.test_build_orchestrator_tools import _build, _fake_render_graph, _ok_validate_graph
@@ -606,14 +608,15 @@ def test_formula_caller_policy_heading_never_deletes_sections(scratch, monkeypat
 
 
 @pytest.mark.parametrize('change', ['schedule','spec','guard','db','registry'])
-def test_preparation_input_change_cannot_authorize_stale_commit(scratch, monkeypatch, change):
+def test_preparation_input_change_cannot_authorize_stale_commit(scratch, monkeypatch, change, authoring_db):
     tx = module('authoring_transaction')
     original = bo._prepare_graph
     spec = scratch / 'Personal/Build Orchestrator/specs/context.md'
     spec.parent.mkdir(parents=True); spec.write_text('original context')
     schema = scratch / '_schema_rules.json';schema.write_text('{}')
-    db_path = scratch / 'db/orchestrator.db'; db_path.parent.mkdir(); db_path.write_bytes(b'synthetic metadata fixture')
-    monkeypatch.setenv('BO_TEST_DB_DIR', str(db_path.parent))
+    import sqlite3
+    with sqlite3.connect(authoring_db) as conn:
+        conn.execute("INSERT INTO tasks(id,title,status,source_schedule) VALUES('stale-approval','Synthetic','ready',?)", (S,))
     registry = scratch / 'registry.yaml'; registry.write_text('synthetic metadata fixture')
     monkeypatch.setenv('BO_MODEL_REGISTRY_PATH', str(registry))
     calls = 0
@@ -622,8 +625,12 @@ def test_preparation_input_change_cannot_authorize_stale_commit(scratch, monkeyp
         calls += 1
         result = original(*args, **kwargs)
         if calls == 1:
-            target = {'schedule': scratch/S, 'spec': spec, 'guard': schema, 'db': db_path, 'registry': registry}[change]
-            target.write_text(target.read_text()+'\n')
+            if change == 'db':
+                with sqlite3.connect(authoring_db) as conn:
+                    conn.execute("UPDATE tasks SET status='running' WHERE id='stale-approval'")
+            else:
+                target = {'schedule': scratch/S, 'spec': spec, 'guard': schema, 'registry': registry}[change]
+                target.write_text(target.read_text()+'\n')
         else:
             result['ok'] = False
             result['errors'] = [{'code':'changed_input_refused'}]
@@ -748,3 +755,135 @@ def test_formula_checks_required_sections_after_policy_replacement(scratch, monk
     assert not r['ok'], r
     assert 'required sections' in r['error']
     assert data_files(scratch) == before
+
+
+@pytest.fixture
+def real_authoring(tmp_path, monkeypatch, authoring_db):
+    """Real adapter and enforce guard, with a fresh synthetic database."""
+    root = tmp_path / 'real-vault'
+    (root/S).parent.mkdir(parents=True)
+    (root/S).write_text(SEED)
+    monkeypatch.setattr(config, 'VAULT_PATH', root)
+    monkeypatch.setenv('BO_VAULT_ROOT', str(root))
+    monkeypatch.setenv('BO_PATH_GUARD_MODE', 'enforce')
+    monkeypatch.setenv('VAULT_WRITE_CONTRACT_MODE', 'off')
+    monkeypatch.setenv('VAULT_MUTATION_LOCK_DIR', str(tmp_path/'real-locks'))
+    monkeypatch.setenv('VAULT_MUTATION_LEDGER_MODE', 'off')
+    monkeypatch.setattr(bo_guard, '_freely_mutable_statuses_cache', None)
+    return root, authoring_db
+
+
+def _real_build(bid, **kwargs):
+    return _build(bid, deployment_intent='deferred', **kwargs)
+
+
+@pytest.mark.parametrize('phase', ['preparation', 'staging'])
+def test_unrelated_database_and_ref_churn_still_commits(real_authoring, monkeypatch, phase):
+    """Unrelated rows and operational columns cannot discard valid work."""
+    import sqlite3
+    root, database = real_authoring
+    assert json.loads(bo.bo_create_build(_real_build('context'), S))['ok']
+    with sqlite3.connect(database) as conn:
+        conn.execute("INSERT INTO tasks(id,title,status,source_schedule) VALUES('unrelated','Synthetic','running','other.yaml')")
+        conn.execute("INSERT INTO tasks(id,title,status,source_schedule) VALUES('context','Synthetic','ready',?)", (S,))
+    import shutil
+    adapter = Path(bo_contract.resolve_authoring_contract_path()).parent
+    scratch_adapter = root.parent/'adapter'
+    scratch_adapter.mkdir()
+    for source in adapter.rglob('*.py'):
+        if any(part in ('.git', '.venv', '__pycache__', 'tests') for part in source.relative_to(adapter).parts):
+            continue
+        target = scratch_adapter/source.relative_to(adapter)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    repo = root.parent/'repo'
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    (scratch_adapter/'config.yaml').write_text(yaml.safe_dump({'projects': {'edge-trading-system': {'repo_dir': str(repo)}}}))
+    monkeypatch.setattr(config, 'BO_AUTHORING_CONTRACT_PATH', str(scratch_adapter/'authoring_contract.py'))
+    tx = module('authoring_transaction')
+    hook = bo._prepare_graph if phase == 'preparation' else tx._stage_file
+    calls = 0
+    def churn(*args, **kwargs):
+        nonlocal calls
+        result = hook(*args, **kwargs)
+        if phase == 'staging' and Path(args[0]).suffix != '.md':
+            return result
+        calls += 1
+        with sqlite3.connect(database) as conn:
+            conn.execute("UPDATE tasks SET title=? WHERE id IN ('unrelated','context')", (f'heartbeat {calls}',))
+        refs = repo/'.git/refs/heads'
+        (refs/'unrelated').write_text(f'{calls:040x}\n')
+        (repo/'.git/packed-refs').write_text(f'{calls:040x} refs/heads/fetched\n')
+        return result
+    monkeypatch.setattr(bo if phase == 'preparation' else tx,
+                        '_prepare_graph' if phase == 'preparation' else '_stage_file', churn)
+    result = json.loads(bo.bo_create_build(_real_build('churn-safe'), S, request_id='churn-safe'))
+    assert result['ok'], result
+    assert (root/'Personal/Build Orchestrator/specs/churn-safe.md').is_file()
+    assert len(list((root/'Personal/Build Orchestrator/.authoring-receipts').glob('*.json'))) == 1
+    if phase == 'preparation':
+        assert calls == 1
+
+
+@pytest.mark.parametrize('phase', ['preparation', 'staging'])
+@pytest.mark.parametrize('change', ['touched-status', 'bound-status', 'orphan-binding', 'external-root'])
+def test_relevant_guard_fact_change_revalidates_before_publication(real_authoring, monkeypatch, phase, change):
+    import sqlite3
+    root, database = real_authoring
+    build = _real_build('guard-race')
+    if change == 'bound-status':
+        assert json.loads(bo.bo_create_build(_real_build('bound'), S))['ok']
+        with sqlite3.connect(database) as conn:
+            conn.execute("INSERT INTO tasks(id,title,status,source_schedule,spec_hash) VALUES('bound','Synthetic','ready',?,'wrong-baseline')", (S,))
+    if change == 'external-root':
+        build.update(goal_id='synthetic-goal', goal_root_build_id='external-root', goal_completion=False)
+        with sqlite3.connect(database) as conn:
+            conn.execute("INSERT INTO tasks(id,title,status,cc_project,goal_id) VALUES('external-root','Synthetic','ready','edge-trading-system','synthetic-goal')")
+    initial = json.loads(bo.bo_validate_build_graph([build], S))
+    assert initial['ok'], initial
+    tx = module('authoring_transaction')
+    before = data_files(root / 'Personal/Build Orchestrator')
+    prepare = bo._prepare_graph
+    attempts = 0
+    def counted_prepare(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return prepare(*args, **kwargs)
+    monkeypatch.setattr(bo, '_prepare_graph', counted_prepare)
+    hook = bo._prepare_graph if phase == 'preparation' else tx._stage_file
+    changed = False
+    def mutate(*args, **kwargs):
+        nonlocal changed
+        result = hook(*args, **kwargs)
+        if phase == 'staging' and Path(args[0]).suffix != '.md':
+            return result
+        if not changed:
+            changed = True
+            with sqlite3.connect(database) as conn:
+                if change == 'touched-status':
+                    conn.execute("INSERT INTO tasks(id,title,status,source_schedule) VALUES('guard-race','Synthetic','running',?)", (S,))
+                elif change == 'bound-status':
+                    conn.execute("UPDATE tasks SET status='running' WHERE id='bound'")
+                elif change == 'orphan-binding':
+                    conn.execute("INSERT INTO tasks(id,title,status,source_schedule) VALUES('orphan','Synthetic','running',?)", (S,))
+                else:
+                    conn.execute("UPDATE tasks SET cc_project='obsidian-web-mcp' WHERE id='external-root'")
+        return result
+    monkeypatch.setattr(bo if phase == 'preparation' else tx,
+                        '_prepare_graph' if phase == 'preparation' else '_stage_file', mutate)
+    result = json.loads(bo.bo_create_build(build, S, request_id='guard-race'))
+    assert changed, result
+    if change == 'bound-status':
+        # The base contract permits a pure append beside an unchanged frozen
+        # sibling. Its status change must rerun preparation, not become a new
+        # blanket refusal (the earlier MEDIUM-1 regression).
+        assert attempts >= 2
+        assert result['ok'], result
+        assert len(specs(root)) == 2
+        assert len(list((root/'Personal/Build Orchestrator/.authoring-receipts').glob('*.json'))) == 1
+        return
+    assert not result['ok'], result
+    assert data_files(root / 'Personal/Build Orchestrator') == before
+    expected = {'touched-status': "has status 'running'" if phase == 'preparation' else 'frozen_contract_mutation',
+                'orphan-binding': 'schedule_binding_orphaned', 'external-root': 'goal_project_mismatch'}[change]
+    assert expected in json.dumps(result), result
