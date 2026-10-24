@@ -32,7 +32,7 @@ import yaml
 from .. import bo_contract, bo_guard, authoring_jobs, authoring_transaction, vault_lock
 from ..bo_guard import SPECS_PREFIX, schedule_builds_from_content
 from ..frontmatter_safe import update_frontmatter_field
-from ..vault import RevisionConflictError, conflict_payload, read_file, write_file_atomic
+from ..vault import RevisionConflictError, conflict_payload, compute_revision, read_file, write_file_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +442,13 @@ def _build_from_existing_spec(build_id: str, spec_markdown: str, spec_path: str)
     return build
 
 
+def _read_schedule_file(schedule_path):
+    raw = bo_guard.schedule_raw_bytes(schedule_path)
+    if raw is None:
+        return read_file(schedule_path)
+    return raw.decode('utf-8'), {"revision": compute_revision(raw)}
+
+
 def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[list[dict], str | None]:
     """Load every entry already in schedule_path's builds: list (excluding
     ids the caller is about to (re)supply) as additional graph nodes, each
@@ -457,7 +464,7 @@ def _existing_schedule_nodes(schedule_path: str, new_build_ids: set) -> tuple[li
     treated as an empty graph.
     """
     try:
-        content, _ = read_file(schedule_path)
+        content, _ = _read_schedule_file(schedule_path)
     except FileNotFoundError:
         return [], None
 
@@ -627,6 +634,7 @@ def _prepare_graph(builds: list[dict], schedule_path: str, mode: str,
     }
 
 
+@bo_contract.authoring_read_call
 def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = "strict_new") -> str:
     """Read-only preflight: validate a proposed build graph. Never writes anything."""
     try:
@@ -658,6 +666,7 @@ def bo_validate_build_graph(builds: list[dict], schedule_path: str, mode: str = 
     })
 
 
+@bo_contract.authoring_read_call
 def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
               write_new_specs: bool = True,
               spec_markdown_overrides: dict[str, str] | None = None,
@@ -676,18 +685,20 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     """
     try:
         for attempt in range(3):
-            inputs = authoring_transaction.capture_inputs(builds=builds, schedule_path=schedule_path)
             # Adapter sources are mutable read dependencies too. Do not reuse
             # path-only syntax/field caches across a fresh preparation pass.
             bo_contract._authoring_fields_cache = None
             bo_contract._schedule_parser_module = None
             bo_guard._freely_mutable_statuses_cache = None
+            bo_contract.reset_authoring_documents()
             try:
-                return _activate_locked(builds, schedule_path, tool_name,
-                                        write_new_specs=write_new_specs,
-                                        spec_markdown_overrides=spec_markdown_overrides,
-                                        dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
-                                        create_schedule=create_schedule, inputs=inputs)
+                with bo_guard.schedule_scan():
+                    inputs = authoring_transaction.capture_inputs(builds=builds, schedule_path=schedule_path)
+                    return _activate_locked(builds, schedule_path, tool_name,
+                                            write_new_specs=write_new_specs,
+                                            spec_markdown_overrides=spec_markdown_overrides,
+                                            dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
+                                            create_schedule=create_schedule, inputs=inputs)
             except authoring_transaction.PreparationChanged:
                 if attempt == 2:
                     raise
@@ -739,6 +750,9 @@ def _activate_locked(builds, schedule_path, tool_name, *, write_new_specs=True,
             })
 
     try:
+        # Retain the target's fresh optimistic revision check. A concurrent
+        # publisher must trigger the existing preparation retry, rather than
+        # turn a cached target revision into an earlier conflict refusal.
         schedule_content, schedule_meta = read_file(schedule_path)
     except FileNotFoundError:
         if create_schedule:
@@ -860,6 +874,7 @@ def bo_authoring_job(job_id: str) -> str:
     return authoring_jobs.bo_authoring_job(job_id)
 
 
+@bo_contract.authoring_read_call
 def bo_activate_existing_spec(build_id: str, schedule_path: str, spec_path: str | None = None) -> str:
     """Activate one already-written inert spec onto an existing schedule.
 
@@ -912,6 +927,7 @@ def bo_author_feature(feature_id: str, title: str, project: str, what_this_means
     feature = copy.deepcopy({k:v for k,v in locals().items() if k not in {"authoring_templates", "request_id", "wait"}})
     schedule_path = schedule_path or f"Personal/Build Orchestrator/schedules/{feature_id}.yaml"
 
+    @bo_contract.authoring_read_call
     def operation(receipt):
         try:
             builds, provenance, warnings = authoring_templates.feature_graph(feature, dry_run=dry_run)

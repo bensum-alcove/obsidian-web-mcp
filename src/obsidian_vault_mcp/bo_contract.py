@@ -21,6 +21,7 @@ import contextvars
 import copy
 import configparser
 import glob
+import functools
 import importlib.util
 import json
 import logging
@@ -34,6 +35,40 @@ from . import config
 logger = logging.getLogger(__name__)
 
 _validation_cache = contextvars.ContextVar("bo_validation_cache", default=None)
+_authoring_reads = contextvars.ContextVar("bo_authoring_reads", default=None)
+
+
+@contextlib.contextmanager
+def authoring_reads():
+    """Share syntax and resolution work within a call, never between calls.
+
+    Documents are keyed by their exact bytes and source name. Publication
+    checks still read current bytes; equal timestamps cannot reuse approval.
+    Nested helpers join the caller's scope, including background job workers.
+    """
+    if _authoring_reads.get() is not None:
+        yield
+        return
+    token = _authoring_reads.set({"documents": {}})
+    try:
+        yield
+    finally:
+        _authoring_reads.reset(token)
+
+
+def authoring_read_call(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with authoring_reads():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def reset_authoring_documents():
+    """A retried preparation must reload syntax after mutable adapter changes."""
+    reads = _authoring_reads.get()
+    if reads is not None:
+        reads["documents"].clear()
 
 
 @contextlib.contextmanager
@@ -181,11 +216,18 @@ def resolve_authoring_contract_path() -> str:
     so this adapter cannot lag a BO deploy the way a hard-coded or vendored
     path could -- see vault-mcp-bo-adapter-live-contract-2026-09-28.
     """
+    reads = _authoring_reads.get()
+    if reads is not None and "contract_path" in reads:
+        return reads["contract_path"]
     override = config.BO_AUTHORING_CONTRACT_PATH
     if override:
-        return override
-    directory = _resolve_live_orchestrator_directory()
-    return os.path.join(directory, "authoring_contract.py")
+        path = override
+    else:
+        directory = _resolve_live_orchestrator_directory()
+        path = os.path.join(directory, "authoring_contract.py")
+    if reads is not None:
+        reads["contract_path"] = path
+    return path
 
 
 def _invoke(payload: dict, timeout: float | None = None) -> dict:
@@ -308,8 +350,24 @@ def parse_schedule_document(content: str, source_name: str = "<string>") -> dict
     unavailable" (fail closed, systemic) from "this one document is
     malformed" (per-content, handled locally) by catching these separately.
     """
+    reads = _authoring_reads.get()
+    documents = reads["documents"] if reads is not None else None
+    key = (source_name, content)
+    if documents is not None and key in documents:
+        result, error = documents[key]
+        if error is not None:
+            raise ValueError(*error)
+        return copy.deepcopy(result)
     module = _schedule_parser()
-    return module.parse_schedule_document(content, source_name=source_name)
+    try:
+        result = module.parse_schedule_document(content, source_name=source_name)
+    except ValueError as exc:
+        if documents is not None:
+            documents[key] = (None, exc.args)
+        raise
+    if documents is not None:
+        documents[key] = (copy.deepcopy(result), None)
+    return result
 
 
 def check_version(timeout: float | None = None) -> dict:

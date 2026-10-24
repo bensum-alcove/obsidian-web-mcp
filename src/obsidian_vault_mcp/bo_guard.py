@@ -290,6 +290,77 @@ class BOGuardError(ValueError):
 SPECS_PREFIX = "Personal/Build Orchestrator/specs/"
 SCHEDULES_PREFIX = "Personal/Build Orchestrator/schedules/"
 _staged_specs = contextvars.ContextVar("bo_staged_specs", default={})
+_schedule_scan = contextvars.ContextVar("bo_schedule_scan", default=None)
+
+
+class ScheduleScan:
+    """One read/parse per schedule version in an authoring preparation.
+
+    References retain the discovery pass's order and malformed-file policy.
+    This object never survives the call. A publication recheck replaces its
+    disk view; the parser can reuse only documents with identical content.
+    """
+
+    def __init__(self):
+        self.documents = {}
+        self.raw_documents = {}
+        self.references = None
+
+    def document(self, path, reader=None):
+        if path not in self.documents:
+            content = reader() if reader is not None else _read_vault_text(path)
+            if isinstance(content, bytes):
+                self.raw_documents[path] = content
+                content = content.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n')
+            builds = (schedule_builds_from_content(content, source_name=path)
+                      if content is not None else None)
+            self.documents[path] = (content, builds)
+        return self.documents[path]
+
+    def referencing(self, build_id):
+        if self.references is None:
+            references = {}
+            for path in _files_under(SCHEDULES_PREFIX):
+                _, builds = self.document(path)
+                seen = set()
+                for entry in builds or []:
+                    if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                        bid = entry["id"]
+                        if bid not in seen:
+                            references.setdefault(bid, []).append(path)
+                            seen.add(bid)
+            self.references = references
+        return list(self.references.get(build_id, []))
+
+
+@contextlib.contextmanager
+def schedule_scan():
+    if _schedule_scan.get() is not None:
+        yield
+        return
+    token = _schedule_scan.set(ScheduleScan())
+    try:
+        yield
+    finally:
+        _schedule_scan.reset(token)
+
+
+def schedule_document(path, reader=None):
+    scan = _schedule_scan.get()
+    if scan is None:
+        scan = ScheduleScan()
+    return scan.document(path, reader)
+
+
+def schedule_raw_bytes(path):
+    scan = _schedule_scan.get()
+    return scan.raw_documents.get(path) if scan is not None else None
+
+
+def refresh_schedule_scan():
+    """Discard disk reads before byte-based publication revalidation."""
+    if _schedule_scan.get() is not None:
+        _schedule_scan.set(ScheduleScan())
 
 
 @contextlib.contextmanager
@@ -833,6 +904,9 @@ def _disk_schedules_referencing(build_id: str) -> list[str]:
     from _revalidate_schedule_with_proposed_spec's fail-closed handling of a
     schedule ALREADY known (from the DB or this scan) to reference it.
     """
+    scan = _schedule_scan.get()
+    if scan is not None:
+        return scan.referencing(build_id)
     matches: list[str] = []
     for schedule_path in _files_under(SCHEDULES_PREFIX):
         content = _read_vault_text(schedule_path)
@@ -863,7 +937,10 @@ def _revalidate_schedule_with_proposed_spec(
     (despite being a known binding) does not actually list build_id in its
     builds:.
     """
-    schedule_content = _read_vault_text(schedule_path)
+    try:
+        schedule_content, builds = schedule_document(schedule_path)
+    except bo_contract.BOContractError as e:
+        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     if schedule_content is None:
         return [ValidationIssue(
             "bo-guard-spec-rewrite-graph", "reject",
@@ -871,10 +948,6 @@ def _revalidate_schedule_with_proposed_spec(
             "unreadable -- failing closed rather than skipping graph revalidation",
         )]
 
-    try:
-        builds = schedule_builds_from_content(schedule_content, source_name=schedule_path)
-    except bo_contract.BOContractError as e:
-        return [ValidationIssue("bo-guard-adapter-unavailable", "reject", str(e))]
     if builds is None:
         return [ValidationIssue(
             "bo-guard-spec-rewrite-graph", "reject",
@@ -1145,6 +1218,8 @@ def _inbound_move_issues(ctx: PathMutationContext) -> list[ValidationIssue]:
     return issues
 
 
+@bo_contract.authoring_read_call
+@schedule_scan()
 def evaluate_content(ctx: WriteContext) -> BOGateResult:
     mode = get_mode()
     if mode == "off" or not _is_bo_path(ctx.path):
@@ -1160,6 +1235,8 @@ def evaluate_content(ctx: WriteContext) -> BOGateResult:
     return BOGateResult(mode=mode, issues=issues)
 
 
+@bo_contract.authoring_read_call
+@schedule_scan()
 def evaluate_path_mutation(ctx: PathMutationContext) -> BOGateResult:
     mode = get_mode()
     if mode == "off":

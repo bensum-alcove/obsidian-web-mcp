@@ -179,6 +179,7 @@ def capture_inputs(*, builds=(), schedule_path=None):
     preparation and are incorporated into the fresh snapshot under the lock.
     The final namespace manifest separately protects every staged hardlink.
     """
+    bo_guard.refresh_schedule_scan()
     proposed_builds = tuple(builds)
     root = config.VAULT_PATH.resolve()
     namespace = root / NAMESPACE
@@ -188,6 +189,7 @@ def capture_inputs(*, builds=(), schedule_path=None):
     guard_ids = set(proposed_ids)
     guard_schedules = {schedule_path} if schedule_path else set()
     graph_entries = list(proposed_builds)
+    schedule_bytes = {}
     for name in ('specs', 'schedules', 'templates', 'rules'):
         folder = namespace / name
         paths.add(folder)
@@ -196,8 +198,15 @@ def capture_inputs(*, builds=(), schedule_path=None):
     for schedule in (namespace / 'schedules').rglob('*'):
         if not schedule.is_file():
             continue
-        entries = bo_guard.schedule_builds_from_content(schedule.read_text(), source_name=str(schedule)) or []
         relative = str(schedule.relative_to(root))
+        def read_schedule():
+            raw = schedule.read_bytes()
+            schedule_bytes[schedule] = raw
+            # The index parses text but keeps these same bytes for both the
+            # optimistic schedule revision and the approval fingerprint.
+            return raw
+        _, entries = bo_guard.schedule_document(relative, reader=read_schedule)
+        entries = entries or []
         relevant = relative == schedule_path or any(
             isinstance(entry, dict) and entry.get('id') in proposed_ids for entry in entries)
         if relevant:
@@ -230,7 +239,7 @@ def capture_inputs(*, builds=(), schedule_path=None):
                 raise ValueError('authoring input contains a symlink')
             digest.update(str((info.st_ino, info.st_mode)).encode())
             if path.is_file():
-                digest.update(path.read_bytes())
+                digest.update(schedule_bytes[path] if path in schedule_bytes else path.read_bytes())
         except FileNotFoundError:
             digest.update(b'absent')
     from . import write_contract
