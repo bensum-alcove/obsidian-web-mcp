@@ -605,10 +605,15 @@ def test_simulated_spec_write_failure_does_not_mutate_schedule(monkeypatch, seed
     monkeypatch.setattr(bo_contract, "validate_graph", _ok_validate_graph)
 
     from obsidian_vault_mcp import authoring_transaction as tx
+    stage = tx._stage_file
     def fail_spec_write(path, data, mode):
         if "specs" in path.parts:
             raise OSError("simulated spec staging failure")
-        raise AssertionError(f"schedule stage must not be attempted after spec failure: {path}")
+        if "schedules" in path.parts:
+            raise AssertionError(f"schedule stage must not be attempted after spec failure: {path}")
+        # Durable job metadata precedes artifact staging and uses the same
+        # low-level writer. Inject the failure only at the spec boundary.
+        return stage(path, data, mode)
 
     monkeypatch.setattr(tx, "_stage_file", fail_spec_write)
     result = json.loads(bo.bo_create_build(_build(), SCHEDULE_PATH))
