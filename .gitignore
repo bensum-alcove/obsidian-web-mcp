@@ -15,3 +15,6 @@ uv.lock
 /evals/history-v3-holdout/*.json
 /evals/history-v3-holdout-2/*.json
 /evals/history-v3-holdout-3/*.json
+
+# Generated Graphify analysis caches; preserve report artifacts for the apply plan.
+/graphify-out/cache/
