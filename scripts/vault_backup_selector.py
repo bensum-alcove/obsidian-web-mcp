@@ -64,11 +64,16 @@ class GenerationCheck:
         return asdict(self)
 
 
-def check_generation(repo_path: Path, commit: str) -> GenerationCheck:
+def _list_md_files(repo_path: Path, commit: str) -> list[str]:
+    names = _git(["ls-tree", "-r", "--name-only", commit], repo_path).splitlines()
+    return [n for n in names if n.endswith(".md")]
+
+
+def check_generation(repo_path: Path, commit: str, md_files: list[str] | None = None) -> GenerationCheck:
     """Integrity-check every .md file's frontmatter at one commit, read-only
     (via `git show`, never a checkout)."""
-    names = _git(["ls-tree", "-r", "--name-only", commit], repo_path).splitlines()
-    md_files = [n for n in names if n.endswith(".md")]
+    if md_files is None:
+        md_files = _list_md_files(repo_path, commit)
 
     errors = []
     for rel in md_files:
@@ -87,18 +92,42 @@ def check_generation(repo_path: Path, commit: str) -> GenerationCheck:
     return GenerationCheck(commit=commit, files_checked=len(md_files), errors=errors)
 
 
-def select_known_good_commit(repo_path: Path, max_generations: int = 20) -> dict:
+def select_known_good_commit(
+    repo_path: Path, max_generations: int = 20, min_completeness_ratio: float = 0.9
+) -> dict:
     """Walk `git log` backwards from HEAD, integrity-checking each generation.
     Returns the first (newest) clean commit, flagging every corrupt one it
     skipped along the way -- never silently returns a corrupt HEAD as the
-    answer, and never claims a generation is clean without having checked it."""
+    answer, and never claims a generation is clean without having checked it.
+
+    Frontmatter parseability alone can't catch a generation that silently
+    lost most of the vault (e.g. a partial/failed sync) but still parses fine
+    -- so this first surveys .md file counts across the whole walked window
+    (cheap, `git ls-tree` only) to establish the vault's peak size in that
+    window, then treats any generation whose file count falls below
+    `min_completeness_ratio` of that peak as incomplete, on top of the
+    per-file frontmatter check.
+    """
     shas = _git(["log", "--format=%H", "-n", str(max_generations)], repo_path).strip().splitlines()
+
+    file_lists = {sha: _list_md_files(repo_path, sha) for sha in shas}
+    max_files_seen = max((len(v) for v in file_lists.values()), default=0)
 
     checked = []
     flagged_corrupt = []
     selected = None
     for sha in shas:
-        generation = check_generation(repo_path, sha)
+        generation = check_generation(repo_path, sha, md_files=file_lists[sha])
+        expected_min = max(1, round(max_files_seen * min_completeness_ratio)) if max_files_seen else 0
+        if generation.files_checked < expected_min:
+            generation.errors.append({
+                "path": "<generation-manifest>",
+                "error": (
+                    f"incomplete generation: {generation.files_checked} .md files, "
+                    f"expected >= {expected_min} (>= {min_completeness_ratio:.0%} of "
+                    f"{max_files_seen} seen across the walked window)"
+                ),
+            })
         checked.append(generation.to_dict())
         if generation.clean:
             selected = sha
@@ -112,6 +141,7 @@ def select_known_good_commit(repo_path: Path, max_generations: int = 20) -> dict
         "flagged_corrupt": flagged_corrupt,
         "selected": selected,
         "head_was_corrupt": bool(shas) and shas[0] in flagged_corrupt,
+        "max_files_seen_in_window": max_files_seen,
     }
 
 
@@ -119,10 +149,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-path", type=Path, required=True)
     parser.add_argument("--max-generations", type=int, default=20)
+    parser.add_argument("--min-completeness-ratio", type=float, default=0.9)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    report = select_known_good_commit(args.repo_path, max_generations=args.max_generations)
+    report = select_known_good_commit(
+        args.repo_path,
+        max_generations=args.max_generations,
+        min_completeness_ratio=args.min_completeness_ratio,
+    )
     rendered = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")

@@ -103,6 +103,43 @@ def test_never_mutates_the_repo_working_tree_or_history(selector_mod, repo):
     assert before_status == after_status == ""
 
 
+def test_flags_incomplete_generation_that_still_parses_cleanly(selector_mod, repo):
+    """A generation that silently dropped most of the vault but still has
+    valid frontmatter on what remains must not be certified as good."""
+    for i in range(1, 11):
+        _commit(repo, f"note{i}.md", "---\nstatus: active\n---\n\ncontent.\n", f"gen{i}, 10 files total")
+    sha_good_full = _git(["rev-parse", "HEAD"], repo)
+
+    # Simulate a partial/failed sync: delete 8 of 10 files, but the 2 that
+    # remain still parse fine.
+    for i in range(3, 11):
+        (repo / f"note{i}.md").unlink()
+    sha_incomplete = _commit(repo, "note1.md", "---\nstatus: active\n---\n\nunchanged.\n", "gen11, incomplete")
+
+    report = selector_mod.select_known_good_commit(repo)
+
+    assert report["head_was_corrupt"] is True
+    assert sha_incomplete in report["flagged_corrupt"]
+    assert report["selected"] == sha_good_full
+    assert report["max_files_seen_in_window"] == 10
+    incomplete_check = report["checked"][0]
+    assert incomplete_check["commit"] == sha_incomplete
+    assert any("incomplete generation" in e["error"] for e in incomplete_check["errors"])
+
+
+def test_min_completeness_ratio_is_configurable(selector_mod, repo):
+    for i in range(1, 11):
+        _commit(repo, f"note{i}.md", "---\nstatus: active\n---\n\ncontent.\n", f"gen{i}")
+    for i in range(3, 11):
+        (repo / f"note{i}.md").unlink()
+    sha_reduced = _commit(repo, "note1.md", "---\nstatus: active\n---\n\nunchanged.\n", "gen11, reduced to 2/10")
+
+    # A lenient ratio (<=20%) accepts a 2/10-file generation as complete.
+    report = selector_mod.select_known_good_commit(repo, min_completeness_ratio=0.2)
+    assert report["selected"] == sha_reduced
+    assert report["flagged_corrupt"] == []
+
+
 def test_cli_main_writes_json_report(selector_mod, repo, tmp_path):
     _commit(repo, "note.md", "---\nstatus: active\n---\n\nGen 1.\n", "gen1")
     output = tmp_path / "report.json"
