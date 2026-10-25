@@ -71,6 +71,36 @@ def reset_authoring_documents():
         reads["documents"].clear()
 
 
+def reset_authoring_release():
+    """Discard the pinned adapter after a release change, within this call."""
+    reads = _authoring_reads.get()
+    if reads is not None:
+        reads.pop("contract_path", None)
+
+
+def authoring_release_identity(*, fresh=False):
+    """Bind preparation to a path and its physical release directory.
+
+    A publication check must bypass call-local resolution without replacing
+    the preparation's pinned path. Resolving symlinks and recording the
+    directory inode also detects a release swapped behind an unchanged path.
+    Missing adapters remain the ordinary adapter validation's responsibility.
+    """
+    token = _authoring_reads.set(None) if fresh else None
+    try:
+        path = resolve_authoring_contract_path()
+        physical = pathlib.Path(path).resolve()
+        try:
+            info = physical.parent.stat()
+            directory = (info.st_dev, info.st_ino)
+        except FileNotFoundError:
+            directory = None
+        return (path, str(physical), directory)
+    finally:
+        if fresh:
+            _authoring_reads.reset(token)
+
+
 @contextlib.contextmanager
 def validation_batch(build_ids=()):
     """Reuse identical read-only checks only within one locked validation pass.
@@ -208,7 +238,7 @@ def _resolve_live_orchestrator_directory() -> str:
 
 
 def resolve_authoring_contract_path() -> str:
-    """Resolve the authoring_contract.py path to invoke, fresh on every call.
+    """Resolve the adapter path, pinned within one authoring preparation.
 
     An explicit config.BO_AUTHORING_CONTRACT_PATH (env var, or a test's
     monkeypatch) always wins. Otherwise resolves the live serving BO
@@ -356,14 +386,14 @@ def parse_schedule_document(content: str, source_name: str = "<string>") -> dict
     if documents is not None and key in documents:
         result, error = documents[key]
         if error is not None:
-            raise ValueError(*error)
+            raise error
         return copy.deepcopy(result)
     module = _schedule_parser()
     try:
         result = module.parse_schedule_document(content, source_name=source_name)
     except ValueError as exc:
         if documents is not None:
-            documents[key] = (None, exc.args)
+            documents[key] = (None, exc)
         raise
     if documents is not None:
         documents[key] = (copy.deepcopy(result), None)

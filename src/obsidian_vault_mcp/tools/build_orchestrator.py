@@ -684,7 +684,9 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
     schedule activation write is performed.
     """
     try:
-        for attempt in range(3):
+        input_retries = 0
+        release_retries = 0
+        while True:
             # Adapter sources are mutable read dependencies too. Do not reuse
             # path-only syntax/field caches across a fresh preparation pass.
             bo_contract._authoring_fields_cache = None
@@ -699,10 +701,18 @@ def _activate(builds: list[dict], schedule_path: str, tool_name: str, *,
                                             spec_markdown_overrides=spec_markdown_overrides,
                                             dry_run=dry_run, receipt=receipt, template_metadata=template_metadata,
                                             create_schedule=create_schedule, inputs=inputs)
+            except authoring_transaction.BOReleaseChanged:
+                if release_retries >= 1:
+                    raise bo_contract.BOContractError(
+                        'bo_release_changed',
+                        'serving BO release changed again after re-preparation; refusing publication',
+                    )
+                release_retries += 1
+                bo_contract.reset_authoring_release()
             except authoring_transaction.PreparationChanged:
-                if attempt == 2:
+                if input_retries == 2:
                     raise
-        raise ValueError("authoring inputs did not stabilize")
+                input_retries += 1
     except (ValueError, OSError, bo_contract.BOContractError) as exc:
         return json.dumps({"ok": False, "activated": False, "error": str(exc),
                            **({"code": exc.code} if isinstance(exc, bo_contract.BOContractError) else {})})

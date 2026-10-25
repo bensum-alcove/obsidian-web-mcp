@@ -106,6 +106,10 @@ class PreparationChanged(ValueError):
     """A read dependency changed; discard the entire preparation and retry."""
 
 
+class BOReleaseChanged(PreparationChanged):
+    """The serving release changed; permit only one new-release preparation."""
+
+
 def _guard_inputs(build_ids=(), schedule_paths=()) -> str:
     """Fingerprint mutable adapter inputs without reading credential values.
 
@@ -167,8 +171,14 @@ class InputBinding:
     builds: tuple
     schedule_path: str | None
     signature: tuple
+    release: tuple
 
     def current(self):
+        # In particular this runs under the transaction lock, both before
+        # staging and immediately before exchange. Never trust the path
+        # pinned for the preparation when checking the serving release.
+        if bo_contract.authoring_release_identity(fresh=True) != self.release:
+            raise BOReleaseChanged('bo_release_changed: serving BO release changed')
         return capture_inputs(builds=self.builds, schedule_path=self.schedule_path)
 
 
@@ -179,6 +189,7 @@ def capture_inputs(*, builds=(), schedule_path=None):
     preparation and are incorporated into the fresh snapshot under the lock.
     The final namespace manifest separately protects every staged hardlink.
     """
+    release = bo_contract.authoring_release_identity()
     bo_guard.refresh_schedule_scan()
     proposed_builds = tuple(builds)
     root = config.VAULT_PATH.resolve()
@@ -249,7 +260,7 @@ def capture_inputs(*, builds=(), schedule_path=None):
             vault._write_contract_mode(), config.MAX_CONTENT_SIZE,
             tuple(write_contract._CONTENT_REGISTRY.items()),
             frozenset(write_contract._ENFORCED_RULES))
-    return InputBinding(proposed_builds, schedule_path, signature)
+    return InputBinding(proposed_builds, schedule_path, signature, release)
 
 
 def refresh(files: dict[str, str]) -> list[str]:
