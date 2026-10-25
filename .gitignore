@@ -8,3 +8,10 @@ wheels/
 .venv/
 .env
 uv.lock
+
+# Generated retrieval score history (retain corpus hashes and deploy gates).
+/evals/history/*.json
+/evals/history-v3/*.json
+/evals/history-v3-holdout/*.json
+/evals/history-v3-holdout-2/*.json
+/evals/history-v3-holdout-3/*.json
