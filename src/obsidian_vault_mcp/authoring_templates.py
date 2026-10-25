@@ -21,7 +21,7 @@ CHECKLIST = "Personal/Build Orchestrator/rules/authoring-checklist.md"
 VARIABLES = frozenset({
     "build_id", "review_id", "deploy_id", "feature_id", "title", "project",
     "what_this_means", "probes", "scope", "proof", "out_of_scope", "commit_prefix",
-    "candidate_ref", "review_artifact", "summary_instruction",
+    "candidate_ref", "review_artifact", "summary_instruction", "deploy_canaries",
 })
 _TOKEN = re.compile(r"{{(.*?)}}", re.DOTALL)
 _MODEL_LITERAL = re.compile(r"\b(?:gpt[- ]\d|claude[- ](?:sonnet|opus|haiku)|gemini[- ]\d|grok[- ]\d)", re.IGNORECASE)
@@ -95,10 +95,26 @@ def _validate(raw: str, kind: str, models: list[str]) -> dict:
             "body": body, "variables": sorted(set(names)), "raw": raw}
 
 
-def load_template(name: str, kind: str, models: list[str], *, dry_run=False) -> tuple[dict, list[dict]]:
+def load_template(name: str, kind: str, models: list[str], *, dry_run=False, version: str | None = None) -> tuple[dict, list[dict]]:
     cache = config.VAULT_PATH / ".bo-authoring-state" / "templates" / f"{name}.json"
     default = (DEFAULTS / f"{name}.md").read_text()
     warnings = []
+    if version is not None:
+        # Explicit replay uses immutable shipped bytes, never today's override
+        # or last-known-good cache. Existing recorded hashes remain verifiable.
+        if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", version) or version in {".", ".."}:
+            raise TemplateError("invalid template version")
+        current = _validate(default, kind, models)
+        if version == current["version"]:
+            return current, warnings
+        try:
+            archived = (DEFAULTS / "versions" / version / f"{name}.md").read_text()
+        except FileNotFoundError as exc:
+            raise TemplateError("unknown shipped template version") from exc
+        template = _validate(archived, kind, models)
+        if template["version"] != version:
+            raise TemplateError("archived template version mismatch")
+        return template, warnings
     try:
         raw, _ = read_file(VAULT_TEMPLATES + name + ".md")
     except FileNotFoundError:
@@ -157,6 +173,22 @@ def feature_graph(feature: dict, *, dry_run=False):
             raise TemplateError(f"{field} must be non-empty text")
         if re.search(r'(?im)^ {0,3}#{1,6}[ \t]+checkout write policy(?:[ \t]+#+)?[ \t]*$', feature[field]):
             raise TemplateError(f'{field} contains an unsafe checkout policy heading')
+    canaries = feature.get("deploy_canaries")
+    if canaries is None:
+        canaries = []
+    if not isinstance(canaries, list) or len(canaries) > 50 or any(
+        not isinstance(item, str) or not item.strip() or len(item) > 4000 for item in canaries
+    ):
+        raise TemplateError("deploy_canaries must be a list of up to 50 non-empty text checks, each at most 4000 characters")
+    if any(re.search(r'(?im)^ {0,3}#{1,6}[ \t]+checkout write policy(?:[ \t]+#+)?[ \t]*$', item) for item in canaries):
+        raise TemplateError("deploy_canaries contains an unsafe checkout policy heading")
+    canary_block = ""
+    if canaries:
+        numbered = []
+        for index, item in enumerate(canaries, 1):
+            lines = item.strip().splitlines()
+            numbered.append(f"   {index}. " + lines[0] + "".join("\n      " + line for line in lines[1:]))
+        canary_block = "\n   Extra canaries (all must pass before publication):\n\n" + "\n".join(numbered) + "\n\n"
     registry = registry_snapshot()
     models = [m["id"] for m in registry["models"]]
     reviewers = _review_models(registry).get("frontier_review", [])
@@ -166,7 +198,8 @@ def feature_graph(feature: dict, *, dry_run=False):
     artifact = f"BS 2nd Brain/Alcove/Infrastructure/Hardening/Reviews/review-{fid}.md"
     variables = {k: feature[k] for k in VARIABLES if k in feature}
     variables.update(build_id=ids[0],review_id=ids[1],deploy_id=ids[2],
-                     candidate_ref=f"refs/heads/candidate/{fid}",review_artifact=artifact)
+                     candidate_ref=f"refs/heads/candidate/{fid}",review_artifact=artifact,
+                     deploy_canaries=canary_block)
     prefs = feature.get("model_preferences") or {}
     if not isinstance(prefs, dict) or set(prefs) - {"build", "review", "deploy"}:
         raise TemplateError("model_preferences must map build/review/deploy to routing fields")
@@ -194,8 +227,13 @@ def feature_graph(feature: dict, *, dry_run=False):
         assertions = [{"type":"summary_valid"},{"type":"checkout_no_new_dirt"}]
         if role == "build":
             assertions.insert(0,{"type":"git_pushed","push_required":True,"head_matches":f"origin/candidate/{fid}"})
-            common["resources"] = [{"id":f"repo:{project}","mode":"exclusive"}]
+            common.update(resources=[], goal_id=fid, goal_root_build_id=fid, goal_completion=True)
+        if role == "review":
+            common.update(goal_id=bid, goal_root_build_id=bid, goal_completion=True)
         if role == "deploy":
+            common["depends_on"] = []
+            common["depends_on_goal"] = [{"producer_project": project, "goal_id": ids[1],
+                                         "goal_root_build_id": ids[1], "evidence_class": "goal_completion"}]
             programs = (["orchestrator","orchestrator-dashboard","bs-control-session-bridge","log-syncer"]
                         if project == "build-orchestrator" else ["bs-brain-vault","cb-brain-vault","alcove-brain-vault"])
             assertions.extend({"type":"supervisor_program_running","program":p} for p in programs)
@@ -207,9 +245,9 @@ def feature_graph(feature: dict, *, dry_run=False):
                 {"id":f"service:{p}","mode":"exclusive"} for p in programs]
             if project == "build-orchestrator":
                 common["resources"].append({"id":"service:bs-control-mcp","mode":"exclusive"})
-            common["review_gate"] = {"artifact_path":artifact,"required_verdict":"APPROVED","required_status":"pass",
-                                     "max_blocker_count":0,"max_high_count":0,"accepted_models":reviewers,
-                                     "require_model_verified":True,"reviewed_sha_must_match":"current_head"}
+            # BO's review-goal gate verifies the achieving review's own result.
+            # A fixed artifact_path cannot follow a generated re-review; the
+            # deploy start gate additionally binds that approval to the ref head.
         common["completion_contract"] = {"assertions":assertions,"waivers": [] if role == "build" else [
             {"assertion":"git_pushed","reason":"Independent read-only review or deployment of an already-pushed exact candidate."}]}
         required = {'What this means', 'Start gate', 'Probes', 'Scope', 'Proof',

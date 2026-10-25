@@ -759,7 +759,8 @@ def bo_author_feature(feature_id: str, title: str, project: str, what_this_means
                       risk_domain: str, blast_radius: str, reversible: bool, shadowable: bool,
                       commit_prefix: str, model_preferences: dict | None = None,
                       schedule_path: str | None = None, request_id: str | None = None,
-                      wait: bool = True, dry_run: bool = False) -> str:
+                      wait: bool = True, dry_run: bool = False,
+                      deploy_canaries: list[str] | None = None) -> str:
     inp = BOAuthorFeatureInput(**locals())
     return _bo_author_feature(**inp.model_dump())
 

@@ -1,5 +1,5 @@
 ---
-version: '1'
+version: '2'
 kind: build
 ---
 # {{ build_id }} — {{ title }}
@@ -7,7 +7,7 @@ kind: build
 ## What this means
 {{ what_this_means }}
 
-This is the implementation stage of {{ feature_id }}. Deployment is deferred until the exact candidate receives independent approval. Report the provider identity that actually ran. Effort is a request, never a gate.
+This is the implementation stage of {{ feature_id }}. Deployment is deferred until the exact candidate receives independent approval. This stage owns the implementation goal; a generated repair retains the candidate ref and the review goal tracks its achieving approval. Report the provider identity that actually ran. Effort is a request, never a gate.
 
 ## Start gate
 Use the BO isolated worktree and the configured project base. Fetch origin and record the base SHA and initial dirty paths. Preserve pre-existing dirt. Never write the live or dreaming checkout.

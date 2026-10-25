@@ -931,7 +931,8 @@ def bo_author_feature(feature_id: str, title: str, project: str, what_this_means
                       risk_domain: str, blast_radius: str, reversible: bool, shadowable: bool,
                       commit_prefix: str, model_preferences: dict | None = None,
                       schedule_path: str | None = None, request_id: str | None = None,
-                      wait: bool = True, dry_run: bool = False) -> str:
+                      wait: bool = True, dry_run: bool = False,
+                      deploy_canaries: list[str] | None = None) -> str:
     """Render and atomically author build → exact-SHA review → gated deployment."""
     from .. import authoring_templates
     feature = copy.deepcopy({k:v for k,v in locals().items() if k not in {"authoring_templates", "request_id", "wait"}})

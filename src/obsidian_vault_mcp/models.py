@@ -1,6 +1,6 @@
 """Pydantic input models for obsidian-vault-mcp tool endpoints."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -802,6 +802,9 @@ class BOAuthorFeatureInput(BaseModel):
     reversible: bool = Field(..., strict=True)
     shadowable: bool = Field(..., strict=True)
     commit_prefix: str = Field(..., min_length=1, max_length=100)
+    deploy_canaries: list[Annotated[str, Field(strict=True, min_length=1, max_length=4000)]] | None = Field(
+        default=None, max_length=50, description="Optional extra deployment checks, rendered as numbered canaries before publication",
+    )
     model_preferences: dict | None = None
     schedule_path: str | None = Field(default=None, min_length=1, max_length=500)
     request_id: str | None = Field(default=None, min_length=1, max_length=200)

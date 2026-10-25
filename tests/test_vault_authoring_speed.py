@@ -59,9 +59,9 @@ def configure(monkeypatch, root):
         return yaml.safe_load(text[text.index('builds:'):])
     monkeypatch.setattr(bo_contract,"parse_schedule_document",parse)
     monkeypatch.setattr(bo_contract,"authoring_field_projection",lambda:{
-        "accepted_input_fields":frozenset(_build()) | frozenset({"depends_on","deployment_intent","work_role","completion_contract","resources","review_gate","engine","codex_model"}),
-        "schedule_entry_keys":frozenset({"id","spec_path","project","tier","depends_on","work_role","engine","codex_model","resources"}),
-        "spec_persist_keys":frozenset({"depends_on","deployment_intent","work_role","completion_contract","review_gate","resources","engine","codex_model"}),
+        "accepted_input_fields":frozenset(_build()) | frozenset({"depends_on","deployment_intent","work_role","completion_contract","resources","review_gate","engine","codex_model","goal_id","goal_root_build_id","goal_completion","depends_on_goal"}),
+        "schedule_entry_keys":frozenset({"id","spec_path","project","tier","depends_on","work_role","engine","codex_model","resources","goal_id","goal_root_build_id","goal_completion","depends_on_goal"}),
+        "spec_persist_keys":frozenset({"depends_on","deployment_intent","work_role","completion_contract","review_gate","resources","engine","codex_model","goal_id","goal_root_build_id","goal_completion","depends_on_goal"}),
     })
     # Transaction validation batch has its own subprocess helper. Keep this
     # unit fixture hermetic while exercising its cache logic independently.
@@ -273,10 +273,13 @@ def test_formula_provenance_and_machine_review_gate(scratch,monkeypatch,project)
     assert r['ok'],r;assert len(specs(scratch))==3
     stored={p.stem:frontmatter.loads(p.read_text()).metadata for p in specs(scratch)}
     assert stored['feature-review']['depends_on']==['feature']
-    assert stored['feature-deploy']['depends_on']==['feature-review']
-    assert stored['feature-deploy']['review_gate']['required_verdict']=='APPROVED'
+    assert stored['feature-deploy']['depends_on']==[]
+    assert stored['feature-deploy']['depends_on_goal']==[dict(producer_project=project, goal_id='feature-review',
+        goal_root_build_id='feature-review', evidence_class='goal_completion')]
+    assert 'review_gate' not in stored['feature-deploy']
+    assert stored['feature-review']['goal_completion'] is True
     for fm in stored.values():
-        assert fm['template_version']=='1' and len(fm['template_hash'])==64
+        assert fm['template_version']=='2' and len(fm['template_hash'])==64
     collision=json.loads(bo.bo_author_feature(**feature(project=project)))
     assert not collision['ok'];assert len(specs(scratch))==3
 
@@ -296,26 +299,26 @@ def test_strict_template_variables_and_filters(scratch,bad):
 
 def test_model_literal_with_valid_hash_is_rejected_and_lkg_is_verified(scratch):
     t=module('authoring_templates');directory=scratch/t.VAULT_TEMPLATES;directory.mkdir(parents=True)
-    path=directory/'build.md';good=(t.DEFAULTS/'build.md').read_text().replace("version: '1'","version: '2'")
+    path=directory/'build.md';good=(t.DEFAULTS/'build.md').read_text().replace("version: '2'","version: '3'")
     path.write_text(good);valid,_=t.load_template('build','build',[])
     path.write_text(good+'\nUse gpt-6.1-sol.\n')
     cached=scratch/'.bo-authoring-state/templates/build.json'
     # Hash-valid but model-bearing content is still invalid, even as an LKG.
     cached.write_text(json.dumps({'raw':path.read_text(),'hash':t._digest(path.read_text())}))
     fallback,notes=t.load_template('build','build',['gpt-6.1-sol'])
-    assert fallback['version']=='1';assert notes[0]['code']=='template_fallback'
+    assert fallback['version']=='2';assert notes[0]['code']=='template_fallback'
     _,second=t.load_template('build','build',['gpt-6.1-sol']);assert second==[]
     cached.write_text(json.dumps({'raw':good,'hash':'tampered'}))
-    fallback,_=t.load_template('build','build',[]);assert fallback['version']=='1'
-    cached.write_text(json.dumps({'raw':good,'hash':t._digest(good)}))
     fallback,_=t.load_template('build','build',[]);assert fallback['version']=='2'
+    cached.write_text(json.dumps({'raw':good,'hash':t._digest(good)}))
+    fallback,_=t.load_template('build','build',[]);assert fallback['version']=='3'
 
 
 def test_malformed_template_falls_back(scratch):
     t=module('authoring_templates');path=scratch/t.VAULT_TEMPLATES/'build.md';path.parent.mkdir(parents=True)
     path.write_text('---\nversion: [\n---\n{{ unknown }}')
     result,warnings=t.load_template('build','build',[])
-    assert result['version']=='1' and warnings
+    assert result['version']=='2' and warnings
 
 
 def test_generated_context_is_bounded_and_read_only(scratch,monkeypatch):

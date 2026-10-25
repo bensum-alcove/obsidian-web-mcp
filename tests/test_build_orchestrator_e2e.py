@@ -458,5 +458,5 @@ def test_real_feature_formula_validates_the_full_rendered_chain(seeded_schedule,
     assert not (seeded_schedule / "Personal/Build Orchestrator/specs/scratch-real-feature.md").exists()
     for rendered in result["rendered"].values():
         metadata = frontmatter.loads(rendered["spec"]).metadata
-        assert metadata["template_version"] == "1"
+        assert metadata["template_version"] == "2"
         assert len(metadata["template_hash"]) == 64

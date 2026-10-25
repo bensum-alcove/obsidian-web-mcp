@@ -1,5 +1,5 @@
 ---
-version: '1'
+version: '2'
 kind: deploy
 source: vault-mcp-lock-pin-deploy-v1.md
 ---
@@ -9,7 +9,7 @@ source: vault-mcp-lock-pin-deploy-v1.md
 Ship the exact approved {{ feature_id }} candidate to the vault servers and dreaming checkout. This formula is derived from vault-mcp-lock-pin-deploy-v1. Report the actual provider identity. Effort is a request, never a gate.
 
 ## Start gate
-Do not overlap a BO deploy: re-check every five minutes for up to three hours, then fail before switching if it still runs. Fetch origin. Both the {{ review_id }} local-first output and {{ review_artifact }} must contain the same APPROVED/pass review-result, zero blockers/highs and model_verified true. reviewed_sha must equal D = {{ candidate_ref }}. Closure alone is never approval. Read canonical checkout records and SYSTEM-FACTS, confirm each program's live directory/command, live release R and dreaming HEAD. R must be an ancestor of D. Record initial dirty paths, program PIDs/uptimes and health on 8420, 8423, 8426 and cb-brain-marketing-ro.
+Do not overlap a BO deploy: re-check every five minutes for up to three hours, then fail before switching if it still runs. Fetch origin. Resolve the ACHIEVED review goal {{ review_id }} for project {{ project }}, root {{ review_id }}, through BO's read-only goal state (or a credential-free extraction). Let A = achieved_by_build_id. Require A to be a closed reviewer in that exact goal lineage. Read A's own frozen spec to resolve the artifact it writes (the original review normally writes {{ review_artifact }}; a generated re-review writes its own artifact). Never substitute the original failed review's artifact. The final review-result blocks in A's own local-first output and its own artifact must agree: build_id and reviewer_build_id equal A, APPROVED, status pass, blocker_count 0, high_count 0, model_verified true, and a reviewer accepted by the live independent-review rules. Their reviewed_sha must equal D = {{ candidate_ref }} after fetching. Missing, ambiguous, stale or mismatched evidence stops before switching. Closure alone is never approval. Read canonical checkout records and SYSTEM-FACTS, confirm each program's live directory/command, live release R and dreaming HEAD. R must be an ancestor of D. Record initial dirty paths, program PIDs/uptimes and health on 8420, 8423, 8426 and cb-brain-marketing-ro.
 
 ## Probes
 {{ probes }}
@@ -25,8 +25,9 @@ Dry-run all post-switch comparisons against R read-only or a credential-free scr
 3. Run the producer/reviewer focused tests on D in a clean scratch install through the structured executor, explicit files. Verify the exact review SHA again before switching.
 4. Non-force fast-forward the live checkout to D. With supervisorctl, reread/update/restart alcove-brain-vault, then cb-brain-vault, then bs-brain-vault, one at a time. Each health endpoint must return 200 and its vault_read plus vault_search canaries must pass before moving to the next. Do not restart cb-brain-marketing-ro; verify it stays RUNNING and healthy. Confirm the live package inventory matches the approved expectation.
 5. Non-force fast-forward the dreaming checkout to D while preserving its dirt. If its cron uses uv run, run one approved read-only cron script exactly as cron does and record its package inventory and any reviewed changes.
-6. Any health/canary/parity failure restores the live release pointer to R using the recorded rollback procedure and the same one-at-a-time supervised restart order, verifies all health checks, then stops with fail. Never kill processes by pattern.
-7. Insert the infrastructure changelog entry with a targeted replace anchored on the newest heading; update canonical checkout records with targeted edits. No unrelated vault rewrite.
+{{ deploy_canaries }}6. Any health/canary/parity failure restores the live release pointer to R using the recorded rollback procedure and the same one-at-a-time supervised restart order, verifies all health checks, then stops with fail. Never kill processes by pattern.
+7. After all restarts and every health, parity and feature-specific canary pass, non-force push the live branch to origin/feature/vault-tools-v2 (`git push origin HEAD:refs/heads/feature/vault-tools-v2`) so the remote matches D. First verify the live HEAD still equals D. If the push is not a fast-forward, do not force it: record live and remote SHAs and their merge base, then stop with fail. On rollback, push nothing.
+8. Insert the infrastructure changelog entry with a targeted replace anchored on the newest heading; update canonical checkout records with targeted edits. No unrelated vault rewrite.
 
 ## Proof
 {{ proof }}

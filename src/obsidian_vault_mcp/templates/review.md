@@ -1,5 +1,5 @@
 ---
-version: '1'
+version: '2'
 kind: review
 ---
 # {{ review_id }} — Review: {{ title }}
@@ -8,7 +8,7 @@ kind: review
 Independently review the exact implementation candidate for {{ feature_id }} before deployment. Record the provider-reported identity. Effort is a request, never a gate.
 
 ## Start gate
-Fetch {{ candidate_ref }} and record its exact SHA as reviewed_sha. Review only that candidate in an isolated scratch checkout. Never alter implementation code or the candidate ref. Apply the live registry's independent-review rules.
+Fetch {{ candidate_ref }} and record its exact SHA as reviewed_sha. Review only that candidate in an isolated scratch checkout. Never alter implementation code or the candidate ref. This row is the root of the review goal {{ review_id }}; only a verified APPROVED/pass verdict may achieve it, including a generated fix-round re-review. Apply the live registry's independent-review rules.
 
 ## Probes
 {{ probes }}

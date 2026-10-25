@@ -1,5 +1,5 @@
 ---
-version: '1'
+version: '2'
 kind: deploy
 source: bo-escalation-allowlist-deploy-v2.md
 ---
@@ -9,7 +9,7 @@ source: bo-escalation-allowlist-deploy-v2.md
 Ship the exact approved candidate for {{ feature_id }} through the BO release procedure. This formula is derived from bo-escalation-allowlist-deploy-v2 and its inherited deploy gates. Report the actual provider identity. Effort is a request, never a gate.
 
 ## Start gate
-Fetch origin. The final review-result blocks in the {{ review_id }} local-first output and {{ review_artifact }} must agree: APPROVED, status pass, blocker_count 0, high_count 0, model_verified true. Their reviewed_sha must equal D = {{ candidate_ref }}. Any mismatch stops before switching. Record live release R, main M, required program PIDs/uptimes and public/port health baselines. Never infer approval from review closure.
+Fetch origin. Resolve the ACHIEVED review goal {{ review_id }} for project {{ project }}, root {{ review_id }}, through BO's read-only goal state (or a credential-free extraction). Let A = achieved_by_build_id. Require A to be a closed reviewer in that exact goal lineage. Read A's own frozen spec to resolve the artifact it writes (the original review normally writes {{ review_artifact }}; a generated re-review writes its own artifact). Never substitute the original failed review's artifact. The final review-result blocks in A's own local-first output and its own artifact must agree: build_id and reviewer_build_id equal A, APPROVED, status pass, blocker_count 0, high_count 0, model_verified true, and a reviewer accepted by the live independent-review rules. Their reviewed_sha must equal D = {{ candidate_ref }} after fetching. Missing, ambiguous, stale or mismatched evidence stops before switching. Closure alone is never approval. Record live release R, main M, required program PIDs/uptimes and public/port health baselines. Never infer approval from review closure.
 
 ## Probes
 {{ probes }}
@@ -26,7 +26,7 @@ Dry-run every post-switch probe before switching against R read-only or a creden
 4. For changed DB tables, use tools/bo_db_extract.py's credential-free extraction and integrity_check; prove normal startup migrates once and reads back. Live db.init_db runs only through normal startup.
 5. Switch orchestrator, orchestrator-dashboard and bs-control-session-bridge using immutable releases and the governed reread, update, restart, status procedure. Switch log-syncer only if its code or imported modules changed. Keep bs-control-mcp unswitched unless bs_control_mcp/ changed; then perform its governed Phase B and MCP canaries. Record both decisions.
 6. Verify release parity on D, dashboard/login health, bo_status, public baselines and every row running before the switch remaining running or normally finished on its frozen model. Watch health for 20 minutes. Use read-only or stubbed-delivery canaries, never a real alarm.
-7. A correctness, health or parity failure rolls the switched programs and governed cron definitions back to R, verifies health, and stops with fail. Reviewer-accepted non-blocking findings proceed and are documented. Any remediation beyond small non-logic fixture/wiring fixes requires the lawful successor; never change logic or weaken tests during deploy.
+{{ deploy_canaries }}7. A correctness, health or parity failure rolls the switched programs and governed cron definitions back to R, verifies health, and stops with fail. Reviewer-accepted non-blocking findings proceed and are documented. Any remediation beyond small non-logic fixture/wiring fixes requires the lawful successor; never change logic or weaken tests during deploy.
 8. After every gate passes, non-force fast-forward main to the exact final approved D. Update the infrastructure changelog with a targeted insertion and compiled current-state records with targeted edits. Preserve unrelated vault bytes.
 
 ## Proof
